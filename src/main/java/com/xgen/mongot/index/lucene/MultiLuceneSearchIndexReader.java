@@ -14,7 +14,6 @@ import com.xgen.mongot.index.MetaResults;
 import com.xgen.mongot.index.MeteredBatchProducer;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.SearchIndexReader;
-import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.facet.TokenFacetsStateCache;
 import com.xgen.mongot.index.query.CollectorQuery;
@@ -24,6 +23,7 @@ import com.xgen.mongot.index.query.Query;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.VectorSearchQuery;
+import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
@@ -45,6 +45,7 @@ import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.search.TaskExecutor;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.IOUtils;
 import org.bson.BsonArray;
 
@@ -311,13 +312,13 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public TokenFieldDefinition tokenField(FieldPath path) throws InvalidQueryException {
-      return this.snapshots.getFirst().tokenField(path);
+    public JoinField joinField(FieldPath path) throws InvalidQueryException {
+      return this.snapshots.getFirst().joinField(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<String> keys, Runnable checkWork)
+        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
         throws IOException, InvalidQueryException {
       for (var snapshot : this.snapshots) {
         snapshot.collectKeys(operator, path, keys, checkWork);

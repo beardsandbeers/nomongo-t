@@ -1,6 +1,8 @@
 # Index joins for standalone mongot
 
-**Available in standalone server 0.6.0 and later for search indexes.**
+**Standalone search-index joins were introduced in server 0.6.0. The native
+ObjectId and adaptive execution extensions below require a build containing
+these changes.**
 
 This guide adapts the original two-Lucene-index example to this repository's
 standalone push server, BSON search expressions, mappings, and cursor lifecycle.
@@ -44,7 +46,8 @@ References: [API schema](../src/proto/standalone/v1/standalone.proto),
 
 Supported scope:
 
-- Equality membership between explicit string fields indexed as `token`.
+- Equality membership between string fields indexed as `token`, or native `objectId` fields.
+- Native `_id` joins when `_id` has an explicit matching token or objectId mapping.
 - Cross-index joins and same-index self-joins in one standalone server.
 - Any-shared-value semantics for arrays, without duplicate local results.
 - Foreign predicates using supported search operators, with scores ignored.
@@ -55,8 +58,8 @@ Supported scope:
 
 Defer foreign-document projection, outer/full joins, score propagation,
 correlated expressions, composite keys, nested/recursive index joins,
-remote servers, and vector joins. Native typed `_id` joins are deferred;
-the first release uses explicit token keys.
+remote servers, vector joins, and numeric join keys. Internal BSON metadata `_id`
+bytes are not used as a join field; explicitly map `_id` to its native type.
 
 ## 2. Semantics and example data
 
@@ -247,23 +250,27 @@ Contacts search index definition:
 ```
 
 `dynamic: true` alone does not establish the token-key contract. Resolve both
-paths as explicit token fields. Use
+paths to the same supported equality domain: token or objectId. A token mapping
+takes precedence when a field also has an objectId mapping, preserving existing
+string joins, including dynamic type sets. Cross-type joins are rejected. Use
 `FieldName.TypeField.TOKEN.getLuceneFieldName(path, Optional.empty())`; do not
 pass raw BSON paths to Lucene or assume token and internal ID field names match.
 
-`IndexableFieldFactory` writes tokens to exact postings and
-`SortedSetDocValuesField`, even for scalars. The original guide's single-valued
+`IndexableFieldFactory` writes tokens and ObjectIds to exact postings and
+`SortedSetDocValuesField`, even for scalars. ObjectIds use 12 raw bytes, never
+UTF-8 or hex conversion. ObjectId joins require an index capability that provides
+ObjectId DocValues; older indexes must be rebuilt. The original guide's single-valued
 `SortedDocValues` collector and `JoinUtil(..., false, ...)` do not apply here.
 
 Equality rules:
 
-- Compare indexed token bytes. Require matching normalizers; recommend `none`
+- Compare indexed bytes within the same type. Require matching token normalizers; recommend `none`
   for identifiers. Lowercase normalization deliberately makes keys
   case-insensitive. Do not normalize collected bytes a second time.
-- Scalars contribute one key; arrays contribute their indexed string values.
+- Scalars contribute one key; arrays contribute their indexed values of the selected type.
   Any shared value qualifies, with one result per local document.
-- Missing, null, empty arrays, and other BSON types contribute no token key.
-  A missing token mapping is a query error, not an empty join.
+- Missing, null, empty arrays, and other BSON types contribute no key.
+  A missing supported mapping is a query error, not an empty join.
 - An empty string is an ordinary key when present in the token index.
 - No implicit number/ObjectId/string conversion, uniqueness enforcement,
   referential integrity, or cascading deletion.
@@ -276,13 +283,29 @@ limit. Lossless raw-value equality would need a mapping/ingestion contract that
 rejects overlong join keys and accounts for existing truncated data. Collecting
 keys at query time cannot recover that information.
 
-**`_id` needs a separate design.** The internal ID is BSON-encoded using
-`LuceneDocumentIdEncoder`; ID DocValues availability depends on index
-capabilities. A UTF-8 token `"a1"` cannot directly match the internal encoding of
-`_id: "a1"`. Explicitly mapping `_id` as a token could support string joins
-through that token representation, but does not supply typed-ID joins. Native
-ID joins need a typed key adapter, a supported foreign-key mapping, and a rule
-for BSON int32 versus int64 equality.
+**Native `_id` joins use a mapped field.** The internal `$meta/_id` is BSON-encoded
+using `LuceneDocumentIdEncoder`; it is not the ordinary mapped `_id` field. Map
+`_id` as `objectId` on the parent index and the reference as `objectId` on the
+local index to use the same native binary representation:
+
+```json
+{
+  "mappings": {
+    "dynamic": false,
+    "fields": {
+      "_id": { "type": "objectId" },
+      "office": { "type": "token" }
+    }
+  }
+}
+```
+
+The local mapping contains `"accountId": { "type": "objectId" }`. Use
+`localField: "accountId", foreignField: "_id"` with the existing `join` syntax.
+For string IDs, explicitly map both sides as `token`. Adding a mapping requires
+reingesting documents into the new generation. No application shadow key or
+change to the internal update/delete ID encoding is needed. Numeric keys remain
+unsupported; a hexadecimal string never matches an ObjectId.
 
 References: [field construction](../src/main/java/com/xgen/mongot/index/lucene/document/single/IndexableFieldFactory.java),
 [field naming](../src/main/java/com/xgen/mongot/index/lucene/field/FieldName.java),
@@ -293,7 +316,7 @@ References: [field construction](../src/main/java/com/xgen/mongot/index/lucene/d
 
 `StandaloneJoinPlanner` handles foreign index access outside BSON parsing and
 local query factories. `SearchIndexReader.QuerySnapshot` provides managed
-reader acquisition, token-key collection, and execution on the same snapshots.
+reader acquisition, binary-key collection, and execution on the same snapshots.
 
 ```text
 StandaloneQueryService.search(QueryRequest)
@@ -320,7 +343,7 @@ planner retains IDs before acquiring readers. A dropped dependency causes failur
 instead of a second lookup against a replacement with the same name.
 
 `JoinOperator` describes the wire expression; `MaterializedJoinOperator` holds
-immutable indexed-token strings internally. Serialization retains the original
+immutable pooled binary membership and count/exhaustiveness hints internally. Serialization retains the original
 expression without serializing membership. Local optimizer and scope visitors
 treat a join as a leaf; its foreign predicate uses its own query factory and
 mapping context. Membership is never expanded into a public BSON `in` expression.
@@ -336,51 +359,71 @@ Initially reject `returnScope`, embedded-document join placement, and foreign
 operators describe relationships within one BSON document. Reject index
 joins in vector entry points/operators until separately supported.
 
-## 6. Lucene strategy and ordinals
+## 6. Adaptive execution and term statistics
 
-All strategies first search foreign documents and materialize distinct keys.
-Use managed searcher references; do not open independent `FSDirectory` readers.
+Foreign preparation searches every qualifying foreign document and collects all
+its indexed keys from pinned readers. It deduplicates segment-local ordinals
+before looking up bytes, then unions owned bytes across all partitions in a
+bounded `JoinKeySet`. Local top-k or lower-bound counting does **not** justify
+truncating this foreign membership: an omitted parent could change the best hit.
 
-| Strategy | Local membership query | Role |
-| --- | --- | --- |
-| A: postings | `TermInSetQuery` | Baseline with a bounded custom collector. |
-| B: DocValues | `SortedSetDocValuesField.newSlowSetQuery` | Compare for highly selective local predicates. |
-| C: both | `IndexOrDocValuesQuery(A, B)` | Reuse the pattern in `InQueryFactory.stringQuery`. |
+`AdaptiveJoinQuery` chooses between two exact local execution paths for both
+strings and ObjectIds:
 
-The implementation uses bounded foreign-key collection and A. B/C remain
-alternatives for future tuning; the development comparison in section 8 includes
-all three. Algorithm selection is internal. Empty sets become `MatchNoDocsQuery`.
+- Postings: a lazily constructed `TermInSetQuery`.
+- Candidate probing: `SortedSetDocValues` plus native binary hash membership in
+  a `TwoPhaseIterator`. A fixed-size, execution-local ordinal memo avoids repeated
+  decoding without allocating an array proportional to the entire dictionary.
 
-```java
-// Equivalent adaptive alternative; production currently uses postings alone.
-Query membership = keys.isEmpty()
-    ? new MatchNoDocsQuery("No foreign join keys")
-    : new IndexOrDocValuesQuery(
-        new TermInSetQuery(localTokenField, keys),
-        SortedSetDocValuesField.newSlowSetQuery(localTokenField, keys));
-// Attach at the parsed filter/exclusion position before collecting results.
+Sets of at most 16 keys retain Lucene's optimized small-term postings query,
+without sampling or probe setup. For larger sets, each leaf samples at most 16
+membership terms using `TermsEnum.docFreq()`. The
+sample estimates total postings work and match density. `Terms.getDocCount()` and
+`getSumDocFreq()` estimate documents with keys and multivalue fan-out. Lucene's
+`ScorerSupplier.get(leadCost)` supplies the estimated work of sibling filters.
+
+In relative work units, the model compares:
+
+```text
+postings work = 64 * distinct foreign keys + estimated sum of local doc frequencies
+probe work    = 64 * expected candidate documents * average keys per document
 ```
 
-Mutable DocValues iterators must be leaf/execution-local. Retained `BytesRef`
-values need owned storage, such as deep copies, rather than iterator buffers.
+The constants are heuristics, not measured nanoseconds. Term statistics do not
+capture correlation with other predicates, stale deleted-document frequencies,
+cache locality, or the number of candidates ranking will inspect. Sampling can
+miss matching keys. It never removes keys or suppresses matches: zero sampled
+frequency means an empty join only when every key was checked.
 
-Lucene's term-based `JoinUtil.createJoinQuery` is a useful reference baseline.
-For token fields use `multipleValuesPerDocument: true`, selecting sorted-set
-collection. It materializes keys internally before returning a query. A bare
-utility call does not provide the required budgets, cancellation, and partition
-union. See the [10.4.0 implementation](https://github.com/apache/lucene/blob/releases/lucene/10.4.0/lucene/join/src/java/org/apache/lucene/search/join/JoinUtil.java)
-and verify against this project's fork before implementation.
+For `count.type: "total"` or any collector query (including facets and
+aggregations), the model estimates exhaustive consumption. Otherwise it can
+estimate a shorter scan from the lower-bound count threshold and join density.
+These flags must come from `SearchQuery`: Lucene passes `COMPLETE_NO_SCORES` to
+filter clauses even when the outer collector is doing top-k search.
 
-No shared global ordinal map is required. One key can have different local
-ordinals in any two segments, including in the same index. Transfer values:
-postings match them directly, and DocValues membership resolves them in each
-local segment. The single-searcher global-ordinal join overload is a different
-algorithm, not an automatic cross-index map. Defer custom shared dictionaries
-and ordinal caches until benchmarks justify them.
+An optimistic probe is not a result limit. When its actual document checks reach
+the estimated break-even cost, its iterator switches to postings at the next
+unvisited document. It neither rescans collected documents nor stops collecting.
+This preserves ranking, requested lower-bound thresholds, pagination, total
+counts, and facets when estimates are wrong. A lower-bound request can still
+require exhaustive work; the collector alone decides when it can stop.
 
-References: [membership factory](../src/main/java/com/xgen/mongot/index/lucene/query/InQueryFactory.java),
-[Lucene reader](../src/main/java/com/xgen/mongot/index/lucene/LuceneSearchIndexReader.java), and
-[partitioned reader](../src/main/java/com/xgen/mongot/index/lucene/MultiLuceneSearchIndexReader.java).
+Postings construction, key sorting, and rewrite are deferred until a leaf chooses
+postings or a probe switches. This avoids the expensive setup in the existing
+`SortedSetDocValuesField.newSlowSetQuery`/`IndexOrDocValuesQuery` combination for a
+large membership set and a very selective local predicate. Empty membership
+becomes `MatchNoDocsQuery`.
+
+No shared global ordinal map is required. Ordinals belong to individual segment
+field dictionaries and must never be compared directly across indexes or leaves.
+The foreign collector transfers values, and the local probe memo is private to
+one scorer and its reader. Cross-request dictionaries/caches are separate future
+work, requiring explicit snapshot identity and memory accounting.
+
+References: [adaptive query](../src/main/java/com/xgen/mongot/index/lucene/query/AdaptiveJoinQuery.java),
+[binary membership](../src/main/java/com/xgen/mongot/index/query/operators/JoinKeySet.java),
+[Lucene reader](../src/main/java/com/xgen/mongot/index/lucene/LuceneSearchIndexReader.java),
+and [partitioned reader](../src/main/java/com/xgen/mongot/index/lucene/MultiLuceneSearchIndexReader.java).
 
 ## 7. Consistency, permissions, and resource bounds
 
@@ -441,8 +484,9 @@ The server applies these fixed admission limits without extra configuration:
 | Estimated memory across concurrent joins and their cursors | 256 MiB |
 | Foreign-work checkpoints across predicates | 10,000,000 |
 
-Memory reservations conservatively account for query metadata, strings, hash
-entries, immutable lists, and term-query/rewrite copies per partition and facet.
+Memory reservations conservatively account for query metadata, pooled binary
+keys, ordinal deduplication, probe state, and term-query/rewrite copies per
+partition and facet.
 They are admission estimates,
 not a measurement of JVM heap or RSS. Cursor-retained membership keeps its
 reservation until exhaustion, kill, invalidation, expiry, or shutdown. Deadline
@@ -470,7 +514,7 @@ a partial answer.
 Foreign key sets and local membership are not cached across requests. Pinned local
 searchers disable Lucene query caching so membership terms retain the cursor's
 bounded lifetime. Later key-set caches must bind to foreign
-reader identities, generation, predicate, field/normalizer semantics, and
+reader identities, generation, predicate, field/type/normalizer semantics, and
 authorization context. Ordinal caches also need local reader/leaf and membership
 identity; integer ordinals are not stable across refreshes/merges.
 
@@ -486,7 +530,8 @@ Implementation entry points:
 4. Cursor transfer, paging, cancellation, and dependency invalidation:
    `CursorQuery.Search`, `CursorFactory`, and `StandaloneQueryService`.
 5. Usage: existing `QueryRequest.query_bson`; no generated schema changes.
-6. Local membership: `JoinQueryFactory` uses postings after comparing A/B/C below.
+6. Local membership: `JoinQueryFactory` creates `AdaptiveJoinQuery`; the A/B/C
+   results below describe the earlier postings-only baseline.
 
 Relevant checks from the repository root:
 
@@ -535,7 +580,7 @@ fan-out, segments/partitions, key length, concurrency, and warm/cold readers.
 Report p50/p95 latency, peak/retained memory, allocations, and cancellation latency.
 Include foreign preparation in every comparison.
 
-### Development comparison (14 November 2026)
+### Original postings-only development comparison (14 November 2026)
 
 A Lucene-only warm-reader comparison used the pinned `10.4.0-5` core, Java 21.0.4,
 10,000 accounts in one segment, and 100,000 contacts in ten segments. Each
@@ -560,6 +605,43 @@ about 4.91 MiB for A, 18.60 MiB for B, and 18.79 MiB for C. These cases support
 postings as the initial baseline while showing a small-key selective case where
 DocValues wins. Rebenchmark with production data before changing the strategy.
 
+### Adaptive binary-key comparison (14 November 2026)
+
+A subsequent Lucene-only run exercised the production `AdaptiveJoinQuery` and
+`JoinKeySet` with the same native foreign collection on both arms. It used the
+pinned 10.4.0-5 fork, Java 21.0.11 with the Vector API, 10,000 foreign documents
+in four segments, and 100,000 local documents in ten segments. Readers were warm
+and in memory; query caches were disabled. Each case had 20 warmups and 40
+measurements with shuffled strategy order. Counts were checked against expected
+results before timing. Foreign collection, query construction/rewrite, and local
+execution are all included. Measurements were taken without concurrent builds.
+
+Times are total p50 / p95 milliseconds. Every row below collects 5,000 foreign
+keys. Selective predicates leave 100 local candidates; broad predicates leave
+100,000. Top-10 uses the normal 1,000-hit lower-bound threshold; full count
+consumes all matches.
+
+| Key / local request | Postings | Adaptive |
+| --- | --- | --- |
+| ObjectId / selective top-10 | 15.366 / 17.680 | 3.416 / 3.872 |
+| String / selective top-10 | 11.218 / 11.793 | 1.303 / 1.553 |
+| ObjectId / broad top-10 | 18.529 / 19.487 | 5.472 / 5.933 |
+| String / broad top-10 | 12.311 / 14.353 | 1.801 / 2.215 |
+| ObjectId / broad full count | 14.774 / 19.027 | 14.200 / 18.078 |
+| String / broad full count | 11.668 / 12.881 | 10.749 / 12.017 |
+
+The 10-key cases retain the original postings path: broad string p50 was
+0.688 ms in both arms, and broad ObjectId p50 was 2.432 / 2.443 ms. For 5,000-key
+selective joins, median thread allocations were 1,540 / 1,035 KiB for ObjectIds
+and 1,501 / 1,112 KiB for strings (postings / adaptive).
+
+These synthetic results support the initial heuristic, not a claim of universal
+optimality or server latency. They omit gRPC, disk I/O, concurrent load, and server
+admission. Tests additionally check multivalued keys, missing values, deleted
+documents, unsampled matches, score ordering across parallel leaves, pagination,
+probe-to-postings switching, native mapped `_id`, type validation, and collector
+hints. Total-count and facet requests remain exact.
+
 ## 9. Agreed initial syntax and scope
 
 | Decision | Initial choice | Rationale / consequence |
@@ -570,9 +652,9 @@ DocValues wins. Rebenchmark with production data before changing the strategy.
 | Self-join | Omit `from` | Reuses the current index and snapshots without a name lookup. Its explicit name also works. |
 | Key names | `localField` / `foreignField` | `path` / `from.path` uses search vocabulary but makes direction less familiar. |
 | Foreign predicate | Required `operator` subtree | `query` suggests a full request; omission would implicitly scan all foreign documents. |
-| Keys | Explicit token strings first | Native typed `_id` removes the shadow key but needs encoding/mapping work. |
+| Keys | Token strings and native ObjectIds | Both paths use binary membership; `_id` must have the corresponding explicit mapping. Numeric keys are unsupported. |
 | Placement | Filter/exclusion positions first | Scoring positions need defined constant-score or foreign-score behavior. |
 
-The first release uses explicit token keys such as `accountKey`. Native typed
-`foreignField: "_id"` joins are a later extension requiring the adapter described
-in section 4.
+String references such as `accountKey` and native ObjectId references use the
+same adaptive engine. `foreignField: "_id"` uses an explicit native mapping as
+described in section 4; it does not read the BSON metadata ID field.

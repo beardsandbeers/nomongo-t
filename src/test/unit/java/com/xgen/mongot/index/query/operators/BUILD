@@ -1,6 +1,8 @@
 load("//bazel/java:test.bzl", "java_test_suite", "mongot_java_unit_test_suite")
 
 _TEST_DEPS = [
+    "//src/main/java/com/xgen/mongot/index/analyzer/definition",
+    "@maven//:org_apache_lucene_lucene_core",
     "//src/main/java/com/xgen/mongot/index/path/string",
     "//src/main/java/com/xgen/mongot/index/query/operators",
     "//src/main/java/com/xgen/mongot/index/query/points",
@@ -25,7 +27,10 @@ mongot_java_unit_test_suite(
     name = "lib",
     exclude_files = glob(
         ["*.java"],
-        exclude = ["JoinOperatorTest.java"],
+        exclude = [
+            "JoinOperatorTest.java",
+            "JoinKeySetTest.java",
+        ],
     ),
     deps = _TEST_DEPS,
 )

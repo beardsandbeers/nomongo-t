@@ -3,12 +3,12 @@ package com.xgen.mongot.index;
 import com.google.common.annotations.VisibleForTesting;
 import com.xgen.mongot.cursor.batch.BatchSizeStrategy;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
-import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.lucene.facet.TokenFacetsStateCache;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.Query;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
+import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.util.FieldPath;
 import java.io.IOException;
@@ -17,6 +17,7 @@ import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.util.BytesRef;
 
 public class MeteredSearchIndexReader implements SearchIndexReader {
 
@@ -165,13 +166,13 @@ public class MeteredSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public TokenFieldDefinition tokenField(FieldPath path) throws InvalidQueryException {
-      return this.snapshot.tokenField(path);
+    public JoinField joinField(FieldPath path) throws InvalidQueryException {
+      return this.snapshot.joinField(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<String> keys, Runnable checkWork)
+        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
         throws IOException, InvalidQueryException {
       this.snapshot.collectKeys(operator, path, keys, checkWork);
     }

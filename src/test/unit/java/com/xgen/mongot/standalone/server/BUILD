@@ -5,6 +5,8 @@ mongot_java_unit_test_suite(
     deps = [
         "//src/main/java/com/xgen/mongot/cursor",
         "//src/main/java/com/xgen/mongot/cursor/batch",
+        "//src/main/java/com/xgen/mongot/index",
+        "//src/main/java/com/xgen/mongot/index/analyzer/definition",
         "//src/main/java/com/xgen/mongot/index/lucene/vector",
         "//src/main/java/com/xgen/mongot/index/query",
         "//src/main/java/com/xgen/mongot/index/query/operators",
@@ -20,6 +22,7 @@ mongot_java_unit_test_suite(
         "@io_grpc_grpc_java//netty",
         "@io_grpc_grpc_java//stub",
         "@maven//:io_netty_netty_handler",
+        "@maven//:org_apache_lucene_lucene_core",
         "@maven//:org_bouncycastle_bc_fips",
         "@maven//:org_bouncycastle_bcpkix_fips",
         "@maven//:org_mongodb_bson",
