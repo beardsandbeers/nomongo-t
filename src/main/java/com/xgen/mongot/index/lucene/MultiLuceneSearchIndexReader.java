@@ -75,6 +75,20 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
   }
 
   @Override
+  public void collectDocumentIds(
+      org.bson.BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Consumer<byte[]> ids,
+      Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    for (var reader : this.readers) {
+      check.run();
+      reader.collectDocumentIds(predicate, vector, all, ids, check);
+    }
+  }
+
+  @Override
   public SearchProducerAndMetaResults query(
       Query query,
       QueryCursorOptions queryCursorOptions,

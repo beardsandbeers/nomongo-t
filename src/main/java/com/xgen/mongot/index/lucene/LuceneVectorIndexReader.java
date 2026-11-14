@@ -2,6 +2,7 @@ package com.xgen.mongot.index.lucene;
 
 import com.google.common.base.Stopwatch;
 import com.google.errorprone.annotations.MustBeClosed;
+import com.google.errorprone.annotations.Var;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.xgen.mongot.cursor.batch.BatchSizeStrategy;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
@@ -34,15 +35,23 @@ import com.xgen.mongot.util.concurrent.LockGuard;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.SimpleCollector;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.bson.BsonArray;
+import org.bson.BsonDocument;
+import org.jetbrains.annotations.Nullable;
 
 @SuppressWarnings("GuardedBy") // Uses LockGuard instead
 public class LuceneVectorIndexReader implements VectorIndexReader {
@@ -116,6 +125,77 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
         concurrentSearchExecutor,
         concurrentVectorRescoringExecutor,
         queryFactory);
+  }
+
+  @Override
+  public void collectDocumentIds(
+      BsonDocument predicate, boolean vector, boolean all, Consumer<byte[]> ids, Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    if (!all && !vector) {
+      throw new IllegalArgumentException("Predicate type does not match reader");
+    }
+    check.run();
+    refresh();
+    check.run();
+    try (var ignored = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("collectDocumentIds");
+      try (var reference = createSearcherReference(false)) {
+        var searcher = reference.getIndexSearcher();
+        searcher.setQueryCache(null);
+        searcher.setTimeout(
+            () -> {
+              check.run();
+              return false;
+            });
+        @Var
+        org.apache.lucene.search.Query query = new org.apache.lucene.search.MatchAllDocsQuery();
+        if (!all) {
+
+          query = this.queryFactory.createFilter(predicate, searcher.getIndexReader());
+        }
+        var roots =
+            new org.apache.lucene.search.TermQuery(
+                new org.apache.lucene.index.Term(
+                    FieldName.MetaField.EMBEDDED_ROOT.getLuceneFieldName(),
+                    com.xgen.mongot.index.lucene.field.FieldValue.EMBEDDED_ROOT_FIELD_VALUE));
+        var selected =
+            new org.apache.lucene.search.BooleanQuery.Builder()
+                .add(query, org.apache.lucene.search.BooleanClause.Occur.FILTER)
+                .add(roots, org.apache.lucene.search.BooleanClause.Occur.FILTER)
+                .build();
+        searcher.search(
+            selected,
+            new SimpleCollector() {
+              @Nullable private StoredFields fields;
+
+              @Override
+              protected void doSetNextReader(LeafReaderContext context) throws IOException {
+                check.run();
+                this.fields = context.reader().storedFields();
+              }
+
+              @Override
+              public void collect(int doc) throws IOException {
+                check.run();
+                var value =
+                    java.util.Objects.requireNonNull(this.fields)
+                        .document(doc, Set.of(FieldName.MetaField.ID.getLuceneFieldName()))
+                        .getBinaryValue(FieldName.MetaField.ID.getLuceneFieldName());
+                if (value == null) {
+                  throw new IOException("Missing document ID");
+                }
+                ids.accept(
+                    Arrays.copyOfRange(value.bytes, value.offset, value.offset + value.length));
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+        check.run();
+      }
+    }
   }
 
   @Override

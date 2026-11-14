@@ -44,6 +44,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
   private final HealthStatusManager health = new HealthStatusManager();
   private final Server server;
   private final StandaloneQueryService queries;
+  private final StandaloneDeleteByQuery deleteByQuery;
 
   /**
    * Registers bounded standalone services and their transport security without starting listeners.
@@ -52,6 +53,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.runtime = runtime;
     this.dispatcher = new RpcDispatcher(runtime.config(), runtime.metrics());
     this.queries = new StandaloneQueryService(runtime, this.dispatcher);
+    this.deleteByQuery = new StandaloneDeleteByQuery(runtime);
     this.deadlines =
         new ScheduledThreadPoolExecutor(
             1, Thread.ofPlatform().name("standalone-deadlines").factory());
@@ -246,6 +248,16 @@ public final class StandaloneGrpcServer implements AutoCloseable {
   }
 
   private final class Documents extends DocumentServiceGrpc.DocumentServiceImplBase {
+    @Override
+    public void deleteByQuery(
+        com.xgen.mongot.standalone.grpc.DeleteByQueryRequest request,
+        StreamObserver<com.xgen.mongot.standalone.grpc.DeleteByQueryResponse> observer) {
+      StandaloneGrpcServer.this.dispatcher.unary(
+          request.getSerializedSize(),
+          observer,
+          () -> StandaloneGrpcServer.this.deleteByQuery.execute(request));
+    }
+
     @Override
     public void upsert(UpsertRequest request, StreamObserver<UpsertResponse> observer) {
       StandaloneGrpcServer.this.dispatcher.unary(

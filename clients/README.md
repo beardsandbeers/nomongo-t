@@ -216,3 +216,22 @@ Environment overrides: `MONGOT_PYTHON`, `MONGOT_MVN`, and per-language `MONGOT_*
 
 Release packaging remains in `scripts/standalone/package_release.py`; verification installs
 artifacts independently using `scripts/standalone/verify_release.py`. Neither publishes artifacts.
+
+## Delete by query
+
+```python
+result = client.delete_by_query(api.DeleteByQueryRequest(
+    index_id=index.index_id,
+    search_query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}}),
+    max_matches=1000,
+    dry_run=False,
+))
+print(result.matched_count, result.processed_count)
+```
+
+Java and TypeScript expose `deleteByQuery(request)`; Rust exposes
+`delete_by_query(request).await?`. Vector indexes accept `vector_filter_bson` with the contents
+of their metadata filter. Set `match_all=True` to select all documents within the operation's
+limits. A dry run returns the selection count without deleting. Both query and write roles are
+required. Concurrent ingestion can leave matches; rerun the query for another pass. Counts
+represent selected and processed IDs, rather than confirmed removals under concurrent writes.

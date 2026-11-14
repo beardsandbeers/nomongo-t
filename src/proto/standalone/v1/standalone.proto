@@ -16,6 +16,7 @@ service CatalogService {
   rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
 }
 service DocumentService {
+  rpc DeleteByQuery(DeleteByQueryRequest) returns (DeleteByQueryResponse);
   rpc Upsert(UpsertRequest) returns (UpsertResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 }
@@ -238,4 +239,29 @@ message ServiceMetric {
   string name = 1;
   map<string,string> labels = 2;
   map<string,double> measurements = 3;
+}
+
+// Selects a bounded set of source IDs, then deletes in batches. Ingestion may interleave.
+// Concurrent inserts can survive and replacements of selected IDs can be deleted.
+// Rerun the predicate for another pass; failures during application may partially apply.
+// Requires WRITE and QUERY. No automatic retries.
+message DeleteByQueryRequest {
+  string index_id = 1;
+  oneof selector {
+    bytes search_query_bson = 2;
+    bytes vector_filter_bson = 3;
+    bool match_all = 4;
+  }
+  string generation_id = 5;
+  DocumentWriteConcern write_concern = 6;
+  uint64 max_matches = 7; // Zero defaults to 10000; larger values are rejected.
+  bool dry_run = 8;
+}
+message DeleteByQueryResponse {
+  string index_id = 1;
+  string generation_id = 2;
+  uint64 active_revision = 3;
+  uint64 matched_count = 4;
+  uint64 processed_count = 5; // Applied ID deletes; zero for dry_run, not an existence count.
+  bool dry_run = 6;
 }

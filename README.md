@@ -19,6 +19,7 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 | Addition | What it enables |
 | --- | --- |
 | Standalone indexes | Run without MongoDB. Create independent named indexes and write BSON directly through gRPC `Upsert` and `Delete`. Each index owns its content and lifecycle. |
+| Delete by query | `DeleteByQuery` removes documents selected by search predicates or vector metadata filters from one index, with dry runs and bounded selection. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
 | Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. See [join examples](#join-searches-across-indexes). |
 | Public gRPC API and four clients | Manage indexes, ingest documents, search, and page results from Python, Rust, Java, and TypeScript, with TLS and bearer tokens restricted by role and index. See the [client guide](clients/README.md). |
 | Dynamic mapping export | `GetIndexMappings` combines configured fields and observed dynamic types into reusable static mappings. See the [mapping example](clients/README.md#export-a-dynamic-mapping). |
@@ -28,6 +29,11 @@ MongoDB supports aggregation joins through `$lookup`. This fork's `join` runs in
 search expression over standalone indexes and returns matching local documents. It does not
 attach foreign documents. The upstream MongoDB-backed entry point remains in the source;
 the standalone instructions below cover the direct gRPC deployment.
+
+For example, `client.delete_by_query(api.DeleteByQueryRequest(index_id=index.index_id,
+search_query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}})))` deletes matching
+documents from one search index. It requires query and write access and selects up to 10,000 IDs.
+Ingestion can continue during deletion; run the predicate again for another pass if matches remain.
 
 ## Quick start
 

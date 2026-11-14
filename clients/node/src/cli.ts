@@ -6,6 +6,7 @@ import { StandaloneClient } from './client';
 const methods: Record<string, keyof StandaloneClient> = {
   Upsert: 'upsert',
   Delete: 'delete',
+  DeleteByQuery: 'deleteByQuery',
   CreateIndex: 'createIndex',
   UpdateIndex: 'updateIndex',
   DropIndex: 'dropIndex',

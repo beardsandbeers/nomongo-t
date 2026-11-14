@@ -75,10 +75,12 @@ import com.xgen.mongot.util.bson.Vector;
 import com.xgen.mongot.util.concurrent.LockGuard;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
@@ -89,6 +91,7 @@ import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
@@ -100,6 +103,8 @@ import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.bson.BsonDocument;
+import org.jetbrains.annotations.Nullable;
 
 /** This class reads from a single Lucene index. */
 @SuppressWarnings("GuardedBy") // Uses LockGuard instead
@@ -284,6 +289,89 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
 
   SearchAggregationMetricsReporter getSearchAggregationMetricsReporter() {
     return this.queryingMetricsUpdater.getSearchAggregationMetricsReporter();
+  }
+
+  @Override
+  public void collectDocumentIds(
+      BsonDocument predicate, boolean vector, boolean all, Consumer<byte[]> ids, Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    if (!all && vector) {
+      throw new IllegalArgumentException("Predicate type does not match reader");
+    }
+    check.run();
+    refresh();
+    check.run();
+    try (var ignored = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("collectDocumentIds");
+      try (var reference = createSearcherReference(false)) {
+        var searcher = reference.getIndexSearcher();
+        searcher.setQueryCache(null);
+        searcher.setTimeout(
+            () -> {
+              check.run();
+              return false;
+            });
+        @Var
+        org.apache.lucene.search.Query query = new org.apache.lucene.search.MatchAllDocsQuery();
+        if (!all) {
+          Operator operator;
+          try (var parser =
+              com.xgen.mongot.util.bson.parser.BsonDocumentParser.fromRoot(predicate).build()) {
+            operator = Operator.exactlyOneFromBson(parser);
+          } catch (com.xgen.mongot.util.bson.parser.BsonParseException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+          }
+          query =
+              this.queryFactory.createQuery(
+                  operator,
+                  searcher.getIndexReader(),
+                  Optional.empty(),
+                  QueryOptimizationFlags.DEFAULT_OPTIONS);
+        }
+        var roots =
+            this.queryFactory.createQuery(
+                AllDocumentsOperator.INSTANCE,
+                searcher.getIndexReader(),
+                Optional.empty(),
+                QueryOptimizationFlags.DEFAULT_OPTIONS);
+        var selected =
+            new org.apache.lucene.search.BooleanQuery.Builder()
+                .add(query, org.apache.lucene.search.BooleanClause.Occur.FILTER)
+                .add(roots, org.apache.lucene.search.BooleanClause.Occur.FILTER)
+                .build();
+        searcher.search(
+            selected,
+            new SimpleCollector() {
+              @Nullable private StoredFields fields;
+
+              @Override
+              protected void doSetNextReader(LeafReaderContext context) throws IOException {
+                check.run();
+                this.fields = context.reader().storedFields();
+              }
+
+              @Override
+              public void collect(int doc) throws IOException {
+                check.run();
+                var value =
+                    java.util.Objects.requireNonNull(this.fields)
+                        .document(doc, Set.of(FieldName.MetaField.ID.getLuceneFieldName()))
+                        .getBinaryValue(FieldName.MetaField.ID.getLuceneFieldName());
+                if (value == null) {
+                  throw new IOException("Missing document ID");
+                }
+                ids.accept(
+                    Arrays.copyOfRange(value.bytes, value.offset, value.offset + value.length));
+              }
+
+              @Override
+              public ScoreMode scoreMode() {
+                return ScoreMode.COMPLETE_NO_SCORES;
+              }
+            });
+        check.run();
+      }
+    }
   }
 
   @Override

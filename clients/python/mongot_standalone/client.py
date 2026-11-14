@@ -35,7 +35,9 @@ class Client(DocumentCommandsMixin):
         options = (("grpc.max_receive_message_length", 64 * 1024 * 1024),)
         self.channel = (
             grpc.secure_channel(
-                address, grpc.ssl_channel_credentials(Path(ca_file).read_bytes()), options
+                address,
+                grpc.ssl_channel_credentials(Path(ca_file).read_bytes()),
+                options,
             )
             if ca_file
             else grpc.insecure_channel(address, options)
@@ -58,75 +60,101 @@ class Client(DocumentCommandsMixin):
         self, request: api.CreateIndexRequest, *, timeout=None
     ) -> api.IndexDescription:
         return self.catalog.CreateIndex(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def update_index(
         self, request: api.UpdateIndexRequest, *, timeout=None
     ) -> api.IndexDescription:
         return self.catalog.UpdateIndex(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def drop_index(self, request: api.DropIndexRequest, *, timeout=None) -> api.IndexDescription:
         return self.catalog.DropIndex(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_index(self, request: api.GetIndexRequest, *, timeout=None) -> api.IndexDescription:
         return self.catalog.GetIndex(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def list_indexes(
         self, request: api.ListIndexesRequest, *, timeout=None
     ) -> api.ListIndexesResponse:
         return self.catalog.ListIndexes(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_index_mappings(
         self, request: api.GetIndexMappingsRequest, *, timeout=None
     ) -> api.GetIndexMappingsResponse:
         return self.catalog.GetIndexMappings(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_index_stats(self, request: api.GetIndexStatsRequest, *, timeout=None) -> api.IndexStats:
         return self.catalog.GetIndexStats(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_index_field_stats(
         self, request: api.GetIndexFieldStatsRequest, *, timeout=None
     ) -> api.IndexFieldStatsResponse:
         return self.catalog.GetIndexFieldStats(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_status(self, request: api.GetStatusRequest, *, timeout=None) -> api.ServiceStatus:
         return self.operations.GetStatus(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def search(self, request: api.QueryRequest, *, timeout=None) -> api.QueryResponse:
         return self.queries.Search(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def vector_search(self, request: api.QueryRequest, *, timeout=None) -> api.QueryResponse:
         return self.queries.VectorSearch(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def get_more(self, request: api.GetMoreRequest, *, timeout=None) -> api.QueryResponse:
         return self.queries.GetMore(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def kill_cursor(
         self, request: api.KillCursorRequest, *, timeout=None
     ) -> api.KillCursorResponse:
         return self.queries.KillCursor(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )

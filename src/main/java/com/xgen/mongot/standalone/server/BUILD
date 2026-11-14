@@ -5,6 +5,7 @@ java_library(
     srcs = [
         "RpcDispatcher.java",
         "StandaloneAuthInterceptor.java",
+        "StandaloneDeleteByQuery.java",
         "StandaloneGrpcServer.java",
         "StandaloneJoinPlanner.java",
         "StandaloneQueryService.java",
@@ -37,6 +38,7 @@ java_library(
         "@io_grpc_grpc_proto//:health_java_proto",
         "@maven//:com_google_errorprone_error_prone_annotations",
         "@maven//:io_netty_netty_handler",
+        "@maven//:org_apache_lucene_lucene_core",
         "@maven//:org_jetbrains_annotations",
         "@maven//:org_mongodb_bson",
     ],

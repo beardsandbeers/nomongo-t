@@ -3,13 +3,17 @@ load("//bazel/java:test.bzl", "mongot_java_unit_test_suite")
 mongot_java_unit_test_suite(
     name = "lib",
     deps = [
+        "//src/main/java/com/xgen/mongot/catalog",
         "//src/main/java/com/xgen/mongot/cursor",
         "//src/main/java/com/xgen/mongot/cursor/batch",
+        "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/lucene/vector",
         "//src/main/java/com/xgen/mongot/index/query",
         "//src/main/java/com/xgen/mongot/index/query/operators",
+        "//src/main/java/com/xgen/mongot/index/version",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "//src/main/java/com/xgen/mongot/standalone/config",
+        "//src/main/java/com/xgen/mongot/standalone/ingestion",
         "//src/main/java/com/xgen/mongot/standalone/runtime",
         "//src/main/java/com/xgen/mongot/standalone/server",
         "//src/main/java/com/xgen/mongot/util",

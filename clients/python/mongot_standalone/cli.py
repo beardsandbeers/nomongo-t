@@ -12,6 +12,7 @@ from . import Client, api
 METHODS = {
     "Upsert": ("upsert_request", api.UpsertRequest),
     "Delete": ("delete_request", api.DeleteRequest),
+    "DeleteByQuery": ("delete_by_query", api.DeleteByQueryRequest),
     "CreateIndex": ("create_index", api.CreateIndexRequest),
     "UpdateIndex": ("update_index", api.UpdateIndexRequest),
     "DropIndex": ("drop_index", api.DropIndexRequest),

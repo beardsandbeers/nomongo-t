@@ -96,7 +96,7 @@ The authoritative [protobuf schema](../src/proto/standalone/v1/standalone.proto)
 | Service | Operations |
 | --- | --- |
 | CatalogService | CreateIndex, GetIndex, GetIndexMappings, GetIndexStats, GetIndexFieldStats, ListIndexes, UpdateIndex, DropIndex |
-| DocumentService | Upsert, Delete |
+| DocumentService | Upsert, Delete, DeleteByQuery |
 | QueryService | Search, VectorSearch, GetMore, KillCursor |
 | OperationsService | GetStatus |
 
@@ -125,7 +125,25 @@ does not guarantee that a mismatched field value was indexed.
 
 A write targets exactly one index. For multiple text/vector indexes, the caller submits content
 to each index. There is no fan-out, cross-index transaction, collection, document read API,
-strict INSERT, delete-by-query workflow, request-ID deduplication, or replay endpoint.
+strict INSERT, request-ID deduplication, or replay endpoint.
+
+### Delete by query
+
+`DocumentService.DeleteByQuery` selects IDs and deletes them in batches from one index. Supply
+exactly one selector: `search_query_bson` containing a search operator, `vector_filter_bson`
+containing a vector metadata filter, or `match_all: true`. Both `write` and `query` roles and an
+index grant are required. Nested and namespaced vector indexes are currently unsupported.
+
+Selection is bounded to 10,000 distinct source IDs, 16 MiB of encoded IDs, and five seconds.
+`max_matches` can lower the document ceiling; exceeding a selection limit applies no deletes.
+`dry_run` returns the selected count without deletion. `processed_count` counts applied ID
+operations, including concurrently removed IDs. The optional generation fence and existing
+write concerns are supported.
+
+Ingestion continues during selection and between batches. Concurrent inserts can survive;
+replacements of selected IDs can be deleted. Rerun the predicate for another pass if matches
+remain. Failures after application starts may leave partial changes. See the
+[design](standalone-delete-by-query-design.md) for predicate syntax and completion semantics.
 
 ### Join filters
 

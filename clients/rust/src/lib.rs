@@ -275,6 +275,19 @@ impl Client {
             .map_err(normalize_status)?
             .into_inner())
     }
+    pub async fn delete_by_query(
+        &mut self,
+        message: DeleteByQueryRequest,
+    ) -> Result<DeleteByQueryResponse, Status> {
+        let mut request = Request::new(message);
+        request.set_timeout(self.timeout);
+        Ok(self
+            .documents
+            .delete_by_query(request)
+            .await
+            .map_err(normalize_status)?
+            .into_inner())
+    }
     pub async fn delete(&mut self, message: DeleteRequest) -> Result<DeleteResponse, Status> {
         let mut request = Request::new(message);
         request.set_timeout(self.timeout);

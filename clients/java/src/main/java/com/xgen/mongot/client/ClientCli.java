@@ -36,6 +36,11 @@ public final class ClientCli {
           var request = call.has("request") ? call.get("request").toString() : "{}";
           Message response;
           switch (call.get("method").getAsString()) {
+            case "DeleteByQuery" -> {
+              var b = DeleteByQueryRequest.newBuilder();
+              JsonFormat.parser().merge(request, b);
+              response = client.deleteByQuery(b.build());
+            }
             case "CreateIndex" -> {
               var b = CreateIndexRequest.newBuilder();
               JsonFormat.parser().merge(request, b);

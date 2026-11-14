@@ -232,6 +232,32 @@ public final class ApiIngestionManager implements ReplicationManager {
     }
   }
 
+  /** Completes batched writes on a still-ready generation without applying another mutation. */
+  public synchronized void completeWrite(
+      String id, InitializedIndex index, DocumentWriteConcern concern) {
+    if (concern == DocumentWriteConcern.UNRECOGNIZED) {
+      throw new IllegalArgumentException("Unknown write concern");
+    }
+    if (this.indexes.get(id) != index || !isGenerationReady(index.getGenerationId())) {
+      throw Status.FAILED_PRECONDITION
+          .withDescription("Generation is unavailable")
+          .asRuntimeException();
+    }
+    if (Context.current().isCancelled()) {
+      throw Status.CANCELLED.asRuntimeException();
+    }
+    try {
+      if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED) {
+        commit(id, index);
+      } else if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE) {
+        index.getReader().refresh();
+      }
+    } catch (java.io.IOException | com.xgen.mongot.index.ReaderClosedException e) {
+      index.setStatus(IndexStatus.failed("Lucene completion failed"));
+      throw Status.UNAVAILABLE.withCause(e).asRuntimeException();
+    }
+  }
+
   private void commit(String id, InitializedIndex index) throws java.io.IOException {
     index.getWriter().commit(EncodedUserData.EMPTY);
     this.dirty.remove(id);

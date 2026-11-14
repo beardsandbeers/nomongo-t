@@ -30,12 +30,25 @@ class DocumentCommandsMixin:
 
     def upsert_request(self, request: api.UpsertRequest, *, timeout=None) -> api.UpsertResponse:
         return self.documents.Upsert(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def delete_request(self, request: api.DeleteRequest, *, timeout=None) -> api.DeleteResponse:
         return self.documents.Delete(
-            request, timeout=self.timeout if timeout is None else timeout, metadata=self.metadata
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
+        )
+
+    def delete_by_query(
+        self, request: api.DeleteByQueryRequest, *, timeout=None
+    ) -> api.DeleteByQueryResponse:
+        return self.documents.DeleteByQuery(
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
         )
 
     def upsert(self, index_id: str, document: Mapping, **options) -> api.UpsertResponse:
@@ -64,7 +77,13 @@ class DocumentCommandsMixin:
         return self.delete_many(index_id, [id], **options)
 
     def delete_many(
-        self, index_id: str, ids: Iterable, *, concern="visible", generation_id="", timeout=None
+        self,
+        index_id: str,
+        ids: Iterable,
+        *,
+        concern="visible",
+        generation_id="",
+        timeout=None,
     ) -> api.DeleteResponse:
         return self.delete_request(
             api.DeleteRequest(
@@ -93,3 +112,38 @@ class Index:
 
     def delete_many(self, ids: Iterable, **options) -> api.DeleteResponse:
         return self.client.delete_many(self.index_id, ids, **options)
+
+    def delete_by_query(
+        self,
+        predicate: Mapping | None = None,
+        *,
+        vector=False,
+        match_all=False,
+        concern="visible",
+        generation_id="",
+        max_matches=0,
+        dry_run=False,
+        timeout=None,
+    ) -> api.DeleteByQueryResponse:
+        if match_all and predicate is not None:
+            raise ValueError("match_all and predicate are mutually exclusive")
+        selectors = (
+            {"match_all": True}
+            if match_all
+            else {
+                "vector_filter_bson" if vector else "search_query_bson": bson.encode(
+                    predicate or {}
+                )
+            }
+        )
+        return self.client.delete_by_query(
+            api.DeleteByQueryRequest(
+                index_id=self.index_id,
+                generation_id=generation_id,
+                write_concern=_concern(concern),
+                max_matches=max_matches,
+                dry_run=dry_run,
+                **selectors,
+            ),
+            timeout=timeout,
+        )

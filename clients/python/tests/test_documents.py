@@ -21,7 +21,7 @@ class RecordingClient(DocumentCommandsMixin):
             self.calls.append((request, options))
             return None
 
-        self.documents = SimpleNamespace(Upsert=record, Delete=record)
+        self.documents = SimpleNamespace(Upsert=record, Delete=record, DeleteByQuery=record)
 
 
 class IndexHelpersTest(unittest.TestCase):
@@ -48,6 +48,37 @@ class IndexHelpersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.upsert("index", {"_id": "a"}, concern="anything")
         self.assertEqual(len(client.calls), 1)
+
+    def test_delete_by_query_forwards_selector_concern_and_limits(self):
+        client = RecordingClient()
+        client.index("index").delete_by_query(
+            {"equals": {"path": "value", "value": Int64(1)}},
+            concern="committed",
+            generation_id="generation",
+            max_matches=7,
+            dry_run=True,
+            timeout=5,
+        )
+        request, options = client.calls[0]
+        self.assertEqual(request.index_id, "index")
+        self.assertEqual(request.WhichOneof("selector"), "search_query_bson")
+        self.assertIsInstance(bson.decode(request.search_query_bson)["equals"]["value"], Int64)
+        self.assertEqual(request.write_concern, api.DOCUMENT_WRITE_CONCERN_COMMITTED)
+        self.assertEqual(request.generation_id, "generation")
+        self.assertEqual(request.max_matches, 7)
+        self.assertTrue(request.dry_run)
+        self.assertEqual(options["timeout"], 5)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_delete_by_query_vector_and_match_all_are_explicit(self):
+        client = RecordingClient()
+        client.index("index").delete_by_query({"tenant": "gone"}, vector=True)
+        client.index("index").delete_by_query(match_all=True)
+        self.assertEqual(client.calls[0][0].WhichOneof("selector"), "vector_filter_bson")
+        self.assertTrue(client.calls[1][0].match_all)
+        with self.assertRaises(ValueError):
+            client.index("index").delete_by_query({"tenant": "gone"}, match_all=True)
+        self.assertEqual(len(client.calls), 2)
 
 
 if __name__ == "__main__":

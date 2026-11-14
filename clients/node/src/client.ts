@@ -1,3 +1,5 @@
+import type { DeleteByQueryRequest } from './generated/mongot/standalone/v1/DeleteByQueryRequest';
+import type { DeleteByQueryResponse__Output } from './generated/mongot/standalone/v1/DeleteByQueryResponse';
 import type { UpsertRequest } from './generated/mongot/standalone/v1/UpsertRequest';
 import type { UpsertResponse__Output } from './generated/mongot/standalone/v1/UpsertResponse';
 import type { DeleteRequest } from './generated/mongot/standalone/v1/DeleteRequest';
@@ -104,6 +106,9 @@ export class StandaloneClient {
   }
   upsert(request: UpsertRequest): Promise<UpsertResponse__Output> {
     return this.call((metadata, options, callback) => this.documents.upsert(request, metadata, options, callback));
+  }
+  deleteByQuery(request: DeleteByQueryRequest): Promise<DeleteByQueryResponse__Output> {
+    return this.call((metadata, options, callback) => this.documents.deleteByQuery(request, metadata, options, callback));
   }
   delete(request: DeleteRequest): Promise<DeleteResponse__Output> {
     return this.call((metadata, options, callback) => this.documents.delete(request, metadata, options, callback));

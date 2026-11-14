@@ -8,6 +8,7 @@ import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
+import com.xgen.mongot.standalone.grpc.DeleteByQueryRequest;
 import com.xgen.mongot.standalone.grpc.DeleteRequest;
 import com.xgen.mongot.standalone.grpc.DocumentServiceGrpc;
 import com.xgen.mongot.standalone.grpc.DocumentWriteConcern;
@@ -42,6 +43,585 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void deleteByQuery_singleOperatorCompound_matchesSearchSemantics() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-single-clause");
+      f.upsert(id, "{_id:'remove',title:'coffee'}");
+      f.upsert(id, "{_id:'keep',title:'tea'}");
+      String predicate = "{compound:{filter:{text:{path:'title',query:'coffee'}}}}";
+      assertThat(f.query(id, predicate).getArray("results")).hasSize(1);
+
+      var result =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setSearchQueryBson(bson(predicate))
+                  .build());
+
+      assertThat(result.getProcessedCount()).isEqualTo(1);
+      assertThat(f.results(id, "tea").getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_singleOperatorCompound_rejectsNestedUnsupportedOperator()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-single-unsupported");
+      f.upsert(id, "{_id:'keep',title:'coffee'}");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setSearchQueryBson(
+                              bson(
+                                  "{compound:{filter:{compound:{must:{"
+                                      + "knnBeta:{path:'v',vector:[1,0,0],k:1}}}}}}"))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_vectorClauseLimit_returnsResourceExhaustedWithoutDeleting()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("delete-clause-limit")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'},"
+                                  + "{type:'filter',path:'value'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      f.upsert(id, "{_id:'keep',value:1,v:[1,0,0]}");
+      var clauses =
+          java.util.stream.IntStream.range(0, 2000)
+              .mapToObj(
+                  i -> BsonDocument.parse("{value:{$gt:" + (i * 2) + ",$lt:" + (i * 2 + 2) + "}}"))
+              .collect(java.util.stream.Collectors.toCollection(org.bson.BsonArray::new));
+      var predicate = new BsonDocument("$or", clauses);
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setVectorFilterBson(
+                              ByteString.copyFrom(StandaloneDefinitionValidator.encode(predicate)))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_smallBatchByteLimit_splitsInternalDeletes() throws Exception {
+    var base = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            new StandaloneConfig.Limits(64, 100, 1000, 64),
+            base.maxInFlightRequests(),
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            base.tls(),
+            base.principals());
+    try (var f = new Fixture(config, new io.grpc.Metadata())) {
+      String id = f.create("delete-batches");
+      f.upsert(id, "{_id:'document-one',title:'coffee'}");
+      f.upsert(id, "{_id:'document-two',title:'coffee'}");
+      f.upsert(id, "{_id:'document-three',title:'coffee'}");
+      f.upsert(id, "{_id:'document-four',title:'coffee'}");
+
+      var result =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build());
+
+      assertThat(result.getProcessedCount()).isEqualTo(4);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void collectDocumentIds_cancellationBeforeScan_releasesReadersForLaterDeletion()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-cancel");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      try (var lease = f.runtime.ingestion().acquireStatisticsLease(generation.getGenerationId())) {
+        var error =
+            assertThrows(
+                StatusRuntimeException.class,
+                () ->
+                    lease
+                        .index()
+                        .getReader()
+                        .collectDocumentIds(
+                            new BsonDocument(),
+                            false,
+                            true,
+                            ignored -> {},
+                            () -> {
+                              throw Status.CANCELLED.asRuntimeException();
+                            }));
+
+        assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.CANCELLED);
+      }
+      assertThat(
+              f.docs
+                  .deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
+                  .getProcessedCount())
+          .isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void collectDocumentIds_duringSelection_allowsConcurrentIngestion() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-concurrent");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      var selected = new java.util.ArrayList<ByteString>();
+      try (var lease = f.runtime.ingestion().acquireStatisticsLease(generation.getGenerationId())) {
+        lease
+            .index()
+            .getReader()
+            .collectDocumentIds(
+                new BsonDocument(),
+                false,
+                true,
+                value -> {
+                  selected.add(ByteString.copyFrom(value));
+                  // The RPC runs on a different worker, so holding ingestion coordination here
+                  // would time out.
+                  f.docs
+                      .withDeadlineAfter(5, TimeUnit.SECONDS)
+                      .upsert(
+                          UpsertRequest.newBuilder()
+                              .setIndexId(id)
+                              .addDocumentsBson(bson("{_id:'later',title:'coffee'}"))
+                              .build());
+                },
+                () -> {});
+      }
+
+      assertThat(selected).hasSize(1);
+      assertThat(
+              f.docs
+                  .deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
+                  .getProcessedCount())
+          .isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_rebuiltGeneration_rejectsOldFenceAndPreservesNewDocuments()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-rebuild");
+      String old = f.ready(id, 1).getGenerationId();
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(id)
+              .setExpectedRevision(1)
+              .setDefinitionBson(bson("{mappings:{dynamic:true}}"))
+              .build());
+      f.ready(id, 2);
+      f.upsert(id, "{_id:'new',title:'coffee'}");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setGenerationId(old)
+                          .setMatchAll(true)
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_authorization_requiresBothRolesAndIndexGrantForDryRun()
+      throws Exception {
+    var base = StandaloneConfig.development(data(), 0);
+    var admin =
+        new StandaloneConfig.Principal(
+            "admin",
+            com.xgen.mongot.standalone.catalog.LocalIndexCatalog.digest(
+                "admin-token-012345678901234567890123456789"
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII)),
+            java.util.Set.of(StandaloneConfig.Role.values()),
+            java.util.Set.of("*"));
+    var writer =
+        new StandaloneConfig.Principal(
+            "writer",
+            com.xgen.mongot.standalone.catalog.LocalIndexCatalog.digest(
+                "writer-token-012345678901234567890123456789"
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII)),
+            java.util.Set.of(StandaloneConfig.Role.WRITE),
+            java.util.Set.of("*"));
+    var restricted =
+        new StandaloneConfig.Principal(
+            "restricted",
+            com.xgen.mongot.standalone.catalog.LocalIndexCatalog.digest(
+                "restricted-token-012345678901234567890123456789"
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII)),
+            java.util.Set.of(StandaloneConfig.Role.WRITE, StandaloneConfig.Role.QUERY),
+            java.util.Set.of("507f1f77bcf86cd799439011"));
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            base.documentLimits(),
+            base.maxInFlightRequests(),
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            base.tls(),
+            java.util.List.of(admin, writer, restricted));
+    try (var f = new Fixture(config, bearer("admin-token-012345678901234567890123456789"))) {
+      String id = f.create("delete-auth");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var request =
+          DeleteByQueryRequest.newBuilder()
+              .setIndexId(id)
+              .setMatchAll(true)
+              .setDryRun(true)
+              .build();
+      var writerStub =
+          DocumentServiceGrpc.newBlockingStub(f.channel)
+              .withInterceptors(
+                  io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(
+                      bearer("writer-token-012345678901234567890123456789")));
+      var restrictedStub =
+          DocumentServiceGrpc.newBlockingStub(f.channel)
+              .withInterceptors(
+                  io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(
+                      bearer("restricted-token-012345678901234567890123456789")));
+
+      var missingRole =
+          assertThrows(StatusRuntimeException.class, () -> writerStub.deleteByQuery(request));
+      var missingGrant =
+          assertThrows(StatusRuntimeException.class, () -> restrictedStub.deleteByQuery(request));
+
+      assertThat(missingRole.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+      assertThat(missingGrant.getStatus().getCode()).isEqualTo(Status.Code.PERMISSION_DENIED);
+      assertThat(f.docs.deleteByQuery(request).getMatchedCount()).isEqualTo(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  private static io.grpc.Metadata bearer(String token) {
+    var headers = new io.grpc.Metadata();
+    headers.put(
+        io.grpc.Metadata.Key.of("authorization", io.grpc.Metadata.ASCII_STRING_MARSHALLER),
+        "Bearer " + token);
+    return headers;
+  }
+
+  @Test
+  public void deleteByQuery_partitionedEmbedded_preservesTypedIdsAndDeletesWholeBlocks()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("delete-blocks")
+                      .setType(IndexType.INDEX_TYPE_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{numPartitions:2,mappings:{dynamic:true,fields:{"
+                                  + "items:{type:'embeddedDocuments',dynamic:true}}}}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      f.upsert(id, "{_id:1,items:[{value:'remove'},{value:'remove'}]}");
+      f.upsert(id, "{_id:{$numberLong:'1'},items:[{value:'keep'}]}");
+      f.upsert(id, "{_id:'1',title:'keep'}");
+      f.upsert(id, "{_id:{$oid:'507f1f77bcf86cd799439011'},title:'keep'}");
+
+      var removed =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setSearchQueryBson(
+                      bson(
+                          "{embeddedDocument:{path:'items',operator:{"
+                              + "text:{path:'items.value',query:'remove'}}}}"))
+                  .build());
+
+      assertThat(removed.getMatchedCount()).isEqualTo(1);
+      assertThat(removed.getProcessedCount()).isEqualTo(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(3);
+      assertThat(f.stats(id).getLuceneDocumentCount()).isEqualTo(4);
+      assertThat(
+              f.docs
+                  .deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
+                  .getMatchedCount())
+          .isEqualTo(3);
+      assertThat(f.stats(id).getLuceneDocumentCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_committed_survivesRestart() throws Exception {
+    String id;
+    try (var f = new Fixture(data())) {
+      id = f.create("delete-commit");
+      f.upsert(id, "{_id:'gone',title:'coffee'}");
+      f.upsert(id, "{_id:'keep',title:'tea'}");
+
+      var result =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setSearchQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED)
+                  .build());
+
+      assertThat(result.getProcessedCount()).isEqualTo(1);
+    }
+    try (var reopened = new Fixture(data())) {
+      reopened.ready(id, 1);
+      assertThat(reopened.results(id, "coffee").getArray("results")).isEmpty();
+      assertThat(reopened.results(id, "tea").getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_indexedWrite_refreshesBeforeSelection() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-indexed");
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .addDocumentsBson(bson("{_id:'a',title:'coffee'}"))
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED)
+              .build());
+
+      var result =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setSearchQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+
+      assertThat(result.getMatchedCount()).isEqualTo(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_nestedUnsupportedOperator_rejectsBeforeWriting() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-invalid");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setSearchQueryBson(
+                              bson(
+                                  "{compound:{filter:[{join:{localField:'title',"
+                                      + "foreignField:'title',"
+                                      + "operator:{exists:{path:'title'}}}}]}}"))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+      assertThat(
+              f.docs
+                  .deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
+                  .getProcessedCount())
+          .isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_invalidSelectors_rejectsBeforeWriting() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-selector");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var empty =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setSearchQueryBson(bson("{}"))
+                          .build()));
+      var falseAll =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(false).build()));
+      var incompatible =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setVectorFilterBson(bson("{title:'coffee'}"))
+                          .build()));
+
+      assertThat(empty.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(falseAll.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(incompatible.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_vectorFilter_preservesNonmatchingDocuments() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("delete-vector")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'},{type:'filter',path:'tenant'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      f.upsert(id, "{_id:'a',tenant:'gone',v:[1,0,0]}");
+      f.upsert(id, "{_id:'b',tenant:'keep',v:[0,1,0]}");
+      f.upsert(id, "{_id:'c',tenant:'gone'}");
+
+      var result =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setVectorFilterBson(bson("{tenant:{$eq:'gone'}}"))
+                  .build());
+
+      assertThat(result.getMatchedCount()).isEqualTo(2);
+      assertThat(result.getProcessedCount()).isEqualTo(2);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_staleGeneration_rejectsWithoutDeletion() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-generation");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setMatchAll(true)
+                          .setGenerationId("stale")
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(io.grpc.Status.Code.FAILED_PRECONDITION);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_dryRunThenDelete_preservesNonmatches() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-query");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'tea'}");
+      var request =
+          DeleteByQueryRequest.newBuilder()
+              .setIndexId(id)
+              .setSearchQueryBson(bson("{text:{path:'title',query:'coffee'}}"));
+
+      var preview = f.docs.deleteByQuery(request.setDryRun(true).build());
+
+      assertThat(preview.getMatchedCount()).isEqualTo(1);
+      assertThat(preview.getProcessedCount()).isEqualTo(0);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+      var deleted = f.docs.deleteByQuery(request.setDryRun(false).build());
+      assertThat(deleted.getProcessedCount()).isEqualTo(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+      assertThat(f.docs.deleteByQuery(request.build()).getMatchedCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_exceedsCeiling_deletesNothing() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-ceiling");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+
+      var error =
+          assertThrows(
+              io.grpc.StatusRuntimeException.class,
+              () ->
+                  f.docs.deleteByQuery(
+                      DeleteByQueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setMatchAll(true)
+                          .setMaxMatches(1)
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(io.grpc.Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+      assertThat(
+              f.docs
+                  .deleteByQuery(
+                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
+                  .getProcessedCount())
+          .isEqualTo(2);
+    }
+  }
 
   @Test
   public void getIndexStats_emptyAndMutations_reportsLiveDocumentsAndOptionalAverages()
@@ -764,16 +1344,26 @@ public class StandaloneGrpcServerTest {
     private final QueryServiceGrpc.QueryServiceBlockingStub queries;
 
     private Fixture(Path data) throws Exception {
-      this.runtime = new StandaloneRuntime(StandaloneConfig.development(data, 0));
+      this(StandaloneConfig.development(data, 0), new io.grpc.Metadata());
+    }
+
+    private Fixture(StandaloneConfig config, io.grpc.Metadata headers) throws Exception {
+      this.runtime = new StandaloneRuntime(config);
       this.server = new StandaloneGrpcServer(this.runtime).start();
       this.channel =
           NettyChannelBuilder.forAddress("127.0.0.1", this.server.port()).usePlaintext().build();
       this.catalog =
-          CatalogServiceGrpc.newBlockingStub(this.channel).withDeadlineAfter(45, TimeUnit.SECONDS);
+          CatalogServiceGrpc.newBlockingStub(this.channel)
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
+              .withDeadlineAfter(45, TimeUnit.SECONDS);
       this.docs =
-          DocumentServiceGrpc.newBlockingStub(this.channel).withDeadlineAfter(45, TimeUnit.SECONDS);
+          DocumentServiceGrpc.newBlockingStub(this.channel)
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
+              .withDeadlineAfter(45, TimeUnit.SECONDS);
       this.queries =
-          QueryServiceGrpc.newBlockingStub(this.channel).withDeadlineAfter(45, TimeUnit.SECONDS);
+          QueryServiceGrpc.newBlockingStub(this.channel)
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
+              .withDeadlineAfter(45, TimeUnit.SECONDS);
     }
 
     private String create(String name) throws Exception {

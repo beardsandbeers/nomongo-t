@@ -122,6 +122,10 @@ public final class StandaloneClient implements AutoCloseable {
     return documents.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).upsert(request);
   }
 
+  public DeleteByQueryResponse deleteByQuery(DeleteByQueryRequest request) {
+    return documents.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).deleteByQuery(request);
+  }
+
   public DeleteResponse delete(DeleteRequest request) {
     return documents.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).delete(request);
   }

@@ -15,11 +15,15 @@ public class LuceneVectorQueryFactoryDistributor {
 
   private final VectorSearchQueryFactory vectorSearchQueryFactory;
   private final VectorFieldDefinitionResolver definitionResolver;
+  private final VectorSearchFilterQueryFactory filters;
 
   private LuceneVectorQueryFactoryDistributor(
-      VectorSearchQueryFactory vectorSearchQueryFactory, VectorQueryFactoryContext context) {
+      VectorSearchQueryFactory vectorSearchQueryFactory,
+      VectorQueryFactoryContext context,
+      VectorSearchFilterQueryFactory filters) {
     this.vectorSearchQueryFactory = vectorSearchQueryFactory;
     this.definitionResolver = context.getFieldDefinitionResolver();
+    this.filters = filters;
   }
 
   public static LuceneVectorQueryFactoryDistributor create(
@@ -30,12 +34,28 @@ public class LuceneVectorQueryFactoryDistributor {
   public static LuceneVectorQueryFactoryDistributor create(
       VectorQueryFactoryContext factoryContext,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry) {
+    var filters = VectorSearchFilterQueryFactory.create(factoryContext, dynamicFeatureFlagRegistry);
     return new LuceneVectorQueryFactoryDistributor(
-        new VectorSearchQueryFactory(
-            factoryContext,
-            VectorSearchFilterQueryFactory.create(factoryContext, dynamicFeatureFlagRegistry),
-            dynamicFeatureFlagRegistry),
-        factoryContext);
+        new VectorSearchQueryFactory(factoryContext, filters, dynamicFeatureFlagRegistry),
+        factoryContext,
+        filters);
+  }
+
+  /** Compiles a metadata predicate independently of vector ranking, using the index settings. */
+  public Query createFilter(org.bson.BsonDocument predicate, IndexReader reader)
+      throws InvalidQueryException, IOException {
+    try (var parser =
+        com.xgen.mongot.util.bson.parser.BsonDocumentParser.fromRoot(
+                new org.bson.BsonDocument("filter", predicate))
+            .build()) {
+      var filter =
+          com.xgen.mongot.index.query.operators.VectorSearchFilter.fromBson(
+                  parser, com.xgen.mongot.index.query.operators.VectorSearchFilter.Type.CLAUSE)
+              .orElseThrow();
+      return this.filters.createLuceneFilter(filter, reader);
+    } catch (com.xgen.mongot.util.bson.parser.BsonParseException e) {
+      throw new IllegalArgumentException(e.getMessage(), e);
+    }
   }
 
   public Query createQuery(MaterializedVectorSearchQuery query, IndexReader indexReader)

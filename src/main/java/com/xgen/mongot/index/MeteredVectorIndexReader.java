@@ -15,6 +15,17 @@ import org.bson.BsonArray;
 public class MeteredVectorIndexReader implements VectorIndexReader {
 
   @Override
+  public void collectDocumentIds(
+      org.bson.BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Consumer<byte[]> ids,
+      Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    this.indexReader.collectDocumentIds(predicate, vector, all, ids, check);
+  }
+
+  @Override
   public com.xgen.mongot.index.statistics.LuceneStatisticsSnapshot acquireStatisticsSnapshot()
       throws IOException, ReaderClosedException {
     return this.indexReader.acquireStatisticsSnapshot();
