@@ -3,6 +3,7 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "query",
     srcs = [
+        "AdaptiveJoinQuery.java",
         "AllDocsQueryFactory.java",
         "AutocompleteQueryFactory.java",
         "BooleanRangeQueryFactory.java",
@@ -63,6 +64,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/analyzer",
+        "//src/main/java/com/xgen/mongot/index/analyzer/definition",
         "//src/main/java/com/xgen/mongot/index/analyzer/wrapper",
         "//src/main/java/com/xgen/mongot/index/definition",
         "//src/main/java/com/xgen/mongot/index/definition/quantization",
@@ -116,6 +118,7 @@ java_library(
         "@maven//:org_apache_lucene_lucene_queries",
         "@maven//:org_apache_lucene_lucene_queryparser",
         "@maven//:org_apache_lucene_lucene_sandbox",
+        "@maven//:org_jetbrains_annotations",
         "@maven//:org_mongodb_bson",
         "@maven//:org_mongodb_mongodb_driver_core",
         "@maven//:org_slf4j_slf4j_api",
