@@ -1,15 +1,12 @@
 package com.xgen.mongot.index.query.operators;
 
 import com.xgen.mongot.index.query.scores.Score;
-import java.util.List;
 import org.bson.BsonValue;
 
-/** Internal immutable indexed-token membership. Keys are never serialized into a request. */
-public record MaterializedJoinOperator(JoinOperator join, List<String> keys) implements Operator {
-  public MaterializedJoinOperator(JoinOperator join, List<String> keys) {
-    this.join = join;
-    this.keys = List.copyOf(keys);
-  }
+/** Internal binary membership and execution hints. Neither is serialized into a request. */
+public record MaterializedJoinOperator(
+    JoinOperator join, JoinField field, JoinKeySet keys, boolean exhaustive, int countThreshold)
+    implements Operator {
 
   @Override
   public Type getType() {

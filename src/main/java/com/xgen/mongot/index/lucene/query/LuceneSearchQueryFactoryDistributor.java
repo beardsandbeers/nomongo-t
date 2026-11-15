@@ -9,10 +9,12 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
+import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.analyzer.wrapper.LuceneAnalyzer;
 import com.xgen.mongot.index.analyzer.wrapper.QueryAnalyzerWrapper;
 import com.xgen.mongot.index.definition.EmbeddedDocumentsFieldDefinition;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.SortFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.field.FieldName;
@@ -44,6 +46,7 @@ import com.xgen.mongot.index.query.operators.GeoWithinOperator;
 import com.xgen.mongot.index.query.operators.HasAncestorOperator;
 import com.xgen.mongot.index.query.operators.HasRootOperator;
 import com.xgen.mongot.index.query.operators.InOperator;
+import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.JoinOperator;
 import com.xgen.mongot.index.query.operators.KnnBetaOperator;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
@@ -364,15 +367,23 @@ public class LuceneSearchQueryFactoryDistributor {
     return new QueryBitSetProducer(EmbeddedDocumentQueryFactory.ROOT_DOCUMENTS_QUERY);
   }
 
-  /** Resolves only explicit root token mappings; collected join keys are already normalized. */
-  public com.xgen.mongot.index.definition.TokenFieldDefinition tokenField(FieldPath path)
-      throws InvalidQueryException {
-    return this.queryFactoryContext
-        .getTokenFieldDefinition(path, Optional.empty())
-        .orElseThrow(
-            () ->
-                new InvalidQueryException(
-                    "Join path '%s' must be indexed as token".formatted(path)));
+  /** Resolves the native equality domain, including explicitly mapped _id fields. */
+  public JoinField joinField(FieldPath path) throws InvalidQueryException {
+    var token = this.queryFactoryContext.getTokenFieldDefinition(path, Optional.empty());
+    var objectId = this.queryFactoryContext.getObjectIdFieldDefinition(path, Optional.empty());
+    if (token.isEmpty() && objectId.isEmpty()) {
+      throw new InvalidQueryException(
+          "Join path '%s' must be indexed as token or objectId".formatted(path));
+    }
+    // Preserve existing token joins when a static mapping or dynamic type set also indexes
+    // ObjectIds. Only the selected ObjectId domain requires ObjectId DocValues support.
+    if (token.isEmpty()
+        && !this.queryFactoryContext.getIndexCapabilities().supportsObjectIdAndBooleanDocValues()) {
+      throw new InvalidQueryException("ObjectId joins require DocValues; rebuild this index");
+    }
+    return new JoinField(
+        token.isPresent() ? JoinField.Type.TOKEN : JoinField.Type.OBJECT_ID,
+        token.flatMap(TokenFieldDefinition::normalizer).orElse(StockNormalizerName.NONE));
   }
 
   public Query createVectorQuery(

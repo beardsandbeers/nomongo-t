@@ -14,8 +14,9 @@ default `INDEXED` behavior. See the [ingestion guide](https://github.com/beardsa
 The server also supports cross-index joins and self-joins inside search filters and exclusions.
 Use `from: "indexName"` (omit for self-joins), explicit `localField`/`foreignField`, and a foreign
 `operator` inside `compound.filter` or `compound.mustNot`. Both keys must be strings mapped as
-`token` with matching normalizers. Native typed `_id` keys and foreign-document enrichment
-are outside this release. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/main/README.md#join-searches-across-indexes).
+`token` with matching normalizers. The current source also supports native `objectId` keys and explicitly mapped `_id` fields;
+these extensions require a build containing the native-key join changes. Foreign-document
+enrichment remains unsupported. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/main/README.md#join-searches-across-indexes).
 
 `GetIndexStats` and `GetIndexFieldStats` expose document counts, storage averages, and field
 storage/memory diagnostics. `GetIndexMappings` exports static mappings. Matching Python, Rust,

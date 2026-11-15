@@ -7,11 +7,14 @@ import com.google.protobuf.ByteString;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.batch.BatchCursorOptions;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
+import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.operators.CompoundClause;
 import com.xgen.mongot.index.query.operators.CompoundOperator;
+import com.xgen.mongot.index.query.operators.JoinField;
+import com.xgen.mongot.index.query.operators.JoinKeySet;
 import com.xgen.mongot.index.query.operators.JoinOperator;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
@@ -44,7 +47,6 @@ import io.grpc.netty.NettyChannelBuilder;
 import io.grpc.stub.MetadataUtils;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -194,6 +196,143 @@ public class StandaloneJoinsTest {
     assertThat(explain.containsKey("collectors")).isTrue();
     assertThat(explain.get("query").toString()).contains("parent");
     assertThat(explain.get("query").toString()).doesNotContain("office");
+  }
+
+  @Test
+  public void search_objectIdReferencesToMappedId_preservesBinaryKeysAcrossPartitionsAndPages()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign =
+          f.create("foreign", MAPPING.replace("key:{type:'token'}", "_id:{type:'objectId'}"));
+      String local =
+          f.create("local", MAPPING.replace("parent:{type:'token'}", "parent:{type:'objectId'}"));
+      f.upsert(foreign, "{_id:{$oid:'ff0000000000000000000001'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:{$oid:'ff0000000000000000000002'},office:'Paris'}");
+      f.upsert(local, "{_id:'a',parent:{$oid:'ff0000000000000000000001'}}");
+      f.upsert(
+          local,
+          "{_id:'b',parent:[{$oid:'ff0000000000000000000002'},{$oid:'ff0000000000000000000001'}]}");
+      f.upsert(local, "{_id:'other',parent:{$oid:'ff0000000000000000000002'}}");
+      f.upsert(local, "{_id:'string',parent:'ff0000000000000000000001'}");
+      String query = JOIN.replace("foreignField:'key'", "foreignField:'_id'");
+
+      var first = f.search(local, query, 1);
+      var next =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
+
+      assertThat(ids(first)).hasSize(1);
+      assertThat(ids(next)).hasSize(1);
+      assertThat(ids(next)).containsNoneIn(ids(first));
+      assertThat(ids(f.search(local, query, 100))).containsExactly("a", "b");
+      assertThat(
+              new RawBsonDocument(first.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getNumber("total")
+                  .longValue())
+          .isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void search_tokenAndObjectIdMappings_preservesNormalizedTokenJoins() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String mapping =
+          MAPPING
+              .replace(
+                  "key:{type:'token'}",
+                  "key:[{type:'token',normalizer:'lowercase'},{type:'objectId'}]")
+              .replace(
+                  "parent:{type:'token'}",
+                  "parent:[{type:'token',normalizer:'lowercase'},{type:'objectId'}]");
+      String foreign = f.create("foreign", mapping);
+      String local = f.create("local", mapping);
+      f.upsert(foreign, "{_id:'p',key:'ABC',office:'Berlin'}");
+      f.upsert(foreign, "{_id:'oid-parent',key:{$oid:'ff0000000000000000000001'},office:'Berlin'}");
+      f.upsert(local, "{_id:'string-match',parent:'abc'}");
+      f.upsert(local, "{_id:'oid-child',parent:{$oid:'ff0000000000000000000001'}}");
+
+      var response = f.search(local, JOIN, 100);
+
+      assertThat(ids(response)).containsExactly("string-match");
+    }
+  }
+
+  @Test
+  public void search_dynamicTokenAndObjectIdTypeSet_preservesTokenJoins() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String mapping =
+          """
+          {numPartitions:2,storedSource:true,
+           typeSets:[{name:'joinKeys',types:[
+             {type:'token',normalizer:'lowercase'},{type:'objectId'}]}],
+           mappings:{dynamic:{typeSet:'joinKeys'}}}
+          """;
+      String foreign = f.create("foreign", mapping);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'p',key:'ABC',office:'BERLIN'}");
+      f.upsert(local, "{_id:'match',parent:'abc'}");
+      // The same normalization requirement still applies to a dynamically resolved token.
+      String normalizedLocal =
+          f.create(
+              "normalized-local",
+              MAPPING.replace(
+                  "parent:{type:'token'}", "parent:{type:'token',normalizer:'lowercase'}"));
+      f.upsert(normalizedLocal, "{_id:'match',parent:'abc'}");
+
+      var response = f.search(normalizedLocal, JOIN, 100);
+      var mismatch = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(ids(response)).containsExactly("match");
+      assertThat(mismatch.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+    }
+  }
+
+  @Test
+  public void search_objectIdAndTokenMappings_rejectsCrossTypeJoin() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      f.create("foreign", MAPPING.replace("key:{type:'token'}", "key:{type:'objectId'}"));
+      String local = f.create("local", MAPPING);
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription()).contains("same type");
+    }
+  }
+
+  @Test
+  public void materializeJoin_countRequirements_preservesRequestHints() throws Exception {
+    var totalQuery = SearchQuery.fromBson(BsonDocument.parse(JOIN));
+    var boundedQuery =
+        SearchQuery.fromBson(
+            BsonDocument.parse(JOIN.replace("type:'total'", "type:'lowerBound',threshold:17")));
+    var facetQuery =
+        SearchQuery.fromBson(
+            new BsonDocument(
+                "facet",
+                new BsonDocument(
+                        "operator",
+                        new BsonDocument(
+                            "compound", BsonDocument.parse(JOIN).getDocument("compound")))
+                    .append(
+                        "facets", BsonDocument.parse("{offices:{type:'string',path:'office'}}"))));
+    var join =
+        (JoinOperator)
+            ((CompoundOperator) StandaloneJoinPlanner.operator(totalQuery))
+                .filter()
+                .operators()
+                .getFirst();
+    var field = new JoinField(JoinField.Type.TOKEN, StockNormalizerName.NONE);
+    var keys = new JoinKeySet.Builder(ignored -> {}).build();
+
+    var total = StandaloneJoinPlanner.materializeJoin(join, field, keys, totalQuery);
+    var bounded = StandaloneJoinPlanner.materializeJoin(join, field, keys, boundedQuery);
+    var facet = StandaloneJoinPlanner.materializeJoin(join, field, keys, facetQuery);
+
+    assertThat(total.exhaustive()).isTrue();
+    assertThat(bounded.exhaustive()).isFalse();
+    assertThat(bounded.countThreshold()).isEqualTo(17);
+    assertThat(facet.exhaustive()).isTrue();
   }
 
   @Test
@@ -815,11 +954,14 @@ public class StandaloneJoinsTest {
       var compound = (CompoundOperator) parsed.operator();
       var join = (JoinOperator) compound.filter().operators().getFirst();
       try (var snapshot = f.runtime.acquireQuerySnapshot(generation, false)) {
-        var keys = new HashSet<String>();
-        snapshot.collectKeys(join.operator(), join.foreignField(), keys::add, () -> {});
+        var builder = new JoinKeySet.Builder(ignored -> {});
+        snapshot.collectKeys(join.operator(), join.foreignField(), builder::add, () -> {});
+        var keys = builder.build();
         f.upsert(index, "{_id:'manager',key:'m',office:'Paris'}");
         f.upsert(index, "{_id:'employee',parent:'absent'}");
-        var materialized = new MaterializedJoinOperator(join, List.copyOf(keys));
+        var materialized =
+            new MaterializedJoinOperator(
+                join, snapshot.joinField(join.localField()), keys, true, 1000);
         var planned =
             parsed.withOperator(
                 new CompoundOperator(
@@ -848,7 +990,9 @@ public class StandaloneJoinsTest {
                       Bytes.ofBytes(1024 * 1024),
                       new BatchCursorOptions(Optional.empty(), Optional.of(100)));
 
-          assertThat(keys).containsExactly("m");
+          assertThat(
+                  keys.terms().stream().map(org.apache.lucene.util.BytesRef::utf8ToString).toList())
+              .containsExactly("m");
           assertThat(batch.batch.asArray()).hasSize(1);
           assertThat(
                   batch

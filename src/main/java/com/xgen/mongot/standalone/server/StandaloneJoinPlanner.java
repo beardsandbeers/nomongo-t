@@ -1,18 +1,20 @@
 package com.xgen.mongot.standalone.server;
 
 import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot;
-import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.CollectorQuery;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.collectors.AggregationCollector;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
+import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.index.query.operators.CompoundClause;
 import com.xgen.mongot.index.query.operators.CompoundOperator;
 import com.xgen.mongot.index.query.operators.EmbeddedDocumentOperator;
 import com.xgen.mongot.index.query.operators.HasAncestorOperator;
 import com.xgen.mongot.index.query.operators.HasRootOperator;
+import com.xgen.mongot.index.query.operators.JoinField;
+import com.xgen.mongot.index.query.operators.JoinKeySet;
 import com.xgen.mongot.index.query.operators.JoinOperator;
 import com.xgen.mongot.index.query.operators.KnnBetaOperator;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
@@ -25,10 +27,8 @@ import io.grpc.Context;
 import io.grpc.Status;
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,7 +39,7 @@ import org.apache.lucene.util.IOUtils;
 import org.bson.types.ObjectId;
 import org.jetbrains.annotations.Nullable;
 
-/** Resolves authorized index dependencies and bounded token membership before opening a cursor. */
+/** Resolves authorized index dependencies and bounded binary membership before opening a cursor. */
 final class StandaloneJoinPlanner {
   static final int MAX_JOINS = 8;
   static final int MAX_KEYS = 100_000;
@@ -111,31 +111,22 @@ final class StandaloneJoinPlanner {
       Map<JoinOperator, MaterializedJoinOperator> resolved = new HashMap<>();
       for (var join : joins) {
         var foreign = Objects.requireNonNull(plan.snapshots.get(targets.get(join)));
-        var localToken = localSnapshot.tokenField(join.localField());
-        var foreignToken = foreign.tokenField(join.foreignField());
-        if (!localToken
-            .normalizer()
-            .orElse(StockNormalizerName.NONE)
-            .equals(foreignToken.normalizer().orElse(StockNormalizerName.NONE))) {
-          throw invalid("Join fields must use the same token normalizer");
+        var localField = localSnapshot.joinField(join.localField());
+        var foreignField = foreign.joinField(join.foreignField());
+        if (!localField.equals(foreignField)) {
+          throw invalid("Join fields must use the same type and token normalizer");
         }
-        var keys = new HashSet<String>();
+        // Account for the initial byte-pool block and fixed probe/ordinal scratch as well as keys.
+        plan.reserveBytes(
+            64L * 1024 * (1L + (long) localSnapshot.partitions() * plan.localQueryCopies));
+        var keys = new JoinKeySet.Builder(plan::reserveKey);
         long foreignStart = System.nanoTime();
         try (var ignored = Explain.suspend()) {
-          foreign.collectKeys(
-              join.operator(),
-              join.foreignField(),
-              key -> {
-                plan.checkWork();
-                if (keys.add(key)) {
-                  plan.reserveKey(key);
-                }
-              },
-              plan::checkWork);
+          foreign.collectKeys(join.operator(), join.foreignField(), keys::add, plan::checkWork);
         } finally {
           this.runtime.metrics().elapsed("joins.foreign", foreignStart);
         }
-        resolved.put(join, new MaterializedJoinOperator(join, List.copyOf(keys)));
+        resolved.put(join, materializeJoin(join, localField, keys.build(), query));
       }
       var materialized = materialize(operator(query), resolved);
       plan.query =
@@ -143,7 +134,7 @@ final class StandaloneJoinPlanner {
             case OperatorQuery local -> local.withOperator(materialized);
             case CollectorQuery collector -> collector.withOperator(materialized);
           };
-      // Foreign searchers are unnecessary once membership owns immutable token strings.
+      // Foreign searchers are unnecessary once membership owns immutable binary keys.
       for (var entry : plan.snapshots.entrySet()) {
         if (entry.getValue() != localSnapshot) {
           entry.getValue().close();
@@ -165,6 +156,16 @@ final class StandaloneJoinPlanner {
     } finally {
       this.runtime.metrics().elapsed("joins.prepare", startNanos);
     }
+  }
+
+  static MaterializedJoinOperator materializeJoin(
+      JoinOperator join, JoinField field, JoinKeySet keys, SearchQuery query) {
+    return new MaterializedJoinOperator(
+        join,
+        field,
+        keys,
+        query instanceof CollectorQuery || query.count().type() == Count.Type.TOTAL,
+        query.count().threshold());
   }
 
   private static void validate(
@@ -337,15 +338,14 @@ final class StandaloneJoinPlanner {
       }
     }
 
-    private void reserveKey(String key) {
+    private void reserveKey(int keyBytes) {
       if (++this.keys > MAX_KEYS) {
         throw exhausted("Join distinct-key limit exceeded");
       }
-      // Includes Java strings/hash entries, immutable lists, per-partition term queries and
-      // rewrites.
+      // Includes pooled bytes, foreign ordinal deduplication, per-partition probes,
+      // lazy term queries and rewrites. Keep conservative cursor-lifetime admission.
       long estimate =
-          (400L + 16L * key.getBytes(StandardCharsets.UTF_8).length)
-              * (1L + (long) snapshot().partitions() * this.localQueryCopies);
+          (400L + 16L * keyBytes) * (1L + (long) snapshot().partitions() * this.localQueryCopies);
       reserveBytes(estimate);
     }
 

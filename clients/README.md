@@ -166,8 +166,9 @@ hits = decode_bson(response.batch_bson)["results"]
 `from` is an instance-wide index name; omit it for a self-join. Use the predicate
 in `compound.mustNot` for exclusion. The caller needs QUERY access to every index
 in the join. Foreign matches do not duplicate local hits or affect their scores.
-Arrays match when any indexed token is shared. Native typed `_id` joins and
-foreign-document enrichment are outside the initial scope.
+Arrays match when any indexed key is shared. Current builds also support native `objectId`
+keys, including `_id` with an explicit matching mapping. Numeric keys and foreign-document
+enrichment remain unsupported.
 
 `GetMore` retains the initial local readers and foreign membership. Dropping a
 dependency or retiring its generation invalidates the cursor. Budget violations

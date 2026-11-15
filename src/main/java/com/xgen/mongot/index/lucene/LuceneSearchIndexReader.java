@@ -24,7 +24,6 @@ import com.xgen.mongot.index.VectorSearchResult;
 import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
-import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.lucene.LuceneAggregationSearchManager.AggregationQueryInfo;
 import com.xgen.mongot.index.lucene.LuceneFacetCollectorSearchManager.FacetCollectorQueryInfo;
 import com.xgen.mongot.index.lucene.LuceneSearchManager.QueryInfo;
@@ -62,6 +61,7 @@ import com.xgen.mongot.index.query.collectors.DrillSidewaysInfoBuilder.DrillSide
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.index.query.operators.AllDocumentsOperator;
+import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.index.query.sort.SequenceToken;
 import com.xgen.mongot.index.query.sort.SortSpec;
@@ -93,6 +93,7 @@ import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.internal.hppc.LongHashSet;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.CollectionStatistics;
@@ -103,6 +104,7 @@ import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.util.BytesRef;
 import org.bson.BsonDocument;
 import org.jetbrains.annotations.Nullable;
 
@@ -408,13 +410,13 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public TokenFieldDefinition tokenField(FieldPath path) throws InvalidQueryException {
-      return LuceneSearchIndexReader.this.queryFactory.tokenField(path);
+    public JoinField joinField(FieldPath path) throws InvalidQueryException {
+      return LuceneSearchIndexReader.this.queryFactory.joinField(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<String> keys, Runnable checkWork)
+        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
         throws IOException, InvalidQueryException {
       try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock)) {
         LuceneSearchIndexReader.this.ensureOpen("collectJoinKeys");
@@ -423,10 +425,10 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     }
 
     private void collectKeysOnSnapshot(
-        Operator operator, FieldPath path, Consumer<String> keys, Runnable checkWork)
+        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
         throws IOException, InvalidQueryException {
       checkState(!this.closed && !this.transferred, "Query snapshot is no longer available");
-      tokenField(path);
+      var joinField = joinField(path);
       // A self-join shares this pinned reader with the local query. Use an unprofiled searcher
       // over that same reader so membership collection cannot pollute the local query's plan.
       var searcher = LuceneIndexSearcher.create(this.reference.getIndexSearcher());
@@ -453,18 +455,24 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
               .add(predicate, BooleanClause.Occur.FILTER)
               .add(rootFilter, BooleanClause.Occur.FILTER)
               .build();
-      String field = FieldName.TypeField.TOKEN.getLuceneFieldName(path, Optional.empty());
+      String field =
+          (joinField.type() == JoinField.Type.TOKEN
+                  ? FieldName.TypeField.TOKEN
+                  : FieldName.TypeField.OBJECT_ID)
+              .getLuceneFieldName(path, Optional.empty());
       // Collect sequentially: DocValues iterators and the bounded key collector are
       // execution-local.
       searcher.search(
           query,
           new SimpleCollector() {
             private SortedSetDocValues values = DocValues.emptySortedSet();
+            private LongHashSet seen = new LongHashSet();
 
             @Override
             protected void doSetNextReader(LeafReaderContext context) throws IOException {
               checkWork.run();
               this.values = DocValues.getSortedSet(context.reader(), field);
+              this.seen = new LongHashSet();
             }
 
             @Override
@@ -472,7 +480,11 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
               checkWork.run();
               if (this.values.advanceExact(doc)) {
                 for (int i = 0; i < this.values.docValueCount(); i++) {
-                  keys.accept(this.values.lookupOrd(this.values.nextOrd()).utf8ToString());
+                  checkWork.run();
+                  long ordinal = this.values.nextOrd();
+                  if (this.seen.add(ordinal)) {
+                    keys.accept(this.values.lookupOrd(ordinal));
+                  }
                 }
               }
             }

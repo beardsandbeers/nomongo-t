@@ -13,8 +13,9 @@ Background reader refresh and commits default to one second; request `VISIBLE` f
 searches or `COMMITTED` for durability. Each batch still targets one index. Upgrade clients along
 with the server so explicit `VISIBLE` is transmitted correctly.
 
-Cross-index joins and self-joins are available as search filters. Join keys are strings explicitly
-indexed as `token`; numeric, ObjectId, and native typed `_id` joins are deferred.
+Cross-index joins and self-joins are available as search filters. Join keys can be strings explicitly
+indexed as `token` or native BSON ObjectIds indexed as `objectId`, including explicitly mapped
+`_id` fields. Numeric join keys remain deferred.
 
 ## Additions to upstream mongot
 
@@ -305,8 +306,8 @@ whose manager works in Berlin, with `managerKey`, `employeeKey`, and `office` ma
 ```
 
 Move the `join` predicate to `compound.mustNot` to exclude documents with a matching foreign
-record. Both join fields require explicit `token` mappings and matching normalizers; arrays
-match on any shared indexed string. Foreign matches do not duplicate local hits or change
+record. Both join fields require matching indexed types: `token` with matching normalizers, or
+`objectId`. Arrays match on any shared indexed value. Foreign matches do not duplicate local hits or change
 their scores. QUERY access is required to every participating index.
 
 Paging retains the initial local snapshot and foreign membership. Dropping an index or

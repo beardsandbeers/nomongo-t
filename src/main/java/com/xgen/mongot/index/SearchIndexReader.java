@@ -2,12 +2,12 @@ package com.xgen.mongot.index;
 
 import com.xgen.mongot.cursor.batch.BatchSizeStrategy;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
-import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.lucene.facet.TokenFacetsStateCache;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.Query;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
+import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.util.FieldPath;
 import java.io.Closeable;
@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.function.Consumer;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.util.BytesRef;
 
 public interface SearchIndexReader extends IndexReader {
 
@@ -26,9 +27,9 @@ public interface SearchIndexReader extends IndexReader {
 
     void setCancellationCheck(Runnable check);
 
-    TokenFieldDefinition tokenField(FieldPath path) throws InvalidQueryException;
+    JoinField joinField(FieldPath path) throws InvalidQueryException;
 
-    void collectKeys(Operator operator, FieldPath path, Consumer<String> keys, Runnable checkWork)
+    void collectKeys(Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
         throws IOException, InvalidQueryException;
 
     SearchProducerAndMetaResults query(

@@ -179,9 +179,10 @@ Server 0.6.0 adds cross-index and self-join predicates to Search BSON. For examp
 
 The request's `index_id` selects the returned documents. `from` is an exact index name;
 omit it for a self-join. Place the predicate in `compound.mustNot` for exclusion.
-Both keys must be string fields explicitly mapped as `token` with matching normalizers.
-Arrays match on any shared indexed string. Native typed `_id` keys, nested joins,
-vector joins, and attaching foreign documents are outside this release.
+Both keys must have matching indexed types: string fields mapped as `token` with matching
+normalizers, or native `objectId` fields. Explicitly mapped `_id` fields are supported. Arrays
+match on any shared indexed key. Numeric keys, nested joins, vector joins, and attaching foreign
+documents remain unsupported.
 
 QUERY access is required to every participating index. Cursors retain their initial
 membership and local reader snapshots; dropping a dependency or retiring its generation

@@ -3,10 +3,11 @@ package com.xgen.mongot.index.query.operators;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.mongot.util.bson.parser.BsonParseException;
-import java.util.List;
+import org.apache.lucene.util.BytesRef;
 import org.bson.BsonDocument;
 import org.junit.Test;
 
@@ -41,7 +42,15 @@ public class JoinOperatorTest {
   @Test
   public void toBson_materializedKeys_keepsInternalMembershipOutOfWireFormat() throws Exception {
     var parsed = (JoinOperator) parse(JOIN);
-    var materialized = new MaterializedJoinOperator(parsed, List.of("private-membership-key"));
+    var keys = new JoinKeySet.Builder(ignored -> {});
+    keys.add(new BytesRef("private-membership-key"));
+    var materialized =
+        new MaterializedJoinOperator(
+            parsed,
+            new JoinField(JoinField.Type.TOKEN, StockNormalizerName.NONE),
+            keys.build(),
+            false,
+            1000);
 
     var bson = materialized.toBson();
 
