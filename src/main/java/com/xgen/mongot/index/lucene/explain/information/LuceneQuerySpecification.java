@@ -48,6 +48,7 @@ public interface LuceneQuerySpecification extends DocumentEncodable {
     SORTED_SET_DOC_VALUES_RANGE_QUERY("SortedSetDocValuesRangeQuery"),
     PHRASE_QUERY("PhraseQuery"),
     POINT_IN_SET_QUERY(Optional.empty(), Optional.of("org.apache.lucene.document.LongPoint$3")),
+    NUMERIC_JOIN_QUERY("NumericJoinQuery"),
     POINT_RANGE_QUERY(Optional.empty(), Optional.of("org.apache.lucene.document.LongPoint$1")),
     PREFIX_QUERY(PrefixQuery.class.getSimpleName()),
     REGEX_QUERY(RegexpQuery.class.getSimpleName()),
@@ -163,6 +164,7 @@ public interface LuceneQuerySpecification extends DocumentEncodable {
       case SORTED_SET_DOC_VALUES_RANGE_QUERY ->
           builder.classField(SortedSetDocValuesRangeQuerySpec::fromBson);
       case POINT_IN_SET_QUERY -> builder.classField(PointInSetQuerySpec::fromBson);
+      case NUMERIC_JOIN_QUERY -> builder.classField(NumericJoinQuerySpec::fromBson);
       case POINT_RANGE_QUERY -> builder.classField(PointRangeQuerySpec::fromBson);
       case PHRASE_QUERY -> builder.classField(PhraseQuerySpec::fromBson);
       case PREFIX_QUERY -> builder.classField(PrefixQuerySpec::fromBson);

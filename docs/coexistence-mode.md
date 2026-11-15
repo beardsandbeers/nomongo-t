@@ -145,6 +145,27 @@ PYTHONPATH=clients/python python scripts/tests/community/coexistence_test.py \
 
 Use a fresh scratch directory and remove its database and index data after the run.
 
+For integer and mixed-type joins, `scripts/tests/community/integer_join_e2e_test.py` runs a live MongoDB replica
+set in an ephemeral Docker container and one source-built mongot process with both ingestion paths.
+It compares paginated `$search` followed by `$lookup` on the parent collection with standalone
+integer joins and an independent MongoDB-only lookup pipeline. Coverage includes int32/int64
+equality, integer extrema, adjacent values above `2^53`, arrays, exclusions, concurrent mutations,
+stable cursors, explain, restart, and source outages. Mixed parent and child IDs also cover
+string/ObjectId/integer equality, BSON type preservation, and cross-type nonmatches. MongoDB's ordinary `$lookup` numeric equality
+includes doubles; the integer-only comparison filters keys by BSON type before lookup.
+
+```sh
+PYTHONPATH=clients/python python scripts/tests/community/integer_join_e2e_test.py \
+  --mongod /path/to/cached/mongod --mongot /path/to/current/package/mongot \
+  --runtime-image ubuntu:24.04 --output /tmp/integer-join-e2e-results
+```
+
+This fixture requires Linux host networking, a preloaded Docker runtime image compatible with
+the MongoDB binary, and the Python client dependencies plus PyYAML. `--mongod-libs` can point to
+cached Linux runtime libraries including `ld-linux-x86-64.so.2`. It never pulls images. It removes
+its containers, volumes, search indexes, and credentials on success or failure, while retaining
+version/build fingerprints, logs, pipeline explain, and results in the requested output directory.
+
 ## Standard Docker replacement regression
 
 `make check.docker.compatibility` builds the `community-compatible` image and runs

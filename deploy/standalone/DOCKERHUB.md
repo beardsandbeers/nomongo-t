@@ -1,10 +1,10 @@
 # Running the push-mode container
 
-Release 0.8.0 is available as `mybyte/nomongo-t:0.8.0` (Linux amd64). The `latest`,
-`mongot-standalone`, and `mongot-standalone-v0.8.0` tags point to this release. Prefer a versioned
+Release 0.9.0 is available as `mybyte/nomongo-t:0.9.0` (Linux amd64). The `latest`,
+`mongot-standalone`, and `mongot-standalone-v0.9.0` tags point to this release. Prefer a versioned
 tag for reproducible upgrades.
 
-The `community-0.8.0` and `community` tags provide the official-container replacement, using
+The `community-0.9.0` and `community` tags provide the official-container replacement, using
 `/mongot-community/config.default.yml` and the upstream runtime user. Both variants select
 standalone or dual ingestion from `syncSource`; remote standalone API calls on a native listener
 require TLS and configured bearer principals.
@@ -18,10 +18,13 @@ default `INDEXED` behavior. See the [ingestion guide](https://github.com/beardsa
 
 The server also supports cross-index joins and self-joins inside search filters and exclusions.
 Use `from: "indexName"` (omit for self-joins), explicit `localField`/`foreignField`, and a foreign
-`operator` inside `compound.filter` or `compound.mustNot`. Both keys must be strings mapped as
-`token` with matching normalizers. The current source also supports native `objectId` keys and explicitly mapped `_id` fields;
-these extensions require a build containing the native-key join changes. Foreign-document
-enrichment remains unsupported. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/main/README.md#join-searches-across-indexes).
+`operator` inside `compound.filter` or `compound.mustNot`. Keys can be strings mapped as
+`token` with matching normalizers, native `objectId` values, or BSON int32/int64 values mapped
+as `number` with `representation: "int64"`, `indexIntegers: true`, and `indexDoubles: false`.
+Version 0.9.0 reuses existing integer columns and supports fields mapped with multiple key types,
+including mixed `_id` collections. Values match within their own type; int32 and int64 compare
+by numeric value. Explicitly map `_id` and the reference field with the required types.
+Foreign-document enrichment remains unsupported. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/main/README.md#join-searches-across-indexes).
 
 `GetIndexStats` and `GetIndexFieldStats` expose document counts, storage averages, and field
 storage/memory diagnostics. `GetIndexMappings` exports static mappings. Matching Python, Rust,
@@ -29,7 +32,7 @@ Java, and TypeScript clients are available; see the [client guide](https://githu
 
 ```sh
 docker run -d --name mongot -p 127.0.0.1:27029:27029 \
-  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.8.0
+  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.9.0
 docker exec mongot mongotctl status
 ```
 

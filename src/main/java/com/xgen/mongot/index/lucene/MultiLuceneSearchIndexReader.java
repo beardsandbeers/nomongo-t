@@ -329,16 +329,20 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public JoinField joinField(FieldPath path) throws InvalidQueryException {
-      return this.snapshots.getFirst().joinField(path);
+    public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
+      return this.snapshots.getFirst().joinFields(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+        Operator operator,
+        FieldPath path,
+        JoinField.Type type,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
         throws IOException, InvalidQueryException {
       for (var snapshot : this.snapshots) {
-        snapshot.collectKeys(operator, path, keys, checkWork);
+        snapshot.collectKeys(operator, path, type, keys, checkWork);
       }
     }
 

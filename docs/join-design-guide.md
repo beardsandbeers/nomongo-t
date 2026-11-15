@@ -1,8 +1,8 @@
 # Index joins for standalone mongot
 
-**Standalone search-index joins were introduced in server 0.6.0. The native
-ObjectId and adaptive execution extensions below require a build containing
-these changes.**
+**Standalone search-index joins were introduced in server 0.6.0. Native ObjectId joins
+are available in 0.8.0. Integer joins, mixed-type joins, and numeric cancellation fixes
+are available in 0.9.0.**
 
 This guide adapts the original two-Lucene-index example to this repository's
 standalone push server, BSON search expressions, mappings, and cursor lifecycle.
@@ -46,8 +46,9 @@ References: [API schema](../src/proto/standalone/v1/standalone.proto),
 
 Supported scope:
 
-- Equality membership between string fields indexed as `token`, or native `objectId` fields.
-- Native `_id` joins when `_id` has an explicit matching token or objectId mapping.
+- Equality membership between string fields indexed as `token`, native `objectId` fields,
+  or BSON int32/int64 fields indexed as integer-only `number`.
+- Native `_id` joins when `_id` has an explicit matching token, objectId, or integer mapping.
 - Cross-index joins and same-index self-joins in one standalone server.
 - Any-shared-value semantics for arrays, without duplicate local results.
 - Foreign predicates using supported search operators, with scores ignored.
@@ -58,7 +59,7 @@ Supported scope:
 
 Defer foreign-document projection, outer/full joins, score propagation,
 correlated expressions, composite keys, nested/recursive index joins,
-remote servers, vector joins, and numeric join keys. Internal BSON metadata `_id`
+remote servers, vector joins, and double/decimal join keys. Internal BSON metadata `_id`
 bytes are not used as a join field; explicitly map `_id` to its native type.
 
 ## 2. Semantics and example data
@@ -250,9 +251,12 @@ Contacts search index definition:
 ```
 
 `dynamic: true` alone does not establish the token-key contract. Resolve both
-paths to the same supported equality domain: token or objectId. A token mapping
-takes precedence when a field also has an objectId mapping, preserving existing
-string joins, including dynamic type sets. Cross-type joins are rejected. Use
+paths to their shared supported equality domains: token, objectId, and integer. Each shared
+mapping contributes its own membership set; a match in any domain qualifies the local document
+once. A field mapped with all three types can therefore join a collection with mixed `_id`
+types. Fields with no shared supported type are rejected. Token normalizers must match when
+both fields support token keys. An ordinary lossy number mapping alongside token/ObjectId
+mappings contributes no integer keys; use the integer-only options below to enable that domain. Use
 `FieldName.TypeField.TOKEN.getLuceneFieldName(path, Optional.empty())`; do not
 pass raw BSON paths to Lucene or assume token and internal ID field names match.
 
@@ -264,10 +268,11 @@ ObjectId DocValues; older indexes must be rebuilt. The original guide's single-v
 
 Equality rules:
 
-- Compare indexed bytes within the same type. Require matching token normalizers; recommend `none`
+- Compare indexed values within the same equality domain. BSON int32 and int64 share the integer
+  domain and compare by numeric value. Require matching token normalizers; recommend `none`
   for identifiers. Lowercase normalization deliberately makes keys
   case-insensitive. Do not normalize collected bytes a second time.
-- Scalars contribute one key; arrays contribute their indexed values of the selected type.
+- Scalars contribute one key; arrays contribute their indexed values in every shared type.
   Any shared value qualifies, with one result per local document.
 - Missing, null, empty arrays, and other BSON types contribute no key.
   A missing supported mapping is a query error, not an empty join.
@@ -304,8 +309,80 @@ The local mapping contains `"accountId": { "type": "objectId" }`. Use
 `localField: "accountId", foreignField: "_id"` with the existing `join` syntax.
 For string IDs, explicitly map both sides as `token`. Adding a mapping requires
 reingesting documents into the new generation. No application shadow key or
-change to the internal update/delete ID encoding is needed. Numeric keys remain
-unsupported; a hexadecimal string never matches an ObjectId.
+change to the internal update/delete ID encoding is needed. A hexadecimal string never matches
+an ObjectId.
+
+### Mixed ID types
+
+Map `_id` on the foreign index and the reference field on the local index with all required types:
+
+```json
+[
+  {"type": "token", "normalizer": "none"},
+  {"type": "objectId"},
+  {"type": "number", "representation": "int64", "indexIntegers": true, "indexDoubles": false}
+]
+```
+
+For example, use this array as the value of `mappings.fields._id` on the parent and
+`mappings.fields.accountId` on the child. One unchanged `join` predicate then matches string
+references to string IDs, ObjectIds to ObjectIds, and integer references to either integer width.
+`"42"` never matches integer `42`, and an ObjectId's hexadecimal string never matches that ObjectId.
+Mixed arrays match if any same-type value matches, with one result per local document. If only
+one side maps all three types, only types shared with the other side participate. `mustNot`
+excludes a document when any shared type matches. Existing compatible columns are reused.
+
+### Integer join keys
+
+Server 0.9.0 supports exact integer joins using existing numeric columns. Map both
+the foreign `_id` (or other key) and local reference with these options:
+
+```json
+{
+  "mappings": {
+    "dynamic": false,
+    "fields": {
+      "_id": {
+        "type": "number",
+        "representation": "int64",
+        "indexIntegers": true,
+        "indexDoubles": false
+      },
+      "office": { "type": "token" }
+    }
+  }
+}
+```
+
+On the local index, map `accountId` with the same numeric options and query with
+`localField: "accountId", foreignField: "_id"`. The `join` request syntax is unchanged.
+For example, this foreign ID and local reference match:
+
+```json
+{"_id": {"$numberInt": "42"}, "office": "Berlin"}
+{"_id": "contact", "accountId": {"$numberLong": "42"}}
+```
+
+All signed 64-bit values compare exactly, including adjacent values above `2^53`. Arrays
+contribute all indexed integers; missing, null, strings, doubles, and decimals contribute none.
+Integer join planning rejects the default double representation, `indexIntegers: false`, and
+`indexDoubles: true`: double representation can round large integers, while int64 representation
+with doubles enabled can truncate fractional inputs into integer keys. Ordinary numeric search
+mappings keep their existing behavior.
+
+Foreign collection reads `SortedNumericDocValues` from `NUMBER_INT64_V2`, encodes longs into
+eight-byte membership keys, and deduplicates them under the existing query budgets. Local queries
+use `NumericJoinQuery` on that same column, choosing numeric points or DocValues using Lucene's
+numeric cost rule. Both point traversal and per-document value scans check cancellation. The
+DocValues branch reuses bounded binary-hash membership, including for adversarial integer keys. No additional on-disk join fields or index-format changes are needed.
+Indexes already using this mapping can be reused. Changing a mapping creates a new generation
+that must be reingested.
+
+Join equality is numeric across integer widths. Upsert/delete identity still preserves the
+original BSON type, so `Int32(42)` and `Int64(42)` are separate stored IDs that both qualify
+for an integer reference to 42. Use a consistent BSON width for document identity. Clients
+must also preserve int64 input: use `bson.Int64` in Python and BSON `Long.fromString(...)` in
+JavaScript for large values, rather than passing them through JavaScript numbers.
 
 References: [field construction](../src/main/java/com/xgen/mongot/index/lucene/document/single/IndexableFieldFactory.java),
 [field naming](../src/main/java/com/xgen/mongot/index/lucene/field/FieldName.java),
@@ -362,9 +439,9 @@ joins in vector entry points/operators until separately supported.
 ## 6. Adaptive execution and term statistics
 
 Foreign preparation searches every qualifying foreign document and collects all
-its indexed keys from pinned readers. It deduplicates segment-local ordinals
-before looking up bytes, then unions owned bytes across all partitions in a
-bounded `JoinKeySet`. Local top-k or lower-bound counting does **not** justify
+its indexed keys from pinned readers. For token and ObjectId fields, it deduplicates segment-local
+ordinals before looking up bytes. Integer fields read numeric values directly. It unions owned
+keys across all partitions in a bounded `JoinKeySet`. Local top-k or lower-bound counting does **not** justify
 truncating this foreign membership: an omitted parent could change the best hit.
 
 `AdaptiveJoinQuery` chooses between two exact local execution paths for both
@@ -374,6 +451,10 @@ strings and ObjectIds:
 - Candidate probing: `SortedSetDocValues` plus native binary hash membership in
   a `TwoPhaseIterator`. A fixed-size, execution-local ordinal memo avoids repeated
   decoding without allocating an array proportional to the entire dictionary.
+
+Integer joins use cancellable numeric point/DocValues membership instead of the term-statistics
+sampling below. The two numeric paths have identical membership semantics; term-postings
+benchmark results below do not measure integer-join performance.
 
 Sets of at most 16 keys retain Lucene's optimized small-term postings query,
 without sampling or probe setup. For larger sets, each leaf samples at most 16
@@ -652,9 +733,10 @@ hints. Total-count and facet requests remain exact.
 | Self-join | Omit `from` | Reuses the current index and snapshots without a name lookup. Its explicit name also works. |
 | Key names | `localField` / `foreignField` | `path` / `from.path` uses search vocabulary but makes direction less familiar. |
 | Foreign predicate | Required `operator` subtree | `query` suggests a full request; omission would implicitly scan all foreign documents. |
-| Keys | Token strings and native ObjectIds | Both paths use binary membership; `_id` must have the corresponding explicit mapping. Numeric keys are unsupported. |
+| Keys | Token strings, native ObjectIds, and BSON int32/int64 | `_id` requires a matching explicit mapping; integers require an integer-only int64 number mapping. Double and decimal join keys are unsupported. |
 | Placement | Filter/exclusion positions first | Scoring positions need defined constant-score or foreign-score behavior. |
 
 String references such as `accountKey` and native ObjectId references use the
 same adaptive engine. `foreignField: "_id"` uses an explicit native mapping as
-described in section 4; it does not read the BSON metadata ID field.
+described in section 4; it does not read the BSON metadata ID field. Integer references use
+the existing numeric columns and cancellable numeric membership.

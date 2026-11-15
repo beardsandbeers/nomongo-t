@@ -90,6 +90,7 @@ import org.apache.lucene.facet.FacetsCollector;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
@@ -105,6 +106,7 @@ import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.NumericUtils;
 import org.bson.BsonDocument;
 import org.jetbrains.annotations.Nullable;
 
@@ -410,25 +412,35 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public JoinField joinField(FieldPath path) throws InvalidQueryException {
-      return LuceneSearchIndexReader.this.queryFactory.joinField(path);
+    public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
+      return LuceneSearchIndexReader.this.queryFactory.joinFields(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+        Operator operator,
+        FieldPath path,
+        JoinField.Type type,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
         throws IOException, InvalidQueryException {
       try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock)) {
         LuceneSearchIndexReader.this.ensureOpen("collectJoinKeys");
-        collectKeysOnSnapshot(operator, path, keys, checkWork);
+        collectKeysOnSnapshot(operator, path, type, keys, checkWork);
       }
     }
 
     private void collectKeysOnSnapshot(
-        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+        Operator operator,
+        FieldPath path,
+        JoinField.Type type,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
         throws IOException, InvalidQueryException {
       checkState(!this.closed && !this.transferred, "Query snapshot is no longer available");
-      var joinField = joinField(path);
+      if (joinFields(path).stream().noneMatch(field -> field.type() == type)) {
+        throw new InvalidQueryException("Join field does not support " + type);
+      }
       // A self-join shares this pinned reader with the local query. Use an unprofiled searcher
       // over that same reader so membership collection cannot pollute the local query's plan.
       var searcher = LuceneIndexSearcher.create(this.reference.getIndexSearcher());
@@ -455,13 +467,19 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
               .add(predicate, BooleanClause.Occur.FILTER)
               .add(rootFilter, BooleanClause.Occur.FILTER)
               .build();
-      String field =
-          (joinField.type() == JoinField.Type.TOKEN
-                  ? FieldName.TypeField.TOKEN
-                  : FieldName.TypeField.OBJECT_ID)
-              .getLuceneFieldName(path, Optional.empty());
+      FieldName.TypeField typeField =
+          switch (type) {
+            case TOKEN -> FieldName.TypeField.TOKEN;
+            case OBJECT_ID -> FieldName.TypeField.OBJECT_ID;
+            case INT64 -> FieldName.TypeField.NUMBER_INT64_V2;
+          };
+      String field = typeField.getLuceneFieldName(path, Optional.empty());
       // Collect sequentially: DocValues iterators and the bounded key collector are
       // execution-local.
+      if (type == JoinField.Type.INT64) {
+        collectIntegerKeys(searcher, query, field, keys, checkWork);
+        return;
+      }
       searcher.search(
           query,
           new SimpleCollector() {
@@ -485,6 +503,46 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
                   if (this.seen.add(ordinal)) {
                     keys.accept(this.values.lookupOrd(ordinal));
                   }
+                }
+              }
+            }
+
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
+    }
+
+    private void collectIntegerKeys(
+        LuceneIndexSearcher searcher,
+        org.apache.lucene.search.Query query,
+        String field,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
+        throws IOException {
+      searcher.search(
+          query,
+          new SimpleCollector() {
+            private SortedNumericDocValues values = DocValues.emptySortedNumeric();
+            private final BytesRef scratch = new BytesRef(new byte[Long.BYTES]);
+
+            @Override
+            protected void doSetNextReader(LeafReaderContext context) throws IOException {
+              checkWork.run();
+              this.values = DocValues.getSortedNumeric(context.reader(), field);
+            }
+
+            @Override
+            public void collect(int doc) throws IOException {
+              checkWork.run();
+              if (this.values.advanceExact(doc)) {
+                for (int i = 0; i < this.values.docValueCount(); i++) {
+                  checkWork.run();
+                  // The bounded membership builder copies this borrowed buffer and deduplicates
+                  // numeric values across documents, segments, and partitions.
+                  NumericUtils.longToSortableBytes(this.values.nextValue(), this.scratch.bytes, 0);
+                  keys.accept(this.scratch);
                 }
               }
             }

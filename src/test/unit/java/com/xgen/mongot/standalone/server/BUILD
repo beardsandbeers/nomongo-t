@@ -2,6 +2,7 @@ load("//bazel/java:test.bzl", "mongot_java_unit_test_suite")
 
 mongot_java_unit_test_suite(
     name = "lib",
+    timeouts = {"StandaloneJoinsTest.java": "long"},
     deps = [
         "//src/main/java/com/xgen/mongot/catalog",
         "//src/main/java/com/xgen/mongot/cursor",

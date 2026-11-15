@@ -13,7 +13,7 @@ per-call deadlines, BSON helpers and all current RPCs. No automatic retries are 
 ## Python
 
 ```sh
-python3 -m pip install mongot-standalone-client==0.8.0
+python3 -m pip install mongot-standalone-client==0.9.0
 ```
 
 ```python
@@ -167,8 +167,14 @@ hits = decode_bson(response.batch_bson)["results"]
 in `compound.mustNot` for exclusion. The caller needs QUERY access to every index
 in the join. Foreign matches do not duplicate local hits or affect their scores.
 Arrays match when any indexed key is shared. Current builds also support native `objectId`
-keys, including `_id` with an explicit matching mapping. Numeric keys and foreign-document
-enrichment remain unsupported.
+keys, including `_id` with an explicit matching mapping. Server 0.9.0 also supports BSON
+int32/int64 join keys with both fields mapped as `number`, `representation: "int64"`,
+`indexIntegers: true`, and `indexDoubles: false`. Integers compare by numeric value across BSON
+widths. For mixed IDs, map both fields with a list containing token, ObjectId, and the integer-only
+number definition; the join combines same-type matches without duplicating hits. Use `bson.Int64` in Python or `Long.fromString(...)` from the Node BSON package when
+constructing large int64 IDs; avoid converting IDs through JavaScript numbers. See the
+[integer mapping example](../docs/join-design-guide.md#integer-join-keys). Double and decimal join
+keys and foreign-document enrichment remain unsupported.
 
 `GetMore` retains the initial local readers and foreign membership. Dropping a
 dependency or retiring its generation invalidates the cursor. Budget violations

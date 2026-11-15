@@ -177,15 +177,19 @@ public class MeteredSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
-    public JoinField joinField(FieldPath path) throws InvalidQueryException {
-      return this.snapshot.joinField(path);
+    public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
+      return this.snapshot.joinFields(path);
     }
 
     @Override
     public void collectKeys(
-        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+        Operator operator,
+        FieldPath path,
+        JoinField.Type type,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
         throws IOException, InvalidQueryException {
-      this.snapshot.collectKeys(operator, path, keys, checkWork);
+      this.snapshot.collectKeys(operator, path, type, keys, checkWork);
     }
 
     @Override

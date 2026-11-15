@@ -8,6 +8,10 @@ Use it for keyword search with mongot's mappings and analyzers, vector similarit
 your own embeddings, or both. Indexes persist on disk. Clients are available for
 [Python, Rust, Java, and TypeScript](clients/README.md).
 
+Version 0.9.0 adds exact integer joins using existing numeric columns, joins across mixed
+string/ObjectId/integer ID fields, and cancellation checks during numeric scans. See the
+[release notes](docs/releases/standalone-0.9.0.md) for mappings, upgrade guidance, and validation.
+
 Version 0.8.0 adds automatic standalone/dual startup, native ObjectId joins, query explain,
 and an official-image replacement regression test. The `community-0.8.0` Docker tag matches
 the official mongot image's configuration path and runtime user.
@@ -18,8 +22,10 @@ searches or `COMMITTED` for durability. Each batch still targets one index. Upgr
 with the server so explicit `VISIBLE` is transmitted correctly.
 
 Cross-index joins and self-joins are available as search filters. Join keys can be strings explicitly
-indexed as `token` or native BSON ObjectIds indexed as `objectId`, including explicitly mapped
-`_id` fields. Numeric join keys remain deferred.
+indexed as `token`, native BSON ObjectIds indexed as `objectId`, or BSON int32/int64 values indexed
+as integer-only `number` fields, including explicitly mapped `_id` fields. Mixed mappings join
+all shared types in the same collection without converting keys across types. Integer joins are available
+from server 0.9.0; see the [mapping requirements](docs/join-design-guide.md#integer-join-keys).
 
 ## Additions to upstream mongot
 
@@ -75,7 +81,7 @@ See the [explain guide](clients/README.md#explain-and-trace-queries) for levels 
 
 ## Quick start
 
-You need Docker. The image includes Java 21 and the native libraries. The published `0.8.0`
+You need Docker. The image includes Java 21 and the native libraries. The published `0.9.0`
 image targets Linux amd64. ARM hosts need amd64 emulation and the `--platform linux/amd64`
 option.
 
@@ -84,7 +90,7 @@ docker run --detach --name nomongo-t \
   --publish 127.0.0.1:27029:27029 \
   --memory 4g \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.8.0
+  mybyte/nomongo-t:0.9.0
 ```
 
 The API listens at **localhost:27029 over gRPC with TLS**. On first startup, the container
@@ -115,7 +121,7 @@ docker cp nomongo-t:/var/lib/mongot/config/admin.token .nomongo-t/admin.token
 chmod 600 .nomongo-t/admin.token
 
 python3 -m venv .venv-nomongo-t
-.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.8.0
+.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.9.0
 ```
 
 Save the following as `demo.py`, then run `.venv-nomongo-t/bin/python demo.py`. It creates a
@@ -311,8 +317,24 @@ whose manager works in Berlin, with `managerKey`, `employeeKey`, and `office` ma
 
 Move the `join` predicate to `compound.mustNot` to exclude documents with a matching foreign
 record. Both join fields require matching indexed types: `token` with matching normalizers, or
-`objectId`. Arrays match on any shared indexed value. Foreign matches do not duplicate local hits or change
-their scores. QUERY access is required to every participating index.
+`objectId`, or integer-only `number`. Arrays match on any shared indexed value. Foreign matches
+do not duplicate local hits or change their scores. QUERY access is required to every
+participating index.
+
+For integer IDs, map `_id` on the foreign index and the reference on the local index with the
+same numeric options, then use the existing `localField` / `foreignField` syntax:
+
+```json
+{"type": "number", "representation": "int64", "indexIntegers": true, "indexDoubles": false}
+```
+
+Integer joins compare BSON int32 and int64 by value across the full signed 64-bit range. Strings
+and doubles do not match integer keys. Existing indexes with this mapping can be reused; changing
+the mapping requires reingestion. See [integer join keys](docs/join-design-guide.md#integer-join-keys)
+for examples and the distinction between join equality and upsert/delete identity. Collections with
+mixed `_id` types can map both fields as `[{"type":"token"},{"type":"objectId"},
+{"type":"number","representation":"int64","indexDoubles":false}]`; the same join predicate covers
+all shared types. See [mixed ID types](docs/join-design-guide.md#mixed-id-types).
 
 Paging retains the initial local snapshot and foreign membership. Dropping an index or
 retiring its generation invalidates dependent cursors. Limits fail the whole query instead
@@ -346,7 +368,7 @@ docker run --detach --name nomongo-t \
   --memory 8g \
   --env JAVA_TOOL_OPTIONS="-Xms512m -Xmx4g -XX:MaxDirectMemorySize=512m" \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.8.0
+  mybyte/nomongo-t:0.9.0
 ```
 
 `--memory` limits the entire container; `-Xmx` limits only the Java heap. Leave space outside the
@@ -419,7 +441,7 @@ docker run --detach --name nomongo-t \
   --env MONGOT_CONTROL_ADDRESS=localhost:27029 \
   --env MONGOT_CONTROL_CA=/etc/nomongo-t/ca.crt \
   --env MONGOT_CONTROL_TOKEN_FILE=/etc/nomongo-t/admin.token \
-  mybyte/nomongo-t:0.8.0 --config /etc/nomongo-t/standalone.yaml
+  mybyte/nomongo-t:0.9.0 --config /etc/nomongo-t/standalone.yaml
 ```
 
 `--config` selects your YAML file instead of automatic credential generation. The
@@ -511,4 +533,4 @@ not needed. For client development, install `./clients/python` instead of the Py
 - [Architecture](docs/standalone-mongot-grpc-guide.md)
 - [Join syntax, mappings, and execution](docs/join-design-guide.md)
 - [Docker images](https://hub.docker.com/r/mybyte/nomongo-t) and [Python packages](https://pypi.org/project/mongot-standalone-client/)
-- [Previous release downloads (0.6.0)](https://github.com/beardsandbeers/nomongo-t/releases/tag/standalone-v0.6.0)
+- [Release downloads (0.9.0)](https://github.com/beardsandbeers/nomongo-t/releases/tag/standalone-v0.9.0)

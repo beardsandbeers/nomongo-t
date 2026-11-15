@@ -77,8 +77,95 @@ public class StandaloneJoinsTest {
         operator:{equals:{path:'office',value:'Berlin'}}}}]},returnStoredSource:true,
         count:{type:'total'}}
       """;
+  private static final String INTEGER_FIELD =
+      "{type:'number',representation:'int64',indexDoubles:false}";
+  private static final String INTEGER_MAPPING =
+      MAPPING
+          .replace("key:{type:'token'}", "key:" + INTEGER_FIELD)
+          .replace("parent:{type:'token'}", "parent:" + INTEGER_FIELD);
+
+  private static final String MIXED_FIELD =
+      "[{type:'token'},{type:'objectId'}," + INTEGER_FIELD + "]";
 
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void search_mixedIdsAndReferences_matchesSameTypesAndPreservesTypedDeletes()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign =
+          f.create("foreign", MAPPING.replace("key:{type:'token'}", "_id:" + MIXED_FIELD));
+      String local =
+          f.create(
+              "local",
+              MAPPING
+                  .replace("key:{type:'token'}", "_id:" + MIXED_FIELD)
+                  .replace("parent:{type:'token'}", "parent:" + MIXED_FIELD));
+      f.upsert(foreign, "{_id:42,office:'Berlin'}");
+      f.upsert(foreign, "{_id:'42',office:'Paris'}");
+      f.upsert(foreign, "{_id:{$oid:'507f1f77bcf86cd799439011'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:'507f1f77bcf86cd799439011',office:'Paris'}");
+      f.upsert(foreign, "{_id:'account',office:'Berlin'}");
+      f.upsert(local, "{_id:'integer-ref',parent:{$numberLong:'42'}}");
+      f.upsert(local, "{_id:{$numberLong:'43'},parent:{$oid:'507f1f77bcf86cd799439011'}}");
+      f.upsert(local, "{_id:{$oid:'507f1f77bcf86cd799439012'},parent:'account'}");
+      f.upsert(
+          local, "{_id:'mixed-array',parent:[42,'account',{$oid:'507f1f77bcf86cd799439011'}]}");
+      f.upsert(local, "{_id:'string-number',parent:'42'}");
+      f.upsert(local, "{_id:'hex-string',parent:'507f1f77bcf86cd799439011'}");
+      f.upsert(local, "{_id:'double',parent:42.0}");
+      String query = JOIN.replace("foreignField:'key'", "foreignField:'_id'");
+
+      var response = f.search(local, query, 100);
+      var excluded = f.search(local, query.replace("filter:", "mustNot:"), 100);
+      f.docs.delete(
+          DeleteRequest.newBuilder()
+              .setIndexId(foreign)
+              .addIdsBson(bson("{_id:42}"))
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .build());
+      var afterDelete = f.search(local, query, 100);
+
+      assertThat(typedIds(response))
+          .containsExactly(
+              new org.bson.BsonString("integer-ref"),
+              new org.bson.BsonInt64(43),
+              BsonDocument.parse("{id:{$oid:'507f1f77bcf86cd799439012'}}").get("id"),
+              new org.bson.BsonString("mixed-array"));
+      assertThat(ids(excluded)).containsExactly("string-number", "hex-string", "double");
+      assertThat(typedIds(afterDelete))
+          .containsExactly(
+              new org.bson.BsonInt64(43),
+              BsonDocument.parse("{id:{$oid:'507f1f77bcf86cd799439012'}}").get("id"),
+              new org.bson.BsonString("mixed-array"));
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_mixedForeignMappingAndIntegerLocalMapping_usesTheirSharedDomain()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign =
+          f.create("foreign", MAPPING.replace("key:{type:'token'}", "_id:" + MIXED_FIELD));
+      String local = f.create("local", INTEGER_MAPPING);
+      f.upsert(foreign, "{_id:42,office:'Berlin'}");
+      f.upsert(foreign, "{_id:'43',office:'Berlin'}");
+      f.upsert(local, "{_id:'match',parent:{$numberLong:'42'}}");
+      f.upsert(local, "{_id:'wrong-type',parent:43}");
+
+      var response = f.search(local, JOIN.replace("foreignField:'key'", "foreignField:'_id'"), 100);
+
+      assertThat(ids(response)).containsExactly("match");
+    }
+  }
+
+  private static List<org.bson.BsonValue> typedIds(QueryResponse response) {
+    return new RawBsonDocument(response.getBatchBson().toByteArray())
+        .getArray("results").stream()
+            .map(value -> value.asDocument().getDocument("storedSource").get("_id"))
+            .toList();
+  }
 
   @Test
   public void search_explainedJoin_preservesPartitionPlansAndCursorDependencies() throws Exception {
@@ -203,9 +290,14 @@ public class StandaloneJoinsTest {
       throws Exception {
     try (var f = new Fixture(data(), List.of())) {
       String foreign =
-          f.create("foreign", MAPPING.replace("key:{type:'token'}", "_id:{type:'objectId'}"));
+          f.create(
+              "foreign",
+              MAPPING.replace("key:{type:'token'}", "_id:[{type:'objectId'},{type:'number'}]"));
       String local =
-          f.create("local", MAPPING.replace("parent:{type:'token'}", "parent:{type:'objectId'}"));
+          f.create(
+              "local",
+              MAPPING.replace(
+                  "parent:{type:'token'}", "parent:[{type:'objectId'},{type:'number'}]"));
       f.upsert(foreign, "{_id:{$oid:'ff0000000000000000000001'},office:'Berlin'}");
       f.upsert(foreign, "{_id:{$oid:'ff0000000000000000000002'},office:'Paris'}");
       f.upsert(local, "{_id:'a',parent:{$oid:'ff0000000000000000000001'}}");
@@ -234,16 +326,254 @@ public class StandaloneJoinsTest {
   }
 
   @Test
-  public void search_tokenAndObjectIdMappings_preservesNormalizedTokenJoins() throws Exception {
+  public void search_integerReferencesToMappedId_preservesExactKeysAcrossPartitionsAndPages()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign =
+          f.create(
+              "foreign",
+              INTEGER_MAPPING
+                  .replace("numPartitions:2", "numPartitions:4")
+                  .replace("key:" + INTEGER_FIELD, "_id:" + INTEGER_FIELD));
+      String local = f.create("local", INTEGER_MAPPING);
+      f.upsert(foreign, "{_id:{$numberLong:'-9223372036854775808'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:{$numberLong:'9223372036854775807'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:{$numberLong:'9007199254740993'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:42,office:'Berlin'}");
+      f.upsert(foreign, "{_id:{$numberLong:'-7'},office:'Berlin'}");
+      f.upsert(foreign, "{_id:0,office:'Paris'}");
+      f.upsert(local, "{_id:'min',parent:{$numberLong:'-9223372036854775808'}}");
+      f.upsert(local, "{_id:'max',parent:{$numberLong:'9223372036854775807'}}");
+      f.upsert(local, "{_id:'large',parent:{$numberLong:'9007199254740993'}}");
+      f.upsert(local, "{_id:'wide',parent:{$numberLong:'42'}}");
+      f.upsert(local, "{_id:'narrow',parent:-7}");
+      f.upsert(local, "{_id:'array',parent:[-7,{$numberLong:'9007199254740993'}]}");
+      f.upsert(local, "{_id:'adjacent',parent:{$numberLong:'9007199254740992'}}");
+      f.upsert(local, "{_id:'fraction',parent:-7.9}");
+      f.upsert(local, "{_id:'double',parent:42.0}");
+      f.upsert(local, "{_id:'string',parent:'42'}");
+      f.upsert(local, "{_id:'unselected',parent:0}");
+      f.upsert(local, "{_id:'missing'}");
+      f.upsert(local, "{_id:'null',parent:null}");
+      f.upsert(local, "{_id:'empty',parent:[]}");
+      String query = JOIN.replace("foreignField:'key'", "foreignField:'_id'");
+
+      var first = f.search(local, query, 1);
+      var next =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder()
+                  .setCursorId(first.getCursorId())
+                  .setBatchSize(100)
+                  .build());
+
+      assertThat(ids(first)).hasSize(1);
+      assertThat(ids(next)).hasSize(5);
+      assertThat(ids(next)).containsNoneIn(ids(first));
+      assertThat(ids(f.search(local, query, 100)))
+          .containsExactly("min", "max", "large", "wide", "narrow", "array");
+      assertThat(
+              new RawBsonDocument(first.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getNumber("total")
+                  .longValue())
+          .isEqualTo(6);
+      assertThat(next.getCursorId()).isEqualTo(0);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_integerArraysAndExclusion_deduplicatesAndIgnoresNonIntegerValues()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", INTEGER_MAPPING);
+      String local = f.create("local", INTEGER_MAPPING);
+      f.upsert(foreign, "{_id:'a',key:[0,0,{$numberLong:'42'}],office:'Berlin'}");
+      f.upsert(foreign, "{_id:'b',key:42,office:'Berlin'}");
+      f.upsert(foreign, "{_id:'wrong',key:[7.9,'8',null],office:'Berlin'}");
+      f.upsert(local, "{_id:'scalar',parent:{$numberLong:'0'}}");
+      f.upsert(local, "{_id:'array',parent:[0,42,42]}");
+      f.upsert(local, "{_id:'fraction',parent:7}");
+      f.upsert(local, "{_id:'string',parent:8}");
+      f.upsert(local, "{_id:'missing'}");
+
+      var response = f.search(local, JOIN, 100);
+      var exclusion = f.search(local, JOIN.replace("filter:", "mustNot:"), 100);
+      var empty = f.search(local, JOIN.replace("value:'Berlin'", "value:'Paris'"), 100);
+
+      assertThat(ids(response)).containsExactly("scalar", "array");
+      assertThat(ids(exclusion)).containsExactly("fraction", "string", "missing");
+      assertThat(ids(empty)).isEmpty();
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_integerConcurrentSelfJoin_preservesFacetsAndExplain() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String local = f.create("local", INTEGER_MAPPING);
+      f.upsert(local, "{_id:'a',key:1,parent:2,office:'Berlin'}");
+      f.upsert(local, "{_id:'b',key:2,parent:1,office:'Paris'}");
+      f.upsert(local, "{_id:'c',key:3,parent:{$numberLong:'1'},office:'Berlin'}");
+      var query =
+          new BsonDocument(
+                  "facet",
+                  new BsonDocument(
+                          "operator",
+                          new BsonDocument(
+                              "compound",
+                              BsonDocument.parse(JOIN.replace("from:'foreign',", ""))
+                                  .getDocument("compound")))
+                      .append(
+                          "facets", BsonDocument.parse("{offices:{type:'string',path:'office'}}")))
+              .append("returnStoredSource", BsonBoolean.TRUE)
+              .append("concurrent", BsonBoolean.TRUE);
+
+      var response =
+          f.queries.search(
+              request(local, query.toJson(), 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(ids(response)).containsExactly("b", "c");
+      assertThat(
+              new RawBsonDocument(response.getMetadataBson().toByteArray())
+                  .getDocument("facet").getDocument("offices").getArray("buckets").stream()
+                      .map(value -> value.asDocument().getString("_id").getValue())
+                      .toList())
+          .containsExactly("Berlin", "Paris");
+      assertPartitionPlans(response);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_integerUnsafeMappings_rejectsBothLocalAndForeignPaths() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      f.create("foreign", INTEGER_MAPPING);
+      String defaultDouble =
+          f.create("default-double", INTEGER_MAPPING.replace(INTEGER_FIELD, "{type:'number'}"));
+      String acceptsDoubles =
+          f.create(
+              "accepts-doubles",
+              INTEGER_MAPPING.replace("indexDoubles:false", "indexDoubles:true"));
+      String ignoresIntegers =
+          f.create(
+              "ignores-integers",
+              INTEGER_MAPPING.replace(
+                  "indexDoubles:false", "indexDoubles:true,indexIntegers:false"));
+      String local = f.create("local", INTEGER_MAPPING);
+
+      var defaultError =
+          assertThrows(StatusRuntimeException.class, () -> f.search(defaultDouble, JOIN, 100));
+      var doubleError =
+          assertThrows(StatusRuntimeException.class, () -> f.search(acceptsDoubles, JOIN, 100));
+      var integerError =
+          assertThrows(StatusRuntimeException.class, () -> f.search(ignoresIntegers, JOIN, 100));
+      var foreignError =
+          assertThrows(
+              StatusRuntimeException.class,
+              () -> f.search(local, JOIN.replace("from:'foreign'", "from:'default-double'"), 100));
+
+      assertThat(defaultError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(defaultError.getStatus().getDescription()).contains("representation:'int64'");
+      assertThat(doubleError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(doubleError.getStatus().getDescription()).contains("indexDoubles:false");
+      assertThat(integerError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(integerError.getStatus().getDescription()).contains("indexIntegers:true");
+      assertThat(foreignError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(foreignError.getStatus().getDescription()).contains("'key'");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_integerAndTokenMappings_rejectsCrossTypeJoin() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      f.create("foreign", INTEGER_MAPPING);
+      String local = f.create("local", MAPPING);
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription()).contains("same type");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_integerMembershipMemoryLimit_releasesReservationsForFreshQueries()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", INTEGER_MAPPING);
+      String local = f.create("local", INTEGER_MAPPING);
+      var keys =
+          java.util.stream.IntStream.range(0, 30_000)
+              .mapToObj(i -> (org.bson.BsonValue) new org.bson.BsonInt32(i))
+              .toList();
+      f.upsert(
+          foreign,
+          BsonDocument.parse("{_id:'p',office:'Berlin'}")
+              .append("key", new org.bson.BsonArray(keys))
+              .toJson());
+      f.upsert(local, "{_id:'match',parent:0}");
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+      f.upsert(foreign, "{_id:'p',key:0,office:'Berlin'}");
+      assertThat(ids(f.search(local, JOIN, 100))).containsExactly("match");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void collectKeys_integerArrayCancellation_releasesSnapshotsForFreshQueries()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", INTEGER_MAPPING);
+      String local = f.create("local", INTEGER_MAPPING);
+      f.upsert(foreign, "{_id:'p',key:[0,1,2,3,4,5,6,7,8,9],office:'Berlin'}");
+      f.upsert(local, "{_id:'match',parent:0}");
+      var generation =
+          f.runtime
+              .liveIndexes()
+              .getIndexById(new org.bson.types.ObjectId(foreign))
+              .orElseThrow()
+              .getGenerationId();
+      var parsed = (OperatorQuery) SearchQuery.fromBson(BsonDocument.parse(JOIN));
+      var join =
+          (JoinOperator) ((CompoundOperator) parsed.operator()).filter().operators().getFirst();
+      var work = new AtomicInteger();
+
+      try (var snapshot = f.runtime.acquireQuerySnapshot(generation, false)) {
+        assertThrows(
+            CancellationException.class,
+            () ->
+                snapshot.collectKeys(
+                    join.operator(),
+                    join.foreignField(),
+                    ignored -> {},
+                    () -> cancelAfter(work, 4)));
+      }
+
+      assertThat(ids(f.search(local, JOIN, 100))).containsExactly("match");
+    }
+  }
+
+  @Test
+  public void search_tokenObjectIdAndNumberMappings_matchesAllLosslessTypes() throws Exception {
     try (var f = new Fixture(data(), List.of())) {
       String mapping =
           MAPPING
               .replace(
                   "key:{type:'token'}",
-                  "key:[{type:'token',normalizer:'lowercase'},{type:'objectId'}]")
+                  "key:[{type:'token',normalizer:'lowercase'},{type:'objectId'},{type:'number'}]")
               .replace(
                   "parent:{type:'token'}",
-                  "parent:[{type:'token',normalizer:'lowercase'},{type:'objectId'}]");
+                  "parent:[{type:'token',normalizer:'lowercase'},"
+                      + "{type:'objectId'},{type:'number'}]");
       String foreign = f.create("foreign", mapping);
       String local = f.create("local", mapping);
       f.upsert(foreign, "{_id:'p',key:'ABC',office:'Berlin'}");
@@ -253,7 +583,7 @@ public class StandaloneJoinsTest {
 
       var response = f.search(local, JOIN, 100);
 
-      assertThat(ids(response)).containsExactly("string-match");
+      assertThat(ids(response)).containsExactly("string-match", "oid-child");
     }
   }
 

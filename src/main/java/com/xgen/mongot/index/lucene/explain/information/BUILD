@@ -46,6 +46,7 @@ java_library(
         "MultiPhraseQuerySpec.java",
         "MultiTermQueryConstantScoreBlendedWrapperSpec.java",
         "NullnessAwareIndexSortRangeQuerySpec.java",
+        "NumericJoinQuerySpec.java",
         "PhraseQuerySpec.java",
         "PointInSetQuerySpec.java",
         "PointRangeQuerySpec.java",

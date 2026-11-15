@@ -10,6 +10,7 @@ import com.xgen.mongot.index.lucene.explain.information.LongDistanceFeatureQuery
 import com.xgen.mongot.index.lucene.explain.information.LuceneQuerySpecification;
 import com.xgen.mongot.index.lucene.explain.information.MatchAllDocsQuerySpec;
 import com.xgen.mongot.index.lucene.explain.information.MatchNoDocsQuerySpec;
+import com.xgen.mongot.index.lucene.explain.information.NumericJoinQuerySpec;
 import com.xgen.mongot.index.lucene.explain.information.SortedNumericDocValuesRangeQuerySpec;
 import com.xgen.mongot.index.lucene.explain.information.SortedSetDocValuesRangeQuerySpec;
 import com.xgen.mongot.index.lucene.explain.knn.InstrumentableKnnByteVectorQuery;
@@ -20,6 +21,7 @@ import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.query.custom.ExactVectorSearchQuery;
 import com.xgen.mongot.index.lucene.query.custom.NullnessAwareIndexSortRangeQuery;
+import com.xgen.mongot.index.lucene.query.custom.NumericJoinQuery;
 import com.xgen.mongot.index.lucene.query.custom.WrappedKnnQuery;
 import com.xgen.mongot.index.lucene.query.util.DisableBulkScorerQuery;
 import com.xgen.mongot.index.lucene.query.util.WrappedToChildBlockJoinQuery;
@@ -116,6 +118,9 @@ public class LuceneQuerySpecificationCreator {
         yield tryCast(query, org.apache.lucene.search.PointRangeQuery.class)
             .map(PointRangeQuerySpecCreator::fromQuery);
       }
+      case NUMERIC_JOIN_QUERY ->
+          tryCast(query, NumericJoinQuery.class)
+              .map(q -> new NumericJoinQuerySpec(strip(q.getField()), q.getKeyCount()));
       case POINT_IN_SET_QUERY -> {
         Check.isEmpty(children, "children");
         yield tryCast(query, org.apache.lucene.search.PointInSetQuery.class)

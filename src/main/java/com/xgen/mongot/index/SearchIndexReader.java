@@ -27,9 +27,24 @@ public interface SearchIndexReader extends IndexReader {
 
     void setCancellationCheck(Runnable check);
 
-    JoinField joinField(FieldPath path) throws InvalidQueryException;
+    List<JoinField> joinFields(FieldPath path) throws InvalidQueryException;
 
-    void collectKeys(Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+    default JoinField joinField(FieldPath path) throws InvalidQueryException {
+      return joinFields(path).getFirst();
+    }
+
+    default void collectKeys(
+        Operator operator, FieldPath path, Consumer<BytesRef> keys, Runnable checkWork)
+        throws IOException, InvalidQueryException {
+      collectKeys(operator, path, joinField(path).type(), keys, checkWork);
+    }
+
+    void collectKeys(
+        Operator operator,
+        FieldPath path,
+        JoinField.Type type,
+        Consumer<BytesRef> keys,
+        Runnable checkWork)
         throws IOException, InvalidQueryException;
 
     SearchProducerAndMetaResults query(

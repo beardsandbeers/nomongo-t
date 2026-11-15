@@ -108,25 +108,53 @@ final class StandaloneJoinPlanner {
       var localSnapshot =
           Objects.requireNonNull(plan.snapshots.get(localGeneration.indexId.toHexString()));
       plan.localSnapshot = localSnapshot;
-      Map<JoinOperator, MaterializedJoinOperator> resolved = new HashMap<>();
+      Map<JoinOperator, Operator> resolved = new HashMap<>();
       for (var join : joins) {
         var foreign = Objects.requireNonNull(plan.snapshots.get(targets.get(join)));
-        var localField = localSnapshot.joinField(join.localField());
-        var foreignField = foreign.joinField(join.foreignField());
-        if (!localField.equals(foreignField)) {
+        var localFields = localSnapshot.joinFields(join.localField());
+        var foreignFields = foreign.joinFields(join.foreignField());
+        List<Operator> domains = new ArrayList<>();
+        for (var localField : localFields) {
+          var foreignField =
+              foreignFields.stream().filter(field -> field.type() == localField.type()).findFirst();
+          if (foreignField.isEmpty()) {
+            continue;
+          }
+          if (!localField.equals(foreignField.get())) {
+            throw invalid("Join fields must use the same type and token normalizer");
+          }
+          // Each equality domain owns separate membership and uses the same bounded plan.
+          plan.reserveBytes(
+              64L * 1024 * (1L + (long) localSnapshot.partitions() * plan.localQueryCopies));
+          var keys = new JoinKeySet.Builder(plan::reserveKey);
+          long foreignStart = System.nanoTime();
+          try (var ignored = Explain.suspend()) {
+            foreign.collectKeys(
+                join.operator(),
+                join.foreignField(),
+                localField.type(),
+                keys::add,
+                plan::checkWork);
+          } finally {
+            this.runtime.metrics().elapsed("joins.foreign", foreignStart);
+          }
+          domains.add(materializeJoin(join, localField, keys.build(), query));
+        }
+        if (domains.isEmpty()) {
           throw invalid("Join fields must use the same type and token normalizer");
         }
-        // Account for the initial byte-pool block and fixed probe/ordinal scratch as well as keys.
-        plan.reserveBytes(
-            64L * 1024 * (1L + (long) localSnapshot.partitions() * plan.localQueryCopies));
-        var keys = new JoinKeySet.Builder(plan::reserveKey);
-        long foreignStart = System.nanoTime();
-        try (var ignored = Explain.suspend()) {
-          foreign.collectKeys(join.operator(), join.foreignField(), keys::add, plan::checkWork);
-        } finally {
-          this.runtime.metrics().elapsed("joins.foreign", foreignStart);
-        }
-        resolved.put(join, materializeJoin(join, localField, keys.build(), query));
+        resolved.put(
+            join,
+            domains.size() == 1
+                ? domains.getFirst()
+                : new CompoundOperator(
+                    join.score(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.empty(),
+                    Optional.of(new CompoundClause(domains)),
+                    1,
+                    Optional.empty()));
       }
       var materialized = materialize(operator(query), resolved);
       plan.query =
@@ -190,8 +218,7 @@ final class StandaloneJoinPlanner {
     }
   }
 
-  private static Operator materialize(
-      Operator operator, Map<JoinOperator, MaterializedJoinOperator> joins) {
+  private static Operator materialize(Operator operator, Map<JoinOperator, Operator> joins) {
     if (operator instanceof JoinOperator join) {
       return joins.get(join);
     }
@@ -209,7 +236,7 @@ final class StandaloneJoinPlanner {
   }
 
   private static CompoundClause materialize(
-      CompoundClause clause, Map<JoinOperator, MaterializedJoinOperator> joins) {
+      CompoundClause clause, Map<JoinOperator, Operator> joins) {
     return new CompoundClause(
         clause.operators().stream().map(child -> materialize(child, joins)).toList());
   }
@@ -343,7 +370,8 @@ final class StandaloneJoinPlanner {
         throw exhausted("Join distinct-key limit exceeded");
       }
       // Includes pooled bytes, foreign ordinal deduplication, per-partition probes,
-      // lazy term queries and rewrites. Keep conservative cursor-lifetime admission.
+      // lazy term queries and rewrites, or numeric set-query arrays and hash tables.
+      // Keep conservative cursor-lifetime admission.
       long estimate =
           (400L + 16L * keyBytes) * (1L + (long) snapshot().partitions() * this.localQueryCopies);
       reserveBytes(estimate);

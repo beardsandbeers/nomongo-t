@@ -15,8 +15,10 @@ which now selects the default `INDEXED`; updated bindings preserve an explicitly
 
 Search supports cross-index and self-join filters: place `join` in `compound.filter` or
 `compound.mustNot`, set `from: "indexName"` (omit for self-joins), `localField`, `foreignField`,
-and a foreign `operator`. Both key fields must be strings explicitly mapped as `token`
-with matching normalizers. Native typed `_id` keys and foreign-document enrichment are deferred.
+and a foreign `operator`. Both key fields require matching indexed types: `token` strings
+with matching normalizers, `objectId`, or integer-only `number` fields with
+`representation: "int64"`, `indexIntegers: true`, and `indexDoubles: false`.
+Explicitly mapped `_id` joins are supported; foreign-document enrichment is deferred.
 See [complete join examples](https://github.com/beardsandbeers/nomongo-t/blob/@COMMIT@/README.md#join-searches-across-indexes)
 and join-design-guide.md inside the server archive for limits and lifecycle details.
 
