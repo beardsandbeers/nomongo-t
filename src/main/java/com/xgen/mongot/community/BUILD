@@ -23,7 +23,7 @@ java_library(
 
 java_binary(
     name = "MongotCommunity",
-    main_class = "com.xgen.mongot.community.MongotCommunity",
+    main_class = "com.xgen.mongot.bootstrap.Mongot",
     visibility = ["//visibility:public"],
-    runtime_deps = [":community"],
+    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],
 )

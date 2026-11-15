@@ -2,7 +2,10 @@ load("//bazel/java:package.bzl", "java_library")
 
 java_library(
     name = "config",
-    srcs = ["StandaloneConfig.java"],
+    srcs = [
+        "CoexistenceConfig.java",
+        "StandaloneConfig.java",
+    ],
     deps = [
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "@maven//:com_fasterxml_jackson_core_jackson_core",

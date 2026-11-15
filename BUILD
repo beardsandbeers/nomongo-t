@@ -5,32 +5,33 @@ load("//deploy:def.bzl", "extracted_libraries")
 exports_files([
     "docs/join-design-guide.md",
     "docs/standalone-mongot.md",
+    "docs/coexistence-mode.md",
     "scripts/standalone/client.py",
 ])
 
 java_binary_stamped_manifest(
     name = "mongot_community",
     classpath_resources = ["//conf/mongot/production:conf"],
-    main_class = "com.xgen.mongot.community.MongotCommunity",
+    main_class = "com.xgen.mongot.bootstrap.Mongot",
     manifest_lines = [
         "Implementation-Title: Atlas Search (mongot)",
         "Implementation-Version: $$BUILD_EMBED_LABEL",
         "Implementation-Vendor: MongoDB Inc.",
     ],
     visibility = ["//visibility:public"],
-    runtime_deps = ["//src/main/java/com/xgen/mongot/community"],
+    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],
 )
 
 java_binary_stamped_manifest(
     name = "mongot_standalone",
     classpath_resources = ["//conf/mongot/production:conf"],
-    main_class = "com.xgen.mongot.standalone.MongotStandalone",
+    main_class = "com.xgen.mongot.bootstrap.Mongot",
     manifest_lines = [
         "Implementation-Title: mongot standalone",
         "Implementation-Version: $$BUILD_EMBED_LABEL",
     ],
     visibility = ["//visibility:public"],
-    runtime_deps = ["//src/main/java/com/xgen/mongot/standalone"],
+    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],
 )
 
 # Jars that must be bundled individually in a deployable tarball

@@ -4,7 +4,10 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.statistics.IndexStatistics;
 import com.xgen.mongot.index.statistics.LuceneStatisticsCollector;
+import com.xgen.mongot.index.statistics.LuceneStatisticsSnapshot;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
@@ -12,22 +15,27 @@ import com.xgen.mongot.standalone.grpc.DocumentWriteConcern;
 import com.xgen.mongot.standalone.grpc.GetIndexFieldStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexStatsRequest;
 import com.xgen.mongot.standalone.grpc.IndexFieldStatsResponse;
+import com.xgen.mongot.standalone.grpc.IndexStats;
 import com.xgen.mongot.standalone.grpc.IndexType;
 import com.xgen.mongot.standalone.grpc.StatsCollectionState;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import org.bson.BsonDocument;
 import org.bson.types.ObjectId;
 import org.junit.Rule;
@@ -88,8 +96,9 @@ public class StandaloneIndexStatisticsTest {
                   .getCode())
           .isEqualTo(Status.Code.INVALID_ARGUMENT);
       var generation = fixture.runtime.liveIndexes().getIndexById(new ObjectId(id)).orElseThrow();
-      assertThat(fixture.runtime.ingestion().dropIndex(generation.getGenerationId()).isDone())
-          .isTrue();
+      // A background commit may still own a lease; the unconsumed page token must not block
+      // retirement after that work drains.
+      fixture.runtime.ingestion().dropIndex(generation.getGenerationId()).get(30, TimeUnit.SECONDS);
       // Completed pages retain only values: retirement did not wait for these idle tokens.
     }
     try (var fixture = new Fixture()) {
@@ -207,7 +216,7 @@ public class StandaloneIndexStatisticsTest {
       var generation =
           fixture.runtime.liveIndexes().getIndexById(new ObjectId(ids.get(0))).orElseThrow();
       fixture.runtime.ingestion().dropIndex(generation.getGenerationId()).get(5, TimeUnit.SECONDS);
-      assertThrows(java.util.concurrent.CompletionException.class, duplicate::join);
+      assertThrows(CompletionException.class, duplicate::join);
       cancel(queued);
       blocker.release.countDown();
       assertThat(second.get(5, TimeUnit.SECONDS).getDocumentCount()).isEqualTo(0);
@@ -227,13 +236,13 @@ public class StandaloneIndexStatisticsTest {
     private final CountDownLatch release = new CountDownLatch(1);
     private final AtomicInteger calls = new AtomicInteger();
 
-    private com.xgen.mongot.index.statistics.IndexStatistics collect(
-        com.xgen.mongot.index.statistics.LuceneStatisticsSnapshot snapshot,
-        com.xgen.mongot.index.definition.IndexDefinition definition,
+    private IndexStatistics collect(
+        LuceneStatisticsSnapshot snapshot,
+        IndexDefinition definition,
         boolean detailed,
-        java.util.OptionalLong writerHeap,
-        java.util.function.BooleanSupplier cancelled)
-        throws java.io.IOException {
+        OptionalLong writerHeap,
+        BooleanSupplier cancelled)
+        throws IOException {
       this.calls.incrementAndGet();
       this.started.countDown();
       try {
@@ -300,8 +309,7 @@ public class StandaloneIndexStatisticsTest {
       return result;
     }
 
-    private List<CompletableFuture<com.xgen.mongot.standalone.grpc.IndexStats>> enqueue(
-        List<String> ids) {
+    private List<CompletableFuture<IndexStats>> enqueue(List<String> ids) {
       return ids.stream()
           .map(
               id ->
@@ -324,17 +332,13 @@ public class StandaloneIndexStatisticsTest {
     private void write(String id, String json) {
       this.runtime
           .ingestion()
-          .coordinate(
-              () ->
-                  this.runtime
-                      .ingestion()
-                      .write(
-                          id,
-                          1,
-                          "",
-                          List.of(bson(json)),
-                          false,
-                          DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE));
+          .write(
+              id,
+              () -> 1L,
+              "",
+              List.of(bson(json)),
+              false,
+              DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE);
     }
 
     private IndexFieldStatsResponse fields(String id, int pageSize) throws Exception {

@@ -79,6 +79,10 @@ class Driver:
     def call(self, method, request=None, error=None):
         check(method in RPC_NAMES, f"Unknown RPC {method}")
         self.called.add(method)
+        # These functional scenarios query immediately after mutation. Exercise explicit visibility.
+        if method in ("Upsert", "Delete"):
+            request = dict(request or {})
+            request.setdefault("writeConcern", "DOCUMENT_WRITE_CONCERN_VISIBLE")
         self.process.stdin.write(json.dumps({"method": method, "request": request or {}}) + "\n")
         self.process.stdin.flush()
         if not self.selector.select(timeout=45):
@@ -491,6 +495,41 @@ def exercise_joins(client, name):
     return {"accounts": accounts, "contacts": contacts, "query": query}
 
 
+def verify_explain(client, method, index, expression, expected_ids):
+    request = {"indexId": index["indexId"], "queryBson": encoded(expression), "batchSize": 1}
+    planner = client.call(method, dict(request, explainVerbosity="EXPLAIN_VERBOSITY_QUERY_PLANNER"))
+    plan = decoded(planner["explainBson"])
+    check("query" in plan, f"{method} planner omitted the query plan")
+    check(not batch_results(planner), "Planner returned document hits")
+    check(int(planner.get("cursorId", 0)) == 0, "Planner retained a cursor")
+    check("resourceUsage" not in plan, "Planner returned execution resource usage")
+    for verbosity in (
+        "EXPLAIN_VERBOSITY_EXECUTION_STATS",
+        "EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION",
+    ):
+        response = client.call(method, dict(request, explainVerbosity=verbosity))
+        results = []
+        batches = 0
+        while True:
+            batches += 1
+            explain = decoded(response["explainBson"])
+            check("query" in explain, f"{method} execution omitted the query plan")
+            check(
+                explain["resourceUsage"]["numBatches"] == batches,
+                f"{method} did not restore cumulative explain state",
+            )
+            results.extend(batch_results(response))
+            if not int(response.get("cursorId", 0)):
+                break
+            response = client.call(
+                "GetMore", {"cursorId": str(response["cursorId"]), "batchSize": 1}
+            )
+        check(ids(results) == expected_ids, f"{method} tracing changed the result set")
+    ordinary = client.call(method, request)
+    check(not ordinary.get("explainBson"), "Explain leaked into an ordinary request")
+    all_results(client, ordinary)
+
+
 def exercise(client):
     checks = []
     name = client.language + "-" + uuid.uuid4().hex
@@ -522,6 +561,14 @@ def exercise(client):
         not all_results(client, search(client, other, "coffee")), "Writes leaked into another index"
     )
     checks.append("direct text writes, cursor pagination, BSON preservation, index isolation")
+    verify_explain(
+        client,
+        "Search",
+        text,
+        {"text": {"path": "title", "query": "coffee"}},
+        {"0", "1", "2"},
+    )
+    checks.append("query plans, execution tracing, cumulative GetMore statistics")
     verify_stats(client, text, 3)
     checks.append(
         "per-index stats, bytes per document, field ledger, filtered immutable pagination"
@@ -670,6 +717,14 @@ def exercise(client):
         ids(all_results(client, client.call("VectorSearch", vector_query))) == {"near"},
         "Vector ingestion failed",
     )
+    verify_explain(
+        client,
+        "VectorSearch",
+        vector,
+        {"path": "embedding", "queryVector": [1.0, 0.0, 0.0], "exact": True, "limit": 1},
+        {"near"},
+    )
+    checks.append("vector query plans and execution tracing")
     client.call("DropIndex", {"indexId": other["indexId"], "expectedRevision": "1"})
     client.call("GetIndex", {"indexId": other["indexId"]}, error="NOT_FOUND")
     vector_stats = client.call("GetIndexStats", {"indexId": vector["indexId"], "refresh": True})
@@ -824,10 +879,25 @@ def main():
                                 == {"0"},
                                 "Reader cannot query its granted index",
                             )
+                            explained = reader.call(
+                                "Search",
+                                {
+                                    "indexId": states[0]["text"]["indexId"],
+                                    "queryBson": encoded(
+                                        {"text": {"path": "title", "query": "coffee"}}
+                                    ),
+                                    "explainVerbosity": "EXPLAIN_VERBOSITY_QUERY_PLANNER",
+                                },
+                            )
+                            check(
+                                "query" in decoded(explained["explainBson"]),
+                                "Reader cannot explain its granted index",
+                            )
                             reader.call(
                                 "Search",
                                 {
                                     "indexId": states[0]["vector"]["indexId"],
+                                    "explainVerbosity": "EXPLAIN_VERBOSITY_QUERY_PLANNER",
                                     "queryBson": encoded(
                                         {"text": {"path": "title", "query": "coffee"}}
                                     ),
@@ -847,6 +917,7 @@ def main():
                                 {
                                     "indexId": states[0]["joins"]["contacts"]["indexId"],
                                     "queryBson": encoded(states[0]["joins"]["query"]),
+                                    "explainVerbosity": "EXPLAIN_VERBOSITY_EXECUTION_STATS",
                                 },
                                 error="PERMISSION_DENIED",
                             )
@@ -900,6 +971,7 @@ def main():
                 check(not (data / "standalone.sqlite").exists(), "Unexpected source database")
                 allowed = {
                     "standalone.lock",
+                    "standalone-owned-ids.json",
                     "indexes.json",
                     "configJournal.json",
                     "dynamicFeatureFlags.json",

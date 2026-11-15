@@ -2,6 +2,7 @@ package com.xgen.mongot.standalone.server;
 
 import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot;
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
+import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.CollectorQuery;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.SearchQuery;
@@ -97,7 +98,11 @@ final class StandaloneJoinPlanner {
             join.from().isPresent()
                 ? this.runtime.catalog().getIndexByName(join.from().get()).getIndexId()
                 : localGeneration.indexId.toHexString();
-        plan.add(id, Optional.empty());
+        // Foreign indexes can have a different partition count. Their selection work must not
+        // capture the local query's profilers (self-joins reuse the already pinned local readers).
+        try (var ignored = Explain.suspend()) {
+          plan.add(id, Optional.empty());
+        }
         targets.put(join, id);
       }
       var localSnapshot =
@@ -116,7 +121,7 @@ final class StandaloneJoinPlanner {
         }
         var keys = new HashSet<String>();
         long foreignStart = System.nanoTime();
-        try {
+        try (var ignored = Explain.suspend()) {
           foreign.collectKeys(
               join.operator(),
               join.foreignField(),

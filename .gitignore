@@ -76,3 +76,6 @@ tmp/
 # Credentials and virtual environment created by the Docker/Python quickstart.
 /.nomongo-t/
 /.venv-nomongo-t/
+
+# Local repository instructions.
+/AGENTS.md

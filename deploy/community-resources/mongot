@@ -59,7 +59,7 @@ run_mongot() {
     '--enable-native-access=ALL-UNNAMED' \
     ${JVM_FLAGS} \
     -cp "${DIR}/lib/*:${DIR}/bin/mongot_community_deploy.jar" \
-    "com.xgen.mongot.community.MongotCommunity" \
+    "com.xgen.mongot.bootstrap.Mongot" \
     "${PASS_THROUGH_ARGS[@]:-}"
 }
 

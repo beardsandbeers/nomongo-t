@@ -190,6 +190,12 @@ public class Explain {
     return Context.current().with(explainQueryState).makeCurrent();
   }
 
+  /** Temporarily disables explain without discarding the surrounding tracing context. */
+  @MustBeClosed
+  public static Scope suspend() {
+    return ExplainQueryState.suspend();
+  }
+
   @MustBeClosed
   public static ExplainQueryState.IndexPartitionResourceManager
       maybeEnterIndexPartitionQueryContext(int indexPartitionId) {

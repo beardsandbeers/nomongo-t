@@ -1,1 +1,19 @@
-# Intentionally empty: the Community build does not link any Rust code.
+"""Rust rules and toolchains required by the repository-wide formatter.
+
+The Community server does not link Rust, but the aggregate formatter still
+depends on rustfmt even when only Java or other non-Rust files are supplied.
+"""
+
+bazel_dep(name = "rules_rust", version = "0.67.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+
+# Pin a stable compiler and formatter with support for edition 2024.
+rust.toolchain(
+    edition = "2021",
+    rustfmt_version = "1.86.0",
+    versions = ["1.86.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")

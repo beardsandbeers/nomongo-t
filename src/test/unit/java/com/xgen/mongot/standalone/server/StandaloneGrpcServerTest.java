@@ -4,6 +4,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.index.lucene.vector.Similarity;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
@@ -13,14 +14,17 @@ import com.xgen.mongot.standalone.grpc.DeleteRequest;
 import com.xgen.mongot.standalone.grpc.DocumentServiceGrpc;
 import com.xgen.mongot.standalone.grpc.DocumentWriteConcern;
 import com.xgen.mongot.standalone.grpc.DropIndexRequest;
+import com.xgen.mongot.standalone.grpc.ExplainVerbosity;
 import com.xgen.mongot.standalone.grpc.GetIndexFieldStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexMappingsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexStatsRequest;
+import com.xgen.mongot.standalone.grpc.GetMoreRequest;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
 import com.xgen.mongot.standalone.grpc.IndexFieldStatsResponse;
 import com.xgen.mongot.standalone.grpc.IndexStats;
 import com.xgen.mongot.standalone.grpc.IndexType;
+import com.xgen.mongot.standalone.grpc.KillCursorRequest;
 import com.xgen.mongot.standalone.grpc.ListIndexesRequest;
 import com.xgen.mongot.standalone.grpc.QueryRequest;
 import com.xgen.mongot.standalone.grpc.QueryServiceGrpc;
@@ -32,9 +36,14 @@ import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
 import org.junit.Rule;
@@ -43,6 +52,189 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void search_queryPlanner_returnsPlanWithoutHitsOrCursor() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-plan");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+
+      var response =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .setBatchSize(1)
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+
+      var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+      assertThat(explain.getDocument("query").getString("type").getValue()).isEqualTo("TermQuery");
+      assertThat(explain.getDocument("query").containsKey("stats")).isFalse();
+      assertThat(explain.getDocument("metadata").getString("indexName").getValue())
+          .isEqualTo("explain-plan");
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .isEmpty();
+      assertThat(response.getCursorId()).isEqualTo(0);
+      assertThat(response.getGenerationId()).isNotEmpty();
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void search_oversizedExplain_releasesCursorAndDoesNotLeakTracing() throws Exception {
+    var base = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            new StandaloneConfig.Limits(128, 100, 1000, 128),
+            1,
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            base.tls(),
+            base.principals());
+    try (var f = new Fixture(config)) {
+      String id = f.create("explain-size-limit");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+              .setBatchSize(1)
+              .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+              .build();
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+      var ordinary = f.queries.search(request.toBuilder().clearExplainVerbosity().build());
+      assertThat(ordinary.getExplainBson()).isEmpty();
+      assertThat(new RawBsonDocument(ordinary.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      f.queries.killCursor(
+          KillCursorRequest.newBuilder().setCursorId(ordinary.getCursorId()).build());
+    }
+  }
+
+  @Test
+  public void search_executionStats_restoresTracingAcrossBatchesAndClosesExhaustedCursor()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-execution");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+              .setBatchSize(1)
+              .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+              .build();
+
+      var first = f.queries.search(request);
+      var next =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder()
+                  .setCursorId(first.getCursorId())
+                  .setBatchSize(100)
+                  .build());
+
+      var initialExplain = new RawBsonDocument(first.getExplainBson().toByteArray());
+      var nextExplain = new RawBsonDocument(next.getExplainBson().toByteArray());
+      assertThat(initialExplain.getDocument("query").containsKey("stats")).isTrue();
+      assertThat(nextExplain.getDocument("query").containsKey("stats")).isTrue();
+      assertThat(initialExplain.getDocument("resourceUsage").getNumber("numBatches").intValue())
+          .isEqualTo(1);
+      assertThat(nextExplain.getDocument("resourceUsage").getNumber("numBatches").intValue())
+          .isEqualTo(2);
+      assertThat(first.getCursorId()).isNotEqualTo(0);
+      assertThat(new RawBsonDocument(first.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(new RawBsonDocument(next.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(next.getCursorId()).isEqualTo(0);
+      assertThat(next.getGenerationId()).isEqualTo(first.getGenerationId());
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      assertThat(
+              f.queries
+                  .search(request.toBuilder().clearExplainVerbosity().build())
+                  .getExplainBson())
+          .isEmpty();
+    }
+  }
+
+  @Test
+  public void search_allPlansExecution_returnsStatsAndSupportsKillingCursor() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-all");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+
+      var response =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .setBatchSize(1)
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION)
+                  .build());
+      f.queries.killCursor(
+          KillCursorRequest.newBuilder().setCursorId(response.getCursorId()).build());
+
+      assertThat(
+              new RawBsonDocument(response.getExplainBson().toByteArray())
+                  .getDocument("query")
+                  .containsKey("stats"))
+          .isTrue();
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(response.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+    }
+  }
+
+  @Test
+  public void search_unknownExplainVerbosity_rejectsRequest() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-invalid");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.search(
+                      QueryRequest.newBuilder()
+                          .setIndexId(id)
+                          .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                          .setExplainVerbosityValue(99)
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.results(id, "coffee").getArray("results")).isEmpty();
+    }
+  }
 
   @Test
   public void deleteByQuery_singleOperatorCompound_matchesSearchSemantics() throws Exception {
@@ -624,6 +816,108 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void push_omittedConcern_returnsBeforeRefreshAndExplicitVisibleWaits() throws Exception {
+    var defaults = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            defaults.dataPath(),
+            defaults.address(),
+            defaults.documentLimits(),
+            defaults.maxInFlightRequests(),
+            defaults.maxInFlightBytes(),
+            defaults.minFreeDiskBytes(),
+            Duration.ofHours(1),
+            Duration.ofHours(1),
+            defaults.maxRpcDuration(),
+            defaults.tls(),
+            defaults.principals());
+    try (var f = new Fixture(config)) {
+      String id = f.create("concerns");
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .addDocumentsBson(bson("{_id:'a',title:'coffee'}"))
+              .build());
+
+      assertThat(f.results(id, "coffee").getArray("results")).isEmpty();
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .addDocumentsBson(bson("{_id:'b',title:'coffee'}"))
+              .build());
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(2);
+      f.docs.delete(
+          DeleteRequest.newBuilder().setIndexId(id).addIdsBson(bson("{_id:'a'}")).build());
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(2);
+      f.docs.delete(
+          DeleteRequest.newBuilder()
+              .setIndexId(id)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .addIdsBson(bson("{_id:'b'}"))
+              .build());
+      assertThat(f.results(id, "coffee").getArray("results")).isEmpty();
+    }
+  }
+
+  @Test
+  public void push_concurrentBatches_indexesEveryDocumentInPartitionedIndex() throws Exception {
+    try (var f = new Fixture(data());
+        var workers = Executors.newFixedThreadPool(8)) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("concurrent")
+                      .setType(IndexType.INDEX_TYPE_SEARCH)
+                      .setDefinitionBson(bson("{numPartitions:2,mappings:{dynamic:true}}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      var requests =
+          IntStream.range(0, 16)
+              .mapToObj(
+                  batch ->
+                      UpsertRequest.newBuilder()
+                          .setIndexId(id)
+                          .addAllDocumentsBson(
+                              IntStream.range(0, 100)
+                                  .mapToObj(
+                                      document ->
+                                          bson(
+                                              "{_id:'"
+                                                  + batch
+                                                  + "-"
+                                                  + document
+                                                  + "',title:'coffee'}"))
+                                  .toList())
+                          .build())
+              .toList();
+
+      var results =
+          workers.invokeAll(
+              requests.stream()
+                  .<java.util.concurrent.Callable<Integer>>map(
+                      request -> () -> f.docs.upsert(request).getIndexedCount())
+                  .toList());
+
+      assertThat(
+              results.stream()
+                  .map(
+                      result -> {
+                        try {
+                          return result.get(10, TimeUnit.SECONDS);
+                        } catch (Exception e) {
+                          throw new AssertionError(e);
+                        }
+                      })
+                  .toList())
+          .containsExactlyElementsIn(java.util.Collections.nCopies(16, 100));
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1600);
+    }
+  }
+
+  @Test
   public void getIndexStats_emptyAndMutations_reportsLiveDocumentsAndOptionalAverages()
       throws Exception {
     try (var f = new Fixture(data())) {
@@ -645,7 +939,11 @@ public class StandaloneGrpcServerTest {
       assertThat(two.getDirectorySizeBytes().hasValue()).isTrue();
       assertThat(two.getMemory().getAccountedWriterBufferHeapBytes().hasValue()).isTrue();
       f.docs.delete(
-          DeleteRequest.newBuilder().setIndexId(id).addIdsBson(bson("{_id:'b'}")).build());
+          DeleteRequest.newBuilder()
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .setIndexId(id)
+              .addIdsBson(bson("{_id:'b'}"))
+              .build());
       assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
     }
   }
@@ -1157,6 +1455,7 @@ public class StandaloneGrpcServerTest {
       var deleted =
           f.docs.delete(
               DeleteRequest.newBuilder()
+                  .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                   .setIndexId(first)
                   .addIdsBson(bson("{_id: 'a'}"))
                   .addIdsBson(bson("{_id: 'missing'}"))
@@ -1194,7 +1493,57 @@ public class StandaloneGrpcServerTest {
     try (var paths = Files.list(data)) {
       assertThat(paths.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).toList())
           .containsExactly(
-              "standalone.lock", "indexes.json", "configJournal.json", "dynamicFeatureFlags.json");
+              "standalone.lock",
+              "indexes.json",
+              "standalone-owned-ids.json",
+              "configJournal.json",
+              "dynamicFeatureFlags.json");
+    }
+  }
+
+  @Test
+  public void standaloneLaunch_journalHasNonLocalGeneration_refusesBeforeRemovingData()
+      throws Exception {
+    Path directory = data();
+    try (var fixture = new Fixture(directory)) {
+      fixture.create("replicated-directory-fixture");
+    }
+    Files.move(directory.resolve("indexes.json"), directory.resolve("saved-indexes.json"));
+    Files.move(
+        directory.resolve("standalone-owned-ids.json"), directory.resolve("saved-ownership.json"));
+    String journal = Files.readString(directory.resolve("configJournal.json"));
+
+    var error =
+        assertThrows(
+            IOException.class,
+            () -> new StandaloneRuntime(StandaloneConfig.development(directory, 0)));
+
+    assertThat(error).hasMessageThat().contains("native mongot launcher");
+    assertThat(Files.readString(directory.resolve("configJournal.json"))).isEqualTo(journal);
+  }
+
+  @Test
+  public void sharedServices_nativeTls_doesNotLoadStandaloneCertificateFiles() throws Exception {
+    var base = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            base.documentLimits(),
+            base.maxInFlightRequests(),
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            Optional.of(
+                new StandaloneConfig.Tls(
+                    base.dataPath().resolve("unused.crt"), base.dataPath().resolve("unused.key"))),
+            base.principals());
+
+    try (var runtime = new StandaloneRuntime(config);
+        var services = new StandaloneGrpcServer(runtime, true)) {
+      assertThat(services.services()).hasSize(4);
     }
   }
 
@@ -1220,6 +1569,7 @@ public class StandaloneGrpcServerTest {
               () ->
                   f.docs.upsert(
                       UpsertRequest.newBuilder()
+                          .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                           .setIndexId(id)
                           .setGenerationId(oldGeneration)
                           .addDocumentsBson(bson("{_id: 'a', title: 'coffee'}"))
@@ -1245,6 +1595,8 @@ public class StandaloneGrpcServerTest {
                       () ->
                           f.docs.upsert(
                               UpsertRequest.newBuilder()
+                                  .setWriteConcern(
+                                      DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                                   .setIndexId(first)
                                   .addDocumentsBson(bson("{_id: 'a'}"))
                                   .build()))
@@ -1267,6 +1619,7 @@ public class StandaloneGrpcServerTest {
               () ->
                   f.docs.upsert(
                       UpsertRequest.newBuilder()
+                          .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                           .setIndexId(id)
                           .addDocumentsBson(bson("{_id:'a',title:'coffee'}"))
                           .addDocumentsBson(bson("{title:'missing id'}"))
@@ -1279,6 +1632,8 @@ public class StandaloneGrpcServerTest {
                       () ->
                           f.docs.delete(
                               DeleteRequest.newBuilder()
+                                  .setWriteConcern(
+                                      DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                                   .setIndexId(id)
                                   .addIdsBson(bson("{_id:'a',other:1}"))
                                   .build()))
@@ -1289,8 +1644,70 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
-  public void vectorPush_usesExistingVectorSchemaAndReader() throws Exception {
+  public void vectorSearch_explain_returnsPlanAndTracesPagedExecution() throws Exception {
     com.xgen.mongot.index.lucene.vector.Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("explain-vectors")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'embedding',"
+                                  + "numDimensions:3,similarity:'cosine'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      f.upsert(id, "{_id:'a',embedding:[1.0,0.0,0.0]}");
+      f.upsert(id, "{_id:'b',embedding:[0.9,0.1,0.0]}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(bson("{path:'embedding',queryVector:[1.0,0.0,0.0],exact:true,limit:2}"))
+              .setBatchSize(1);
+
+      var plan =
+          f.queries.vectorSearch(
+              request
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+      var first =
+          f.queries.vectorSearch(
+              request
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+      var next =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder()
+                  .setCursorId(first.getCursorId())
+                  .setBatchSize(100)
+                  .build());
+
+      assertThat(new RawBsonDocument(plan.getExplainBson().toByteArray()).containsKey("query"))
+          .isTrue();
+      assertThat(new RawBsonDocument(plan.getBatchBson().toByteArray()).getArray("results"))
+          .isEmpty();
+      assertThat(plan.getCursorId()).isEqualTo(0);
+      assertThat(first.getCursorId()).isNotEqualTo(0);
+      assertThat(new RawBsonDocument(first.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(new RawBsonDocument(next.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(
+              new RawBsonDocument(next.getExplainBson().toByteArray())
+                  .getDocument("resourceUsage")
+                  .getNumber("numBatches")
+                  .intValue())
+          .isEqualTo(2);
+      assertThat(next.getCursorId()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void vectorPush_usesExistingVectorSchemaAndReader() throws Exception {
+    Similarity.load();
     try (var f = new Fixture(data())) {
       var index =
           f.catalog.createIndex(
@@ -1322,8 +1739,7 @@ public class StandaloneGrpcServerTest {
     Path data = data();
     try (var f = new Fixture(data)) {
       assertThrows(
-          java.io.IOException.class,
-          () -> new StandaloneRuntime(StandaloneConfig.development(data, 0)));
+          IOException.class, () -> new StandaloneRuntime(StandaloneConfig.development(data, 0)));
     }
   }
 
@@ -1344,7 +1760,11 @@ public class StandaloneGrpcServerTest {
     private final QueryServiceGrpc.QueryServiceBlockingStub queries;
 
     private Fixture(Path data) throws Exception {
-      this(StandaloneConfig.development(data, 0), new io.grpc.Metadata());
+      this(StandaloneConfig.development(data, 0));
+    }
+
+    private Fixture(StandaloneConfig config) throws Exception {
+      this(config, new io.grpc.Metadata());
     }
 
     private Fixture(StandaloneConfig config, io.grpc.Metadata headers) throws Exception {
@@ -1399,6 +1819,7 @@ public class StandaloneGrpcServerTest {
               this.docs
                   .upsert(
                       UpsertRequest.newBuilder()
+                          .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
                           .setIndexId(id)
                           .addDocumentsBson(bson(json))
                           .build())
@@ -1409,6 +1830,12 @@ public class StandaloneGrpcServerTest {
     private IndexStats stats(String id) {
       return this.catalog.getIndexStats(
           GetIndexStatsRequest.newBuilder().setIndexId(id).setRefresh(true).build());
+    }
+
+    private boolean hasOpenCursors(String id) {
+      var generation =
+          this.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      return this.runtime.cursors().hasOpenCursors(generation.getGenerationId());
     }
 
     private IndexFieldStatsResponse fieldStats(String id, int size) throws Exception {

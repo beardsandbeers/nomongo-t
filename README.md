@@ -8,8 +8,13 @@ Use it for keyword search with mongot's mappings and analyzers, vector similarit
 your own embeddings, or both. Indexes persist on disk. Clients are available for
 [Python, Rust, Java, and TypeScript](clients/README.md).
 
-Version 0.6.0 adds cross-index joins and self-joins as search filters. Join keys are strings
-explicitly indexed as `token`; numeric, ObjectId, and native typed `_id` joins are deferred.
+Version 0.7.0 enables concurrent gRPC ingestion batches and defaults writes to `INDEXED`.
+Background reader refresh and commits default to one second; request `VISIBLE` for read-after-write
+searches or `COMMITTED` for durability. Each batch still targets one index. Upgrade clients along
+with the server so explicit `VISIBLE` is transmitted correctly.
+
+Cross-index joins and self-joins are available as search filters. Join keys are strings explicitly
+indexed as `token`; numeric, ObjectId, and native typed `_id` joins are deferred.
 
 ## Additions to upstream mongot
 
@@ -18,26 +23,54 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 
 | Addition | What it enables |
 | --- | --- |
+| Dual ingestion | Configure `syncSource.replicaSet` to run MongoDB replication alongside direct gRPC writes into separate standalone indexes in one process. See [configuration](docs/coexistence-mode.md). |
 | Standalone indexes | Run without MongoDB. Create independent named indexes and write BSON directly through gRPC `Upsert` and `Delete`. Each index owns its content and lifecycle. |
 | Delete by query | `DeleteByQuery` removes documents selected by search predicates or vector metadata filters from one index, with dry runs and bounded selection. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
 | Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. See [join examples](#join-searches-across-indexes). |
 | Public gRPC API and four clients | Manage indexes, ingest documents, search, and page results from Python, Rust, Java, and TypeScript, with TLS and bearer tokens restricted by role and index. See the [client guide](clients/README.md). |
+| Concurrent gRPC ingestion | Apply batches concurrently to the same or different indexes. Writes default to `INDEXED`; background reader refresh and commits default to one second. Request `VISIBLE` or `COMMITTED` when needed. See [write behavior](#write-behavior-and-persistence). |
 | Dynamic mapping export | `GetIndexMappings` combines configured fields and observed dynamic types into reusable static mappings. See the [mapping example](clients/README.md#export-a-dynamic-mapping). |
 | Index and field diagnostics | `GetIndexStats` and `GetIndexFieldStats` expose document counts, storage averages, and storage/memory attribution, including shared and unknown costs. See the [statistics examples](clients/README.md#index-and-field-statistics). |
+| Standalone query explain | Request Lucene query plans and execution traces through `Search` and `VectorSearch`, including per-partition local plans for joins and cumulative statistics across `GetMore` batches. This exposes the upstream explain engine over the standalone API. See [query tracing](clients/README.md#explain-and-trace-queries). |
 
 MongoDB supports aggregation joins through `$lookup`. This fork's `join` runs inside a mongot
 search expression over standalone indexes and returns matching local documents. It does not
 attach foreign documents. The upstream MongoDB-backed entry point remains in the source;
 the standalone instructions below cover the direct gRPC deployment.
 
+Both ingestion paths can run in one process. Startup follows the configuration: without
+`syncSource`, mongot runs standalone; with `syncSource.replicaSet`, it starts MongoDB replication
+and the standalone gRPC services on the same listener. No mode selector or enablement flag is
+needed. Each index retains one ingestion owner. See [dual ingestion](docs/coexistence-mode.md)
+for configuration, authorization, and recovery behavior. The
+[standard Docker compatibility test](docs/coexistence-mode.md#standard-docker-replacement-regression)
+starts official mongot first and then swaps in our image with the same config and data.
+
 For example, `client.delete_by_query(api.DeleteByQueryRequest(index_id=index.index_id,
 search_query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}})))` deletes matching
 documents from one search index. It requires query and write access and selects up to 10,000 IDs.
 Ingestion can continue during deletion; run the predicate again for another pass if matches remain.
 
+For query tracing, set `explain_verbosity` on the ordinary query request and decode the returned
+`explain_bson`:
+
+```python
+response = client.search(api.QueryRequest(
+    index_id=index.index_id,
+    query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}}),
+    explain_verbosity=api.EXPLAIN_VERBOSITY_EXECUTION_STATS,
+))
+print(decode_bson(response.explain_bson))
+```
+
+Use `EXPLAIN_VERBOSITY_QUERY_PLANNER` for a plan without returned hits or a live cursor.
+Execution tracing returns hits normally; drain `GetMore` for statistics covering all consumed
+results. Regenerate/build the clients together with a server containing this API addition.
+See the [explain guide](clients/README.md#explain-and-trace-queries) for levels and limitations.
+
 ## Quick start
 
-You need Docker. The image includes Java 21 and the native libraries. The published `0.6.0`
+You need Docker. The image includes Java 21 and the native libraries. The published `0.7.0`
 image targets Linux amd64. ARM hosts need amd64 emulation and the `--platform linux/amd64`
 option.
 
@@ -46,7 +79,7 @@ docker run --detach --name nomongo-t \
   --publish 127.0.0.1:27029:27029 \
   --memory 4g \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.6.0
+  mybyte/nomongo-t:0.7.0
 ```
 
 The API listens at **localhost:27029 over gRPC with TLS**. On first startup, the container
@@ -77,7 +110,7 @@ docker cp nomongo-t:/var/lib/mongot/config/admin.token .nomongo-t/admin.token
 chmod 600 .nomongo-t/admin.token
 
 python3 -m venv .venv-nomongo-t
-.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.6.0
+.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.7.0
 ```
 
 Save the following as `demo.py`, then run `.venv-nomongo-t/bin/python demo.py`. It creates a
@@ -119,7 +152,7 @@ with Client(
     client.upsert_many(index.index_id, [
         {"_id": "coffee", "title": "Coffee brewing guide"},
         {"_id": "tea", "title": "Tea brewing guide"},
-    ])
+    ], concern="visible")
 
     response = client.search(api.QueryRequest(
         index_id=index.index_id,
@@ -170,7 +203,7 @@ with Client(
     client.upsert_many(index.index_id, [
         {"_id": "coffee", "embedding": [1.0, 0.0, 0.0]},
         {"_id": "tea", "embedding": [0.0, 1.0, 0.0]},
-    ])
+    ], concern="visible")
 
     response = client.vector_search(api.QueryRequest(
         index_id=index.index_id,
@@ -231,11 +264,11 @@ with Client(
     client.upsert_many(accounts.index_id, [
         {"_id": "a1", "accountKey": "a1", "region": "Berlin"},
         {"_id": "a2", "accountKey": "a2", "region": "Paris"},
-    ])
+    ], concern="visible")
     client.upsert_many(contacts.index_id, [
         {"_id": "c1", "accountKey": "a1", "title": "Software Architect"},
         {"_id": "c2", "accountKey": "a2", "title": "Cloud Architect"},
-    ])
+    ], concern="visible")
     response = client.search(api.QueryRequest(
         index_id=contacts.index_id,
         query_bson=encode_bson({
@@ -308,7 +341,7 @@ docker run --detach --name nomongo-t \
   --memory 8g \
   --env JAVA_TOOL_OPTIONS="-Xms512m -Xmx4g -XX:MaxDirectMemorySize=512m" \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.6.0
+  mybyte/nomongo-t:0.7.0
 ```
 
 `--memory` limits the entire container; `-Xmx` limits only the Java heap. Leave space outside the
@@ -381,7 +414,7 @@ docker run --detach --name nomongo-t \
   --env MONGOT_CONTROL_ADDRESS=localhost:27029 \
   --env MONGOT_CONTROL_CA=/etc/nomongo-t/ca.crt \
   --env MONGOT_CONTROL_TOKEN_FILE=/etc/nomongo-t/admin.token \
-  mybyte/nomongo-t:0.6.0 --config /etc/nomongo-t/standalone.yaml
+  mybyte/nomongo-t:0.7.0 --config /etc/nomongo-t/standalone.yaml
 ```
 
 `--config` selects your YAML file instead of automatic credential generation. The
@@ -439,11 +472,16 @@ See the [operating guide](docs/standalone-mongot.md) for all settings and index-
 
 ## Write behavior and persistence
 
-- Writes default to `concern="visible"`: a fresh search can observe the change when the call
-  returns. Use `concern="committed"` to wait for a durable Lucene commit; reader refresh happens
-  separately. Background commits run at `commitIntervalMillis`.
-- Batches are ordered and can partially apply on failure or disconnect. Keep retries ordered
-  against newer writes. Bound client concurrency and back off on `RESOURCE_EXHAUSTED`.
+- Writes default to `concern="indexed"`: they return after applying the batch to the writer,
+  without waiting for a reader refresh or durable commit. Search visibility follows
+  `refreshIntervalMillis` (default 1000). Use `concern="visible"` for immediate search visibility,
+  or `concern="committed"` to wait for a durable Lucene commit. Background commits run at
+  `commitIntervalMillis` (default 1000); a crash can lose uncommitted writes.
+- Concurrent gRPC batches can index in parallel, including into one index. Documents within each
+  batch remain ordered; batches may interleave and can partially apply on failure or disconnect.
+  Sequence requests and retries that modify the same IDs. Bound client concurrency and back off
+  on `RESOURCE_EXHAUSTED`. See the [ingestion guide](docs/standalone-mongot-grpc-guide.md) for
+  concurrency limits and protocol compatibility.
 - Updating an index mapping creates an empty index generation. Reingest your content after the
   new revision becomes ready.
 - Run one server per data volume. To back up, stop the container cleanly and copy the entire
@@ -467,4 +505,5 @@ not needed. For client development, install `./clients/python` instead of the Py
 - [Server configuration, write semantics, and backpressure](docs/standalone-mongot.md)
 - [Architecture](docs/standalone-mongot-grpc-guide.md)
 - [Join syntax, mappings, and execution](docs/join-design-guide.md)
-- [Release downloads](https://github.com/beardsandbeers/nomongo-t/releases/tag/standalone-v0.6.0)
+- [Docker images](https://hub.docker.com/r/mybyte/nomongo-t) and [Python packages](https://pypi.org/project/mongot-standalone-client/)
+- [Previous release downloads (0.6.0)](https://github.com/beardsandbeers/nomongo-t/releases/tag/standalone-v0.6.0)

@@ -31,7 +31,7 @@ java_library(
 java_binary(
     name = "MongotStandalone",
     jvm_flags = ["--enable-preview"],
-    main_class = "com.xgen.mongot.standalone.MongotStandalone",
+    main_class = "com.xgen.mongot.bootstrap.Mongot",
     visibility = ["//visibility:public"],
-    runtime_deps = [":standalone"],
+    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],
 )

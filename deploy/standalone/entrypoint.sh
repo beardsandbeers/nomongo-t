@@ -25,7 +25,6 @@ if [[ ! -f "${config}/standalone.yaml" ]]; then
     -keyout "${bootstrap}/server.key" -out "${bootstrap}/server.crt" >/dev/null 2>&1
   openssl rand -hex 32 > "${bootstrap}/admin.token"
   cat > "${bootstrap}/standalone.yaml" <<'CONFIG'
-mode: standalone
 storage:
   dataPath: /var/lib/mongot/data
 server:

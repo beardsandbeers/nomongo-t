@@ -19,4 +19,4 @@ exec "${STANDALONE_JAVA}" \
   --enable-native-access=ALL-UNNAMED \
   ${BC_FIPS_FLAGS[@]+"${BC_FIPS_FLAGS[@]}"} \
   -cp "${STANDALONE_DIR}/lib/*:${STANDALONE_DIR}/bin/mongot_standalone_deploy.jar" \
-  com.xgen.mongot.standalone.MongotStandalone "$@"
+  com.xgen.mongot.bootstrap.Mongot "$@"

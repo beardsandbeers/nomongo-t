@@ -539,6 +539,7 @@ public class DefaultConfigManager implements ConfigManager {
     LOG.info("Shutting down.");
 
     this.closed = true;
+    this.configState.awaitRetirements();
     this.configState.cursorManager.close();
 
     shutdown();

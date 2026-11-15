@@ -1,9 +1,13 @@
-from google.protobuf.internal import containers as _containers
-from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from collections.abc import Iterable as _Iterable
+from collections.abc import Mapping as _Mapping
+from typing import ClassVar as _ClassVar
+from typing import Optional as _Optional
+from typing import Union as _Union
+
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Iterable as _Iterable, Mapping as _Mapping
-from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
+from google.protobuf.internal import containers as _containers
+from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -38,6 +42,13 @@ class DocumentWriteConcern(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DOCUMENT_WRITE_CONCERN_INDEXED: _ClassVar[DocumentWriteConcern]
     DOCUMENT_WRITE_CONCERN_COMMITTED: _ClassVar[DocumentWriteConcern]
 
+class ExplainVerbosity(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    EXPLAIN_VERBOSITY_UNSPECIFIED: _ClassVar[ExplainVerbosity]
+    EXPLAIN_VERBOSITY_QUERY_PLANNER: _ClassVar[ExplainVerbosity]
+    EXPLAIN_VERBOSITY_EXECUTION_STATS: _ClassVar[ExplainVerbosity]
+    EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION: _ClassVar[ExplainVerbosity]
+
 INDEX_TYPE_UNSPECIFIED: IndexType
 INDEX_TYPE_SEARCH: IndexType
 INDEX_TYPE_VECTOR_SEARCH: IndexType
@@ -54,6 +65,10 @@ STATS_COLLECTION_STATE_READY: StatsCollectionState
 DOCUMENT_WRITE_CONCERN_VISIBLE: DocumentWriteConcern
 DOCUMENT_WRITE_CONCERN_INDEXED: DocumentWriteConcern
 DOCUMENT_WRITE_CONCERN_COMMITTED: DocumentWriteConcern
+EXPLAIN_VERBOSITY_UNSPECIFIED: ExplainVerbosity
+EXPLAIN_VERBOSITY_QUERY_PLANNER: ExplainVerbosity
+EXPLAIN_VERBOSITY_EXECUTION_STATS: ExplainVerbosity
+EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION: ExplainVerbosity
 
 class CreateIndexRequest(_message.Message):
     __slots__ = ("name", "type", "definition_bson")
@@ -601,39 +616,45 @@ class DeleteResponse(_message.Message):
     ) -> None: ...
 
 class QueryRequest(_message.Message):
-    __slots__ = ("index_id", "query_bson", "batch_size", "generation_id")
+    __slots__ = ("index_id", "query_bson", "batch_size", "generation_id", "explain_verbosity")
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     QUERY_BSON_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPLAIN_VERBOSITY_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     query_bson: bytes
     batch_size: int
     generation_id: str
+    explain_verbosity: ExplainVerbosity
     def __init__(
         self,
         index_id: _Optional[str] = ...,
         query_bson: _Optional[bytes] = ...,
         batch_size: _Optional[int] = ...,
         generation_id: _Optional[str] = ...,
+        explain_verbosity: _Optional[_Union[ExplainVerbosity, str]] = ...,
     ) -> None: ...
 
 class QueryResponse(_message.Message):
-    __slots__ = ("cursor_id", "batch_bson", "metadata_bson", "generation_id")
+    __slots__ = ("cursor_id", "batch_bson", "metadata_bson", "generation_id", "explain_bson")
     CURSOR_ID_FIELD_NUMBER: _ClassVar[int]
     BATCH_BSON_FIELD_NUMBER: _ClassVar[int]
     METADATA_BSON_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPLAIN_BSON_FIELD_NUMBER: _ClassVar[int]
     cursor_id: int
     batch_bson: bytes
     metadata_bson: bytes
     generation_id: str
+    explain_bson: bytes
     def __init__(
         self,
         cursor_id: _Optional[int] = ...,
         batch_bson: _Optional[bytes] = ...,
         metadata_bson: _Optional[bytes] = ...,
         generation_id: _Optional[str] = ...,
+        explain_bson: _Optional[bytes] = ...,
     ) -> None: ...
 
 class GetMoreRequest(_message.Message):

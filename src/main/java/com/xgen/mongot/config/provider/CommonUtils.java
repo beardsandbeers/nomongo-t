@@ -64,6 +64,40 @@ public class CommonUtils {
       ReplicationStateMonitor replicationStateMonitor,
       Optional<Supplier<EmbeddingServiceManager>> embeddingServiceManagerSupplier,
       Optional<LeaderStatusRegistrar> leaderStatusRegistrar) {
+    return getReplicationManagerFactory(
+        dataPath,
+        replicationConfig,
+        initialSyncConfig,
+        durabilityConfig,
+        featureFlags,
+        cursorManager,
+        indexCatalog,
+        initializedIndexCatalog,
+        meterAndFtdcRegistry,
+        replicationMode,
+        replicationStateMonitor,
+        embeddingServiceManagerSupplier,
+        leaderStatusRegistrar,
+        Optional.empty());
+  }
+
+  /** Creates a native replication factory with optional externally owned indexing schedulers. */
+  public static ReplicationManagerFactory getReplicationManagerFactory(
+      Path dataPath,
+      MongoDbReplicationConfig replicationConfig,
+      InitialSyncConfig initialSyncConfig,
+      DurabilityConfig durabilityConfig,
+      FeatureFlags featureFlags,
+      MongotCursorManager cursorManager,
+      IndexCatalog indexCatalog,
+      InitializedIndexCatalog initializedIndexCatalog,
+      MeterAndFtdcRegistry meterAndFtdcRegistry,
+      DefaultConfigManager.ReplicationMode replicationMode,
+      ReplicationStateMonitor replicationStateMonitor,
+      Optional<Supplier<EmbeddingServiceManager>> embeddingServiceManagerSupplier,
+      Optional<LeaderStatusRegistrar> leaderStatusRegistrar,
+      Optional<com.xgen.mongot.replication.mongodb.common.IndexingWorkSchedulerFactory>
+          sharedSchedulers) {
 
     return (Optional<SyncSourceConfig> syncConfig) -> {
       var pauseReplication = replicationStateMonitor.getReplicationGate().isClosed();
@@ -134,7 +168,8 @@ public class CommonUtils {
           meterAndFtdcRegistry,
           replicationStateMonitor.getInitialSyncGate(),
           embeddingServiceManagerSupplier,
-          leaderStatusRegistrar);
+          leaderStatusRegistrar,
+          sharedSchedulers);
     };
   }
 

@@ -110,7 +110,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
       long expiresAt) {}
 
   private record Capture(
-      ApiIngestionManager.StatisticsLease lease,
+      ApiIngestionManager.IndexLease lease,
       LuceneStatisticsSnapshot readers,
       OptionalLong writerHeap)
       implements AutoCloseable {

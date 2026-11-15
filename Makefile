@@ -19,6 +19,10 @@ ONPREM_CONTAINER_VERSION ?= preview
 
 DOCKER_BUILD_OPTS ?=
 STANDALONE_IMAGE ?= mongot-standalone:local
+COMMUNITY_IMAGE ?= mongot-community:local
+COMPATIBILITY_PYTHON ?= python3
+COMPATIBILITY_OUTPUT ?= /tmp/mongot-docker-compatibility
+COMPATIBILITY_TEST_OPTS ?=
 
 # default platform
 PLATFORM ?= linux_x86_64
@@ -53,6 +57,23 @@ build.docker.standalone.local: build.deploy.standalone
 	cp -fL bazel-bin/deploy/mongot-standalone.tgz deploy/standalone/.package/mongot-standalone.tgz
 	docker build $(DOCKER_BUILD_OPTS) --build-arg PACKAGE_SOURCE=local-package \
 		-f deploy/standalone/Dockerfile -t $(STANDALONE_IMAGE) .
+
+.PHONY: build.docker.community.local
+build.docker.community.local: build.deploy.standalone
+	mkdir -p deploy/standalone/.package
+	cp -fL bazel-bin/deploy/mongot-standalone.tgz deploy/standalone/.package/mongot-standalone.tgz
+	docker build $(DOCKER_BUILD_OPTS) --build-arg PACKAGE_SOURCE=local-package \
+		--target community-compatible -f deploy/standalone/Dockerfile -t $(COMMUNITY_IMAGE) .
+
+# Standard backwards-compatibility gate: official mongot first, then an image-only replacement.
+.PHONY: test.docker.compatibility
+test.docker.compatibility:
+	PYTHONPATH=clients/python $(COMPATIBILITY_PYTHON) scripts/tests/community/docker_compatibility_test.py \
+		--candidate-image $(COMMUNITY_IMAGE) --output $(COMPATIBILITY_OUTPUT) $(COMPATIBILITY_TEST_OPTS)
+
+.PHONY: check.docker.compatibility
+check.docker.compatibility: build.docker.community.local
+	$(MAKE) test.docker.compatibility
 
 # linting rules
 .PHONY: lint
@@ -159,7 +180,11 @@ tools.precommit.enabled:
 # dependency rules
 .PHONY: deps.update
 deps.update:
-	@CARGO_BAZEL_REPIN=1 $(call BAZEL) build //src/main/rust/...
+	@if [ -d "$(DIR)/src/main/rust" ]; then \
+		CARGO_BAZEL_REPIN=1 $(call BAZEL) build //src/main/rust/...; \
+	else \
+		echo 'Skipping server Rust dependency refresh: src/main/rust is absent.'; \
+	fi
 	@$(DIR)/scripts/java/update-dependencies.sh
 	@$(call BAZEL) run //bazel/python:requirements.update
 

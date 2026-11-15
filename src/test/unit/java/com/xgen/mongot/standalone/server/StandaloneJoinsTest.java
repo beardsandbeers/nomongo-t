@@ -21,7 +21,9 @@ import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
 import com.xgen.mongot.standalone.grpc.DeleteRequest;
 import com.xgen.mongot.standalone.grpc.DocumentServiceGrpc;
+import com.xgen.mongot.standalone.grpc.DocumentWriteConcern;
 import com.xgen.mongot.standalone.grpc.DropIndexRequest;
+import com.xgen.mongot.standalone.grpc.ExplainVerbosity;
 import com.xgen.mongot.standalone.grpc.GetIndexRequest;
 import com.xgen.mongot.standalone.grpc.GetMoreRequest;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
@@ -49,6 +51,7 @@ import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
 import org.junit.Rule;
@@ -74,6 +77,124 @@ public class StandaloneJoinsTest {
       """;
 
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void search_explainedJoin_preservesPartitionPlansAndCursorDependencies() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING.replace("numPartitions:2", "numPartitions:4"));
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'f',key:'account',office:'Berlin'}");
+      f.upsert(local, "{_id:'a',parent:'account'}");
+      f.upsert(local, "{_id:'b',parent:'account'}");
+      f.upsert(local, "{_id:'c',parent:'account'}");
+
+      var first =
+          f.queries.search(
+              request(local, JOIN, 1).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+      var next =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).setBatchSize(1).build());
+      f.catalog.dropIndex(
+          DropIndexRequest.newBuilder().setIndexId(foreign).setExpectedRevision(1).build());
+
+      assertPartitionPlans(first);
+      assertPartitionPlans(next);
+      assertThat(
+              new RawBsonDocument(next.getExplainBson().toByteArray())
+                  .getDocument("resourceUsage")
+                  .getNumber("numBatches")
+                  .intValue())
+          .isEqualTo(2);
+      assertThat(new RawBsonDocument(next.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+    }
+  }
+
+  @Test
+  public void search_explainedConcurrentSelfJoin_isolatesMembershipFromPartitionPlans()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String local = f.create("local", MAPPING);
+      f.upsert(local, "{_id:'a',key:'account',parent:'account',office:'Berlin'}");
+      f.upsert(local, "{_id:'b',key:'account',parent:'account',office:'Berlin'}");
+      f.upsert(local, "{_id:'c',key:'account',parent:'account',office:'Berlin'}");
+      var expression = BsonDocument.parse(JOIN.replace("from:'foreign',", ""));
+      expression.put("concurrent", BsonBoolean.TRUE);
+
+      var first =
+          f.queries.search(
+              request(local, expression.toJson(), 1).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION)
+                  .build());
+      var next =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder()
+                  .setCursorId(first.getCursorId())
+                  .setBatchSize(100)
+                  .build());
+
+      assertPartitionPlans(first);
+      assertPartitionPlans(next);
+      assertThat(new RawBsonDocument(first.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(new RawBsonDocument(next.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(2);
+      assertThat(next.getCursorId()).isEqualTo(0);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_explainedSinglePartitionJoin_returnsOnlyLocalPlannerQuery() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING.replace("numPartitions:2", "numPartitions:1"));
+      f.upsert(foreign, "{_id:'f',key:'account',office:'Berlin'}");
+      f.upsert(local, "{_id:'a',parent:'account'}");
+
+      var response =
+          f.queries.search(
+              request(local, JOIN, 1).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+
+      var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+      assertThat(explain.getDocument("query").toJson()).contains("parent");
+      assertThat(explain.getDocument("query").toJson()).doesNotContain("office");
+      assertThat(explain.getDocument("query").containsKey("stats")).isFalse();
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .isEmpty();
+      assertThat(response.getCursorId()).isEqualTo(0);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  private static void assertPartitionPlans(QueryResponse response) {
+    var partitions =
+        new RawBsonDocument(response.getExplainBson().toByteArray())
+            .getArray("indexPartitionExplain");
+    assertThat(partitions).hasSize(2);
+    assertLocalPlan(partitions.get(0).asDocument());
+    assertLocalPlan(partitions.get(1).asDocument());
+  }
+
+  private static void assertLocalPlan(BsonDocument explain) {
+    assertThat(explain.containsKey("query")).isTrue();
+    assertThat(explain.containsKey("collectors")).isTrue();
+    assertThat(explain.get("query").toString()).contains("parent");
+    assertThat(explain.get("query").toString()).doesNotContain("office");
+  }
 
   @Test
   public void search_guideExampleWithDifferentMappings_returnsOnlyMatchingArchitect()
@@ -196,7 +317,11 @@ public class StandaloneJoinsTest {
       assertThat(first.getCursorId()).isNotEqualTo(0);
 
       f.docs.delete(
-          DeleteRequest.newBuilder().setIndexId(foreign).addIdsBson(bson("{_id:'p'}")).build());
+          DeleteRequest.newBuilder()
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .setIndexId(foreign)
+              .addIdsBson(bson("{_id:'p'}"))
+              .build());
       var second =
           f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
       var fresh = f.search(local, JOIN, 100);
@@ -971,7 +1096,11 @@ public class StandaloneJoinsTest {
 
     private void upsert(String id, String doc) {
       this.docs.upsert(
-          UpsertRequest.newBuilder().setIndexId(id).addDocumentsBson(bson(doc)).build());
+          UpsertRequest.newBuilder()
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .setIndexId(id)
+              .addDocumentsBson(bson(doc))
+              .build());
     }
 
     private QueryResponse search(String id, String query, int size) {

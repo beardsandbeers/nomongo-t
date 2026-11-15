@@ -71,6 +71,14 @@ final class StandaloneDeleteByQuery {
     }
   }
 
+  private long requireRevision(String indexId, long expected) {
+    long revision = this.runtime.catalog().getIndex(indexId).getDesiredRevision();
+    if (revision != expected) {
+      throw Status.FAILED_PRECONDITION.asRuntimeException();
+    }
+    return revision;
+  }
+
   DeleteByQueryResponse execute(DeleteByQueryRequest request) {
     StandaloneAuthInterceptor.requireRole(
         com.xgen.mongot.standalone.config.StandaloneConfig.Role.QUERY);
@@ -212,37 +220,23 @@ final class StandaloneDeleteByQuery {
             }
             var batch = list.subList(start, end);
             start = end;
-            ingestion.coordinate(
-                () -> {
-                  var desired = this.runtime.catalog().getIndex(request.getIndexId());
-                  if (desired.getDesiredRevision() != revision) {
-                    throw Status.FAILED_PRECONDITION.asRuntimeException();
-                  }
-                  this.runtime.checkWriteAdmission(request.getSerializedSize());
-                  return ingestion.write(
-                      request.getIndexId(),
-                      revision,
-                      id,
-                      batch,
-                      true,
-                      DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED);
-                });
+            this.runtime.checkWriteAdmission(request.getSerializedSize());
+            ingestion.write(
+                request.getIndexId(),
+                () -> requireRevision(request.getIndexId(), revision),
+                id,
+                batch,
+                true,
+                DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED);
           }
         }
-        ingestion.coordinate(
-            () -> {
-              if (Context.current().isCancelled()) {
-                throw Status.CANCELLED.asRuntimeException();
-              }
-              var desired = this.runtime.catalog().getIndex(request.getIndexId());
-              if (desired.getDesiredRevision() != revision || lease.retired()) {
-                throw Status.FAILED_PRECONDITION.asRuntimeException();
-              }
-              if (!request.getDryRun()) {
-                ingestion.completeWrite(id, lease.index(), request.getWriteConcern());
-              }
-              return true;
-            });
+        ingestion.completeWrite(
+            request.getIndexId(),
+            () -> requireRevision(request.getIndexId(), revision),
+            id,
+            request.getDryRun()
+                ? DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED
+                : request.getWriteConcern());
         return DeleteByQueryResponse.newBuilder()
             .setIndexId(request.getIndexId())
             .setGenerationId(id)

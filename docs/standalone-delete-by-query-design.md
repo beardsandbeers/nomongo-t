@@ -13,9 +13,9 @@ may leave matching documents behind; callers can rerun the same query if they wa
 There is no document version checking or coordination across the whole operation.
 
 Reject selections that exceed resource limits before deleting anything. Failures during
-application can leave partial changes, as with existing writes. Reuse the ordinary write lock
-for each batch and final completion, and use a generation lease to keep reader resources alive
-during selection. Large purges require narrower predicates initially; background jobs remain
+application can leave partial changes, as with existing writes. Acquire generation leases for batch writes and final completion, and keep a selection lease
+while reader resources are in use. Catalog checks use the ingestion monitor; writes, refresh,
+and commits run outside it. Large purges require narrower predicates initially; background jobs remain
 separate follow-up work.
 
 ## Current behavior and motivation
@@ -32,7 +32,8 @@ The relevant implementation is:
   `Delete`, and separate search RPCs. `DeleteResponse.processed_count` counts submitted IDs,
   including IDs that did not exist.
 - [ApiIngestionManager](../src/main/java/com/xgen/mongot/standalone/ingestion/ApiIngestionManager.java)
-  coordinates writes, mapping changes, retirement, and commits with one monitor. It validates
+  coordinates catalog changes and generation acquisition with one monitor. Writes run outside
+  that monitor, and commits serialize per generation. It validates
   the active generation, applies delete events, and completes the requested write concern.
 - [StandaloneQueryService](../src/main/java/com/xgen/mongot/standalone/server/StandaloneQueryService.java)
   parses BSON search expressions and creates cursors with pinned readers. Public cursor paging
@@ -183,8 +184,8 @@ selection. Concurrent mutations may or may not appear, depending on when that pa
 reader was acquired. The selected readers need not represent one common instant across all
 partitions. Once pinned, each reader's selection is stable.
 
-Apply selected IDs through ordinary delete batches, acquiring and releasing the coordinator
-for each batch. Do not re-evaluate the predicate or check document versions before deletion.
+Apply selected IDs through ordinary delete batches, briefly acquiring the coordinator
+to validate the catalog and lease the generation before each batch. Do not re-evaluate the predicate or check document versions before deletion.
 The accepted behavior is:
 
 - A new match inserted after selection can survive this pass and be selected on the next pass.
@@ -201,8 +202,8 @@ operation internally to the resolved generation and revision; recheck both again
 before every batch and final completion. A schema change or drop stops further application,
 possibly after earlier batches. Never carry selected IDs into a replacement generation.
 
-Selection does not hold the global ingestion lock. Batch writes and final refresh/commit retain
-the existing lock behavior, so other writes and readiness checks can wait for those sections.
+Selection, batch writes, and final refresh/commit run outside the catalog monitor. Brief
+generation checks still serialize; commits use the generation's commit lock.
 Queries can observe partial deletion, and existing cursors can return their older snapshots.
 The operation does not invalidate query cursors or statistics snapshots; cached statistics retain
 their existing freshness semantics.
@@ -227,18 +228,19 @@ their existing freshness semantics.
    before applying them. On a limit or selection error, release resources and fail without
    deleting documents. A dry run rechecks the generation and revision and returns the count here.
 6. Close selection readers once IDs are materialized. Submit ordinary delete events in internal
-   batches within existing document and byte limits. Each batch acquires the coordinator,
-   checks cancellation, generation/revision, and disk admission, applies deletes, then releases
-   the coordinator. Mark the generation dirty before mutations and check cancellation between IDs.
-7. Acquire the coordinator once more, revalidate generation/revision and cancellation, and
-   complete the requested write concern. Release it and return counts and the selected
+   batches within existing document and byte limits. Each batch checks disk admission,
+   then briefly acquires the coordinator to validate generation/revision and obtain a write lease.
+   It applies deletes outside the coordinator, checks cancellation between IDs, and advances the
+   generation's write version in a finally block so partial work remains eligible for commit.
+7. Acquire a completion lease while revalidating generation/revision and cancellation, then
+   complete the requested write concern outside the coordinator. Return counts and the selected
    generation. Always close the lease and remaining readers outside the coordinator, and release
    the capacity reservation, including on errors and failed response delivery.
 
 Extract the shared event application and completion logic from `ApiIngestionManager.write` so
 both ID-based deletion and query deletion use the same dirty tracking, partition routing,
-writer-limit handling, and failure transitions. Internal batches release coordination between
-batches and apply with `INDEXED`; perform the requested refresh/commit only at final completion.
+writer-limit handling, and failure transitions. Internal batches apply outside catalog coordination
+with `INDEXED`; perform the requested refresh/commit only at final completion.
 Background refresh and commit may also occur between batches. A non-dry-run zero-match request
 still validates the generation and honors the requested completion boundary.
 
@@ -271,7 +273,7 @@ String, ObjectId, int32, and int64 identities must remain distinct, including in
 with the same numeric value. Apply deletes through `DocumentEvent.createDelete` using the decoded
 typed value. The existing writer removes the root and all children carrying that ID.
 
-Reuse the existing `ApiIngestionManager.StatisticsLease` mechanism as the generation lease
+Reuse the existing `ApiIngestionManager.IndexLease` mechanism as the generation lease
 for selection and statistics. Retirement may mark the generation unavailable immediately,
 but physical resource close waits for its leases to drain. Check retirement between selection
 phases and before applying batches. Close pinned readers before releasing the lease, and complete
@@ -307,8 +309,7 @@ The time limits are cooperative, not hard latency guarantees. Waiting to enter t
 monitor cannot be cancelled, and a Lucene refresh, write, or commit already in progress may
 overrun a deadline. Recheck cancellation immediately after monitor acquisition and every such
 call; do not continue mutation work after observing it. Retain admission capacity until server
-work actually stops. The selection timeout runs without holding the ingestion lock. Other writes
-and readiness checks can still wait behind an individual delete batch or final refresh/commit,
+work actually stops. The selection timeout runs without holding the ingestion lock. Writes and refresh/commit can still compete for CPU, memory, and disk,
 and shared RPC workers remain a source of contention.
 
 Retain existing disk admission for deletion: applying and committing deletes can require disk

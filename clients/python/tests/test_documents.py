@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import bson
 from bson import Int64, ObjectId
-
 from mongot_standalone import api
 from mongot_standalone.documents import DocumentCommandsMixin
 
@@ -39,6 +38,18 @@ class IndexHelpersTest(unittest.TestCase):
         self.assertIsInstance(bson.decode(delete.ids_bson[1])["_id"], Int64)
         self.assertNotIsInstance(bson.decode(delete.ids_bson[2])["_id"], Int64)
         self.assertFalse(hasattr(upsert, "request_id"))
+
+    def test_default_concern_is_indexed_and_visible_preserves_presence(self):
+        client = RecordingClient()
+        client.upsert("index", {"_id": "a"})
+        client.delete("index", "a")
+        client.upsert("index", {"_id": "a"}, concern="visible")
+        self.assertEqual(client.calls[0][0].write_concern, api.DOCUMENT_WRITE_CONCERN_INDEXED)
+        self.assertEqual(client.calls[1][0].write_concern, api.DOCUMENT_WRITE_CONCERN_INDEXED)
+        visible = api.UpsertRequest.FromString(client.calls[2][0].SerializeToString())
+        self.assertTrue(visible.HasField("write_concern"))
+        self.assertEqual(visible.write_concern, api.DOCUMENT_WRITE_CONCERN_VISIBLE)
+        self.assertFalse(api.UpsertRequest().HasField("write_concern"))
 
     def test_generation_and_timeout_are_forwarded_without_retries(self):
         client = RecordingClient()

@@ -1,7 +1,8 @@
 # Running mongot in push mode
 
 The standalone executable uses mongot's ordinary Lucene indexes, BSON mapping validation,
-text/vector readers, and cursor manager. It does not connect to MongoDB. It stores content
+text/vector readers, and cursor manager. Without `syncSource`, it does not connect to MongoDB. Adding a MongoDB source starts
+both ingestion paths in one process; see [dual ingestion](coexistence-mode.md). It stores content
 only through Lucene, including `storedSource` when explicitly configured in the index schema.
 
 ## Build and run
@@ -13,13 +14,13 @@ cd /tmp/mongot-standalone
 ./mongot-standalone --config standalone.yaml
 ```
 
-The archive includes Java 21, native libraries, the API schema, and an example configuration.
+The archive includes Java 21, native libraries, the API schema, and example configurations.
+It also includes the native `mongot` launcher for [replication and standalone indexes together](coexistence-mode.md).
 Docker build and TLS bootstrap instructions are in [the container guide](../deploy/standalone/DOCKERHUB.md).
 
 ## Configuration
 
 ```yaml
-mode: standalone
 storage:
   dataPath: ./data
 server:
@@ -80,10 +81,12 @@ retries; preserve ordering against newer writes when retrying replacements or de
 
 Indexing runs synchronously on the RPC workers. Slow Lucene writes hold admission capacity until
 they finish, so the limits eventually reject excess traffic instead of growing a persistent queue.
-Writes and commits currently share one ingestion lock across all indexes. A slow write can delay
-other indexes and occupy shared workers; there is no adaptive or per-index rate limiter. Client
-and server deadlines cancel cooperatively between documents and before queued work starts; they
-do not interrupt a Lucene call already in progress.
+Concurrent ingestion batches run outside the catalog monitor, including batches targeting the
+same index. Background commits run independently of writes, with per-generation commit coordination.
+The shared worker pool bounds concurrency, so slow requests can still delay other RPCs. Lucene
+indexing, analysis, refresh and commit can still compete for CPU, memory and disk resources.
+There is no adaptive or per-index rate limiter. Client and server deadlines cancel cooperatively
+between documents and before queued work starts; they do not interrupt a Lucene call in progress.
 
 GetStatus exposes the `standalone.rpc.inflight`, `standalone.rpc.bytes`, `standalone.rpc.queued`
 and `standalone.rpc.rejected` metrics. The release checks cover functional RPC behavior, TLS,
@@ -123,13 +126,25 @@ nesting and IDs exceeding Lucene's term limit fail validation before the batch i
 Existing mongot mapping rules determine which fields produce indexed values; a successful write
 does not guarantee that a mismatched field value was indexed.
 
+Release 0.7.0 defaults Upsert and Delete to `INDEXED`: the batch is applied without waiting
+for reader refresh or durable commit. The default refresh and commit intervals are one second.
+Explicit `VISIBLE` waits for search visibility; `COMMITTED` waits for durability. Use matching
+0.7.0 client bindings to transmit explicit `VISIBLE=0`; older bindings omit it and therefore use
+the new default. See the [ingestion guide](standalone-mongot-grpc-guide.md) for protocol details.
+
+Concurrent requests can index through up to eight bounded RPC workers, including into the same
+index. Documents within each batch execute in order; concurrent batches can interleave. Sequence
+writes and retries affecting the same IDs when order matters.
+
 A write targets exactly one index. For multiple text/vector indexes, the caller submits content
 to each index. There is no fan-out, cross-index transaction, collection, document read API,
 strict INSERT, request-ID deduplication, or replay endpoint.
 
 ### Delete by query
 
-`DocumentService.DeleteByQuery` selects IDs and deletes them in batches from one index. Supply
+`DocumentService.DeleteByQuery` selects IDs and deletes them in batches from one index. Its
+write concern defaults to `VISIBLE`; the `INDEXED` default for Upsert/Delete does not change
+DeleteByQuery completion. Supply
 exactly one selector: `search_query_bson` containing a search operator, `vector_filter_bson`
 containing a vector metadata filter, or `match_all: true`. Both `write` and `query` roles and an
 index grant are required. Nested and namespaced vector indexes are currently unsupported.
@@ -176,15 +191,15 @@ limits, and token-length caveats; the guide also ships beside this file in the s
 
 ### Completion and retries
 
-- `VISIBLE` (default): applies the batch and refreshes the Lucene reader. Fresh searches see it.
-- `INDEXED`: applies to the writer. Refresh and commit occur separately.
+- `INDEXED` (default): applies to the writer without waiting for refresh or durable commit.
+- `VISIBLE`: applies the batch and refreshes the Lucene reader. Fresh searches see it.
 - `COMMITTED`: commits to Lucene before returning. Visibility follows reader refresh.
 
 Background commits run at `commitIntervalMillis`. Shutdown commits outstanding writes before
 closing indexes. Uncommitted writes can be lost on a crash; replay them from your own source.
 `VISIBLE` does not imply durability. Use `COMMITTED` for crash persistence.
 
-Batches are ordered but not atomic. A failure, deadline, or disconnect can leave a prefix applied.
+Documents within a batch are ordered; concurrent batches can interleave. Batches are not atomic. A failure, deadline, or disconnect can leave a prefix applied.
 Repeating a replacement/delete is idempotent in isolation, but there is no durable request ledger:
 callers must order retries so an old retry cannot overwrite a newer update. Optional
 `generation_id` fences writes against schema changes. Requests during a mapping transition fail
@@ -204,6 +219,31 @@ asynchronously. Query cursors pin their reader snapshot; index drop invalidates 
 Search and VectorSearch execute ordinary BSON search expressions against `index_id`; use
 GetMore for nonzero cursor IDs and KillCursor to release them early. Results contain IDs/scores
 and optional configured Lucene stored source. There is no external document hydration.
+
+### Query explain
+
+`QueryService.Search` and `QueryService.VectorSearch` accept an `explain_verbosity` enum outside
+`query_bson`. The default, `EXPLAIN_VERBOSITY_UNSPECIFIED`, disables explain. Supported levels are
+`EXPLAIN_VERBOSITY_QUERY_PLANNER`, `EXPLAIN_VERBOSITY_EXECUTION_STATS`, and
+`EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION`; unknown values return `INVALID_ARGUMENT`.
+
+Explained responses add `explain_bson`, a complete BSON document in the upstream Lucene explain
+format. Planner requests return an empty `results` array and no live cursor. Execution levels
+return normal result batches and cumulative explain snapshots, including on `GetMore`. They
+measure the work performed so far; the server does not automatically drain the cursor. Use the
+final response for complete execution statistics. Tracing is opt-in and adds profiling overhead.
+Planner requests can still perform preparation, join key collection, and metadata/count work.
+
+The ordinary query role and per-index grants apply, including every foreign index in a join.
+Existing generation fences, reader snapshots, cursor ownership, idle expiration, cancellation,
+and dependency invalidation also apply. Explain state is restored on each batch and released with
+the cursor. Oversized explain output returns `RESOURCE_EXHAUSTED`; output is not silently truncated.
+This uses the shared explain and cursor machinery without changing the MongoDB-backed command
+path. It returns diagnostics in the RPC response and does not configure external trace export.
+
+Build matching server/client bindings for these added fields. See the
+[client examples](../clients/README.md#explain-and-trace-queries) for Python, Java, TypeScript,
+and Rust usage and the available output sections.
 
 ## Persistence and upgrades
 

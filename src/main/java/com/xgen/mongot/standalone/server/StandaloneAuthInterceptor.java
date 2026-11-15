@@ -8,11 +8,13 @@ import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
 import io.grpc.Context;
 import io.grpc.Contexts;
 import io.grpc.ForwardingServerCallListener;
+import io.grpc.Grpc;
 import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.List;
@@ -73,7 +75,7 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
       ServerCall<ReqT, RespT> call, Metadata headers, ServerCallHandler<ReqT, RespT> next) {
     Principal principal;
     try {
-      principal = authenticate(headers);
+      principal = authenticate(call, headers);
       String service = call.getMethodDescriptor().getServiceName();
       Role role =
           service != null
@@ -137,8 +139,23 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
     }
   }
 
-  private Principal authenticate(Metadata headers) {
+  private Principal authenticate(ServerCall<?, ?> call, Metadata headers) {
     List<Principal> principals = this.config.principals();
+    if (this.config.sharedListener()) {
+      var remote = call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
+      boolean loopback =
+          remote instanceof InetSocketAddress address
+              && address.getAddress() != null
+              && address.getAddress().isLoopbackAddress();
+      if (!loopback
+          && (principals.isEmpty()
+              || call.getAttributes().get(Grpc.TRANSPORT_ATTR_SSL_SESSION) == null)) {
+        throw Status.UNAUTHENTICATED
+            .withDescription(
+                "Remote standalone API access requires TLS and configured bearer principals")
+            .asRuntimeException();
+      }
+    }
     if (principals.isEmpty()) {
       return LOCAL;
     }

@@ -5,6 +5,9 @@ import com.google.protobuf.ByteString;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.batch.BatchCursorOptions;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
+import com.xgen.mongot.index.lucene.explain.explainers.MetadataFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.tracing.Explain;
+import com.xgen.mongot.index.lucene.explain.tracing.ExplainTooLargeException;
 import com.xgen.mongot.index.query.MaterializedVectorSearchQuery;
 import com.xgen.mongot.index.query.QueryExecutionContext;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
@@ -12,6 +15,7 @@ import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.VectorSearchQuery;
 import com.xgen.mongot.standalone.StandaloneBson;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
+import com.xgen.mongot.standalone.grpc.ExplainVerbosity;
 import com.xgen.mongot.standalone.grpc.GetMoreRequest;
 import com.xgen.mongot.standalone.grpc.KillCursorRequest;
 import com.xgen.mongot.standalone.grpc.KillCursorResponse;
@@ -111,6 +115,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
           .asRuntimeException();
     }
     int size = batchSize(request.getBatchSize());
+    var verbosity = explainVerbosity(request.getExplainVerbosity());
+    boolean plannerOnly =
+        verbosity.filter(value -> value == Explain.Verbosity.QUERY_PLANNER).isPresent();
     if (!this.capacity.tryAcquire()) {
       throw Status.RESOURCE_EXHAUSTED
           .withDescription("Open cursor capacity is full")
@@ -119,7 +126,14 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     @Var long cursorId = 0;
     @Var boolean retained = false;
     @Var StandaloneJoinPlanner.Plan joinPlan = null;
-    try {
+    try (var unused =
+        Explain.setup(verbosity, Optional.of(generation.getDefinition().getNumPartitions()))) {
+      Explain.getQueryInfo()
+          .map(
+              info ->
+                  info.getFeatureExplainer(
+                      MetadataFeatureExplainer.class, MetadataFeatureExplainer::new))
+          .ifPresent(metadata -> metadata.setIndexName(desired.getName()));
       var expression = new BsonDocument();
       expression.putAll(
           StandaloneBson.document(request.getQueryBson().toByteArray(), 1024 * 1024, 100));
@@ -186,12 +200,16 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       var response =
           QueryResponse.newBuilder()
               .setGenerationId(generationId)
-              .setBatchBson(encode(new BsonDocument("results", batch.batch)))
+              .setBatchBson(
+                  encode(
+                      new BsonDocument(
+                          "results", plannerOnly ? new org.bson.BsonArray() : batch.batch)))
               .setMetadataBson(encode(cursor.metaResults.applyAggregationLimit().toBson()));
+      batch.explainResult.ifPresent(explain -> response.setExplainBson(encode(explain.toBson())));
       if (joinPlan != null) {
         joinPlan.verifyDependencies();
       }
-      if (!batch.exhausted) {
+      if (!plannerOnly && !batch.exhausted) {
         this.leases.put(
             cursorId,
             new Lease(
@@ -232,7 +250,8 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   QueryResponse nextBatch(GetMoreRequest request) {
     var lease = requireLease(request.getCursorId());
     synchronized (lease) {
-      try {
+      try (var unused =
+          Explain.setup(this.runtime.cursors().getExplainQueryState(request.getCursorId()))) {
         lease.joinPlan.ifPresent(plan -> plan.activate(Context.current()));
         var batch =
             this.runtime
@@ -247,11 +266,13 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         if (batch.exhausted) {
           release(request.getCursorId(), lease);
         }
-        return QueryResponse.newBuilder()
-            .setCursorId(batch.exhausted ? 0 : request.getCursorId())
-            .setGenerationId(lease.generation)
-            .setBatchBson(encode(new BsonDocument("results", batch.batch)))
-            .build();
+        var response =
+            QueryResponse.newBuilder()
+                .setCursorId(batch.exhausted ? 0 : request.getCursorId())
+                .setGenerationId(lease.generation)
+                .setBatchBson(encode(new BsonDocument("results", batch.batch)));
+        batch.explainResult.ifPresent(explain -> response.setExplainBson(encode(explain.toBson())));
+        return response.build();
       } catch (Exception e) {
         release(request.getCursorId(), lease);
         throw queryError(e);
@@ -375,6 +396,20 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     return requested == 0 ? 100 : requested;
   }
 
+  private static Optional<Explain.Verbosity> explainVerbosity(ExplainVerbosity verbosity) {
+    return switch (verbosity) {
+      case EXPLAIN_VERBOSITY_UNSPECIFIED -> Optional.empty();
+      case EXPLAIN_VERBOSITY_QUERY_PLANNER -> Optional.of(Explain.Verbosity.QUERY_PLANNER);
+      case EXPLAIN_VERBOSITY_EXECUTION_STATS -> Optional.of(Explain.Verbosity.EXECUTION_STATS);
+      case EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION ->
+          Optional.of(Explain.Verbosity.ALL_PLANS_EXECUTION);
+      case UNRECOGNIZED ->
+          throw Status.INVALID_ARGUMENT
+              .withDescription("Unknown explain_verbosity")
+              .asRuntimeException();
+    };
+  }
+
   private static RuntimeException queryError(Exception e) {
     if (e instanceof io.grpc.StatusRuntimeException status) {
       return status;
@@ -383,6 +418,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       return Status.NOT_FOUND
           .withDescription("Cursor expired or its index was dropped")
           .asRuntimeException();
+    }
+    if (e instanceof ExplainTooLargeException) {
+      return Status.RESOURCE_EXHAUSTED.withDescription(e.getMessage()).asRuntimeException();
     }
     if (e instanceof com.xgen.mongot.util.bson.parser.BsonParseException
         || e instanceof com.xgen.mongot.index.query.InvalidQueryException

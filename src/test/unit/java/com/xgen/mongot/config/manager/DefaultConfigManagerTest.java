@@ -102,6 +102,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1140,6 +1141,24 @@ public class DefaultConfigManagerTest {
 
     inOrder.verify(mocks.cursorManager).close();
     inOrder.verify(mocks.lifecycleManager).shutdown();
+  }
+
+  @Test
+  public void close_failedRetirement_preservesCursorManagerAndLifecycle() throws Exception {
+    var mocks = DefaultConfigManagerMocks.create();
+    synchronized (mocks.configManager) {
+      var state = mocks.configManager.configState;
+      state.enableDeferredRetirement(Runnable::run);
+      state.deferRetirement(
+          mockIndexGeneration(),
+          () ->
+              CompletableFuture.failedFuture(new IllegalStateException("Producer did not drain")));
+    }
+
+    Assert.assertThrows(IllegalStateException.class, mocks.configManager::close);
+
+    verify(mocks.cursorManager, never()).close();
+    verify(mocks.lifecycleManager, never()).shutdown();
   }
 
   @Test

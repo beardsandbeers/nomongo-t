@@ -1037,7 +1037,7 @@ public class SearchCommandTest {
     Assert.assertEquals(0, result.getInt32("ok").getValue());
     Assert.assertEquals(
         "Query should contain either an operator [autocomplete, compound, embeddedDocument,"
-            + " equals, exists, geoShape, geoWithin, hasAncestor, hasRoot, in, knnBeta,"
+            + " equals, exists, geoShape, geoWithin, hasAncestor, hasRoot, in, join, knnBeta,"
             + " moreLikeThis, near, phrase, queryString, range, regex, search, span, term, text,"
             + " vectorSearch, wildcard] or a collector [facet]",
         result.getString("errmsg").getValue());
@@ -1067,7 +1067,7 @@ public class SearchCommandTest {
     Assert.assertEquals(0, result.getInt32("ok").getValue());
     Assert.assertEquals(
         "Query should contain either an operator [autocomplete, compound, embeddedDocument,"
-            + " equals, exists, geoShape, geoWithin, hasAncestor, hasRoot, in, knnBeta,"
+            + " equals, exists, geoShape, geoWithin, hasAncestor, hasRoot, in, join, knnBeta,"
             + " moreLikeThis, near, phrase, queryString, range, regex, search, span, term, text,"
             + " vectorSearch, wildcard] or a collector [facet]",
         result.getString("errmsg").getValue());

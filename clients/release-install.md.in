@@ -4,6 +4,15 @@ Install server and clients from the same release. Verify artifacts with SHA256SU
 The server archive includes Java and native libraries. See standalone-mongot.md inside the
 archive and clients/README.md in the source release for examples.
 
+Writes default to `INDEXED`: the batch is applied without waiting for refresh or commit.
+Background reader refresh and commits default to one second. Request `VISIBLE` for read-after-write
+search or `COMMITTED` for durability. Batches can execute concurrently against one or several
+indexes, but each individual batch targets one index and preserves its document order. Sequence
+requests and retries that affect the same IDs when order matters.
+
+Upgrade client bindings with the server. Older generated bindings omit `VISIBLE=0` on the wire,
+which now selects the default `INDEXED`; updated bindings preserve an explicitly selected concern.
+
 Search supports cross-index and self-join filters: place `join` in `compound.filter` or
 `compound.mustNot`, set `from: "indexName"` (omit for self-joins), `localField`, `foreignField`,
 and a foreign `operator`. Both key fields must be strings explicitly mapped as `token`

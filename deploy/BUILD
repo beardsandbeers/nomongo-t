@@ -105,7 +105,10 @@ package_deploy_tar(
 
 package_deploy_tar(
     name = "mongot-standalone",
-    bin = ["//:mongot_standalone_deploy.jar"],
+    bin = [
+        "//:mongot_standalone_deploy.jar",
+        "//:mongot_community_deploy.jar",
+    ],
     lib = [
         "//:fips-jars",
     ] + select({
@@ -119,11 +122,14 @@ package_deploy_tar(
     target_jdk = "//deploy:release_target_jdk",
     toplevel = [
         ":standalone-resources/mongot-standalone",
+        ":community-resources/mongot",
+        ":standalone-resources/coexistence.yaml",
         ":standalone-resources/standalone.yaml",
         ":bc-fips-env.sh",
         "//src/proto/standalone/v1:standalone.proto",
         "//:docs/join-design-guide.md",
         "//:docs/standalone-mongot.md",
+        "//:docs/coexistence-mode.md",
         "//:scripts/standalone/client.py",
     ],
     with_tags = False,

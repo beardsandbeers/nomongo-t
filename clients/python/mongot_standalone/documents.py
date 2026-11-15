@@ -59,7 +59,7 @@ class DocumentCommandsMixin:
         index_id: str,
         documents: Iterable[Mapping],
         *,
-        concern="visible",
+        concern="indexed",
         generation_id="",
         timeout=None,
     ) -> api.UpsertResponse:
@@ -81,7 +81,7 @@ class DocumentCommandsMixin:
         index_id: str,
         ids: Iterable,
         *,
-        concern="visible",
+        concern="indexed",
         generation_id="",
         timeout=None,
     ) -> api.DeleteResponse:

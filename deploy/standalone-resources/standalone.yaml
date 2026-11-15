@@ -1,4 +1,3 @@
-mode: standalone
 storage:
   dataPath: ./data
 server:

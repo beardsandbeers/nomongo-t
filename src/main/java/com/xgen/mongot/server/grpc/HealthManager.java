@@ -39,6 +39,11 @@ public class HealthManager {
     return this.healthStatusManager.getHealthService();
   }
 
+  /** Adds named extension health without changing native empty-service readiness. */
+  public void setServiceStatus(String service, boolean serving) {
+    this.healthStatusManager.setStatus(service, serving ? SERVING : NOT_SERVING);
+  }
+
   public boolean isHealthy() {
     return this.healthy;
   }

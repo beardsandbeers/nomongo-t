@@ -53,6 +53,7 @@ public class CommunityConfigUpdater implements ConfigUpdater {
   private final AuthoritativeIndexCatalog authoritativeIndexCatalog;
   private final MongoDbMetadataClient mongoDbMetadataClient;
   private final ConfigManager configManager;
+  private final boolean requireCompleteSnapshot;
   private final FeatureFlags featureFlags;
   private final InitialSyncHostProvider initialSyncHostProvider;
   private final CatalogAccessGuard catalogAccessGuard;
@@ -77,6 +78,27 @@ public class CommunityConfigUpdater implements ConfigUpdater {
       SyncSourceConfig initialSyncSourceConfig,
       InitialSyncHostProvider initialSyncHostProvider,
       CatalogAccessGuard catalogAccessGuard) {
+    this(
+        authoritativeIndexCatalog,
+        mongoDbMetadataClient,
+        configManager,
+        featureFlags,
+        initialSyncSourceConfig,
+        initialSyncHostProvider,
+        catalogAccessGuard,
+        false);
+  }
+
+  public CommunityConfigUpdater(
+      AuthoritativeIndexCatalog authoritativeIndexCatalog,
+      MongoDbMetadataClient mongoDbMetadataClient,
+      ConfigManager configManager,
+      FeatureFlags featureFlags,
+      SyncSourceConfig initialSyncSourceConfig,
+      InitialSyncHostProvider initialSyncHostProvider,
+      CatalogAccessGuard catalogAccessGuard,
+      boolean requireCompleteSnapshot) {
+    this.requireCompleteSnapshot = requireCompleteSnapshot;
     this.authoritativeIndexCatalog = authoritativeIndexCatalog;
     this.mongoDbMetadataClient = mongoDbMetadataClient;
     this.configManager = configManager;
@@ -127,7 +149,10 @@ public class CommunityConfigUpdater implements ConfigUpdater {
     // desired index definitions.
     List<IndexDefinition> desiredDefinitions;
     try {
-      desiredDefinitions = this.authoritativeIndexCatalog.listIndexDefinitions();
+      desiredDefinitions =
+          this.requireCompleteSnapshot
+              ? this.authoritativeIndexCatalog.listCompleteIndexDefinitions()
+              : this.authoritativeIndexCatalog.listIndexDefinitions();
     } catch (MetadataServiceException e) {
       // CommunityConfigUpdater may have started before mongod is available or we received a
       // transient error because mongod is unavailable.

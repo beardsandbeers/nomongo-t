@@ -195,34 +195,49 @@ enum DocumentWriteConcern {
   DOCUMENT_WRITE_CONCERN_COMMITTED = 2;
 }
 // Full BSON replacements with a client-assigned _id, written to exactly one index.
-// Batches are ordered, not atomic. On failure/disconnect a prefix may have been applied.
+// Documents within each batch are ordered; concurrent batches may interleave.
+// Batches are not atomic. On failure/disconnect a prefix may have been applied.
 // Repeating an upsert/delete is safe in isolation; callers order retries against newer writes.
 message UpsertRequest {
   string index_id = 1;
   repeated bytes documents_bson = 2;
   string generation_id = 3; // Optional fence against a schema change.
-  DocumentWriteConcern write_concern = 4;
+  // Omitted concern defaults to INDEXED; explicit VISIBLE waits for reader refresh.
+  optional DocumentWriteConcern write_concern = 4;
 }
 message UpsertResponse { string index_id = 1; string generation_id = 2; uint32 indexed_count = 3; }
 message DeleteRequest {
   string index_id = 1;
   repeated bytes ids_bson = 2; // Each is a complete BSON document containing exactly {_id: value}.
   string generation_id = 3;
-  DocumentWriteConcern write_concern = 4;
+  // Omitted concern defaults to INDEXED; explicit VISIBLE waits for reader refresh.
+  optional DocumentWriteConcern write_concern = 4;
 }
 // Count is the number of processed IDs; Lucene does not report prior source existence.
 message DeleteResponse { string index_id = 1; string generation_id = 2; uint32 processed_count = 3; }
+// Omitted/unspecified disables explain. These levels use the engine's existing explain format.
+enum ExplainVerbosity {
+  EXPLAIN_VERBOSITY_UNSPECIFIED = 0;
+  EXPLAIN_VERBOSITY_QUERY_PLANNER = 1;
+  EXPLAIN_VERBOSITY_EXECUTION_STATS = 2;
+  EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION = 3;
+}
 message QueryRequest {
   string index_id = 1;
   bytes query_bson = 2;
   uint32 batch_size = 3;
   string generation_id = 4;
+  // QUERY_PLANNER returns no hits or live cursor. Execution levels page results normally.
+  ExplainVerbosity explain_verbosity = 5;
 }
 message QueryResponse {
   uint64 cursor_id = 1;
   bytes batch_bson = 2;
   bytes metadata_bson = 3;
   string generation_id = 4;
+  // Empty unless explain was requested. Complete BSON document in the engine's explain format.
+  // Execution statistics accumulate across Search/VectorSearch and subsequent GetMore batches.
+  bytes explain_bson = 5;
 }
 message GetMoreRequest { uint64 cursor_id = 1; uint32 batch_size = 2; }
 message KillCursorRequest { uint64 cursor_id = 1; }

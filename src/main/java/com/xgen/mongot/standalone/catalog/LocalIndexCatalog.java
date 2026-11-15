@@ -23,15 +23,20 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import org.bson.BsonArray;
 import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.types.ObjectId;
 
 /** Persists index definitions only. Content is stored exclusively by Lucene. */
 public final class LocalIndexCatalog implements Closeable {
   private final Path path;
+  private final Path ownershipPath;
+  private final Set<String> ownedIds = new HashSet<>();
   private final FileChannel lockChannel;
   private final FileLock lock;
   private final LinkedHashMap<String, IndexDefinition> indexes = new LinkedHashMap<>();
@@ -40,6 +45,7 @@ public final class LocalIndexCatalog implements Closeable {
   public LocalIndexCatalog(Path directory) throws IOException {
     Files.createDirectories(directory);
     this.path = directory.resolve("indexes.json");
+    this.ownershipPath = directory.resolve("standalone-owned-ids.json");
     this.lockChannel =
         FileChannel.open(
             directory.resolve("standalone.lock"),
@@ -56,6 +62,16 @@ public final class LocalIndexCatalog implements Closeable {
       throw new IOException("Standalone data directory is already in use");
     }
     try {
+      if (Files.exists(directory.resolve("coexistence.json"))
+          && !Files.exists(this.ownershipPath)) {
+        throw new IOException("Coexistence ownership metadata is missing");
+      }
+      if (Files.exists(this.ownershipPath)) {
+        for (var id : BsonDocument.parse(Files.readString(this.ownershipPath)).getArray("ids")) {
+          validateIndexId(id.asString().getValue());
+          this.ownedIds.add(id.asString().getValue());
+        }
+      }
       if (Files.exists(directory.resolve("standalone.sqlite"))) {
         throw new IOException(
             "Legacy document-store state is unsupported. Use a new dataPath and reingest content.");
@@ -71,10 +87,47 @@ public final class LocalIndexCatalog implements Closeable {
           }
         }
         StandaloneDefinitionValidator.validateCatalog(definitions());
+        if (Files.exists(directory.resolve("coexistence.json"))
+            && !this.ownedIds.containsAll(this.indexes.keySet())) {
+          throw new IOException("Local catalog conflicts with coexistence ownership metadata");
+        }
+        this.ownedIds.addAll(this.indexes.keySet());
       }
+      persistOwnership();
     } catch (IOException | RuntimeException e) {
       close();
       throw e;
+    }
+  }
+
+  /** Includes dropped IDs while their physical generations may still be retiring. */
+  public synchronized boolean owns(ObjectId id) {
+    return this.ownedIds.contains(id.toHexString());
+  }
+
+  private void persistOwnership() throws IOException {
+    var ids = new BsonArray(this.ownedIds.stream().sorted().map(BsonString::new).toList());
+    Path temporary = this.ownershipPath.resolveSibling("standalone-owned-ids.json.tmp");
+    try (var output =
+        FileChannel.open(
+            temporary,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE)) {
+      var buffer =
+          ByteBuffer.wrap(new BsonDocument("ids", ids).toJson().getBytes(StandardCharsets.UTF_8));
+      while (buffer.hasRemaining()) {
+        output.write(buffer);
+      }
+      output.force(true);
+    }
+    Files.move(
+        temporary,
+        this.ownershipPath,
+        StandardCopyOption.ATOMIC_MOVE,
+        StandardCopyOption.REPLACE_EXISTING);
+    try (var directory = FileChannel.open(this.path.getParent(), StandardOpenOption.READ)) {
+      directory.force(true);
     }
   }
 
@@ -107,6 +160,15 @@ public final class LocalIndexCatalog implements Closeable {
     if (this.indexes.size() >= 64) {
       throw Status.RESOURCE_EXHAUSTED
           .withDescription("Standalone supports 64 indexes")
+          .asRuntimeException();
+    }
+    this.ownedIds.add(candidate.internal().getIndexId().toHexString());
+    try {
+      persistOwnership();
+    } catch (IOException e) {
+      throw Status.UNAVAILABLE
+          .withDescription("Cannot persist index ownership")
+          .withCause(e)
           .asRuntimeException();
     }
     var updated = new LinkedHashMap<>(this.indexes);

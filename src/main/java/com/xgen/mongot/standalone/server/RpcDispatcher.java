@@ -1,21 +1,27 @@
 package com.xgen.mongot.standalone.server;
 
+import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
 import io.grpc.Context;
 import io.grpc.Contexts;
 import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.jetbrains.annotations.Nullable;
 
@@ -53,11 +59,7 @@ final class RpcDispatcher implements AutoCloseable {
     async(size, observer, () -> CompletableFuture.completedFuture(action.get()));
   }
 
-  <T> void unary(
-      long size,
-      StreamObserver<T> observer,
-      Supplier<T> action,
-      java.util.function.Consumer<T> abandoned) {
+  <T> void unary(long size, StreamObserver<T> observer, Supplier<T> action, Consumer<T> abandoned) {
     async(size, observer, () -> CompletableFuture.completedFuture(action.get()), abandoned);
   }
 
@@ -69,7 +71,7 @@ final class RpcDispatcher implements AutoCloseable {
       long size,
       StreamObserver<T> observer,
       Supplier<CompletableFuture<T>> action,
-      java.util.function.Consumer<T> abandoned) {
+      Consumer<T> abandoned) {
     long started = System.nanoTime();
     String operation = StandaloneAuthInterceptor.operation();
     if (size > this.maxBytes || !this.requests.tryAcquire()) {
@@ -92,16 +94,11 @@ final class RpcDispatcher implements AutoCloseable {
     }
     var context = Context.current();
     var completed = new AtomicBoolean();
-    var pending = new AtomicReference<Optional<CompletableFuture<T>>>(Optional.empty());
-    Context.CancellationListener cancellation =
-        cancelled -> pending.get().ifPresent(future -> future.cancel(false));
-    context.addListener(cancellation, Runnable::run);
-    java.util.function.BiConsumer<@Nullable T, @Nullable Throwable> finish =
+    BiConsumer<@Nullable T, @Nullable Throwable> finish =
         (value, error) -> {
           if (!completed.compareAndSet(false, true)) {
             return;
           }
-          context.removeListener(cancellation);
           try {
             if (context.isCancelled()) {
               if (value != null) {
@@ -114,7 +111,7 @@ final class RpcDispatcher implements AutoCloseable {
             } else if (error != null) {
               observer.onError(status(error).asRuntimeException());
             } else {
-              observer.onNext(java.util.Objects.requireNonNull(value));
+              observer.onNext(Objects.requireNonNull(value));
               observer.onCompleted();
             }
           } catch (RuntimeException deliveryFailure) {
@@ -151,11 +148,8 @@ final class RpcDispatcher implements AutoCloseable {
                       (ignored, error) ->
                           this.metrics.elapsed(
                               "rpc.async.wait", waitStarted, "operation", operation));
-                  pending.set(Optional.of(future));
                   future.whenComplete(finish);
-                  if (context.isCancelled()) {
-                    future.cancel(false);
-                  }
+
                 } catch (RuntimeException e) {
                   finish.accept(null, e);
                 }
@@ -170,11 +164,12 @@ final class RpcDispatcher implements AutoCloseable {
   }
 
   private static Status status(Throwable error) {
-    Throwable cause =
-        error instanceof java.util.concurrent.CompletionException && error.getCause() != null
-            ? error.getCause()
-            : error;
-    if (cause instanceof io.grpc.StatusRuntimeException exception) {
+    @Var Throwable cause = error;
+    while ((cause instanceof CompletionException || cause instanceof ExecutionException)
+        && cause.getCause() != null) {
+      cause = cause.getCause();
+    }
+    if (cause instanceof StatusRuntimeException exception) {
       return exception.getStatus();
     }
     if (cause instanceof IllegalArgumentException) {

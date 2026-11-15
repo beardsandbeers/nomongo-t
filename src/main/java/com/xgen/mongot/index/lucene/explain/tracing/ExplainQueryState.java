@@ -51,6 +51,11 @@ public class ExplainQueryState implements ImplicitContextKeyed {
     return Optional.ofNullable(Context.current().get(KEY));
   }
 
+  @MustBeClosed
+  static Scope suspend() {
+    return Context.current().with(KEY, null).with(CURRENT_PARTITION_KEY, null).makeCurrent();
+  }
+
   @Override
   public Context storeInContext(Context context) {
     return context.with(KEY, this);

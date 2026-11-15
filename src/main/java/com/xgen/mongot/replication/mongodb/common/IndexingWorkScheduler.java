@@ -27,7 +27,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import org.bson.types.ObjectId;
@@ -156,14 +158,45 @@ public abstract class IndexingWorkScheduler extends Thread {
         this.concurrentIndexingBatches.acquire();
 
         batch = this.schedulerQueue.remove();
-        this.dequeueCounter.increment();
-        this.batchSchedulingTimer.record(batch.elapsed());
+        if (batch.operation.isEmpty()) {
+          this.dequeueCounter.increment();
+          this.batchSchedulingTimer.record(batch.elapsed());
+        }
       } catch (InterruptedException ex) {
         Executors.shutdownOrFail(this.executor);
         this.shutdownFuture.complete(null);
         return;
       }
 
+      if (batch.operation.isPresent()) {
+        // Optional producer operation: it owns preparation, ordering and completion barriers.
+        // Native batches continue through the existing strategy/checkpoint path below.
+        CompletableFuture.runAsync(
+                () -> {
+                  try {
+                    batch.operation.get().call();
+                  } catch (Exception e) {
+                    throw new CompletionException(e);
+                  }
+                },
+                this.executor)
+            .whenComplete(
+                (ignored, error) -> {
+                  try {
+                    this.schedulerQueue.finalizeBatch(batch);
+                    if (error == null) {
+                      batch.future.complete(null);
+                    } else {
+                      batch.future.completeExceptionally(error);
+                    }
+                  } catch (RuntimeException failure) {
+                    batch.future.completeExceptionally(failure);
+                  } finally {
+                    this.concurrentIndexingBatches.release();
+                  }
+                });
+        continue;
+      }
       Timer.Sample sample = Timer.start();
       // complete the batch's future when the tasks finish running.
       getBatchTasksFuture(batch)
@@ -347,6 +380,49 @@ public abstract class IndexingWorkScheduler extends Thread {
 
       return future;
     }
+  }
+
+  /**
+   * Enqueues a producer-owned operation in the same generation FIFO and executor as native batches.
+   * The operation includes its completion barrier. Its future must not be cancelled by the caller;
+   * cancellation is cooperative through the operation so resource drain remains observable.
+   */
+  public synchronized CompletableFuture<Void> scheduleOperation(
+      List<DocumentEvent> events,
+      DocumentIndexer indexer,
+      GenerationId generationId,
+      IndexingMetricsUpdater metrics,
+      Callable<Void> operation) {
+    if (this.shutdown) {
+      return CompletableFuture.failedFuture(
+          new IllegalStateException("Indexing scheduler is closed"));
+    }
+    var future = new CompletableFuture<Void>();
+    this.schedulerQueue.add(
+        new IndexingSchedulerBatch(
+            events,
+            Priority.STEADY_STATE_CHANGE_STREAM,
+            indexer,
+            future,
+            generationId,
+            Optional.empty(),
+            Optional.empty(),
+            metrics,
+            Optional.of(operation)));
+    return future;
+  }
+
+  /**
+   * Runs an independently admitted API batch on the shared indexing executor. The caller owns
+   * generation leases and drain; unlike replication, concurrent API batches may interleave.
+   */
+  public synchronized <T> CompletableFuture<T> executeConcurrentOperation(
+      java.util.function.Supplier<T> operation) {
+    if (this.shutdown) {
+      return CompletableFuture.failedFuture(
+          new IllegalStateException("Indexing scheduler is closed"));
+    }
+    return CompletableFuture.supplyAsync(operation, this.executor);
   }
 
   @TestOnly

@@ -1,22 +1,29 @@
 # Running the push-mode container
 
-Release 0.6.0 is available as `mybyte/nomongo-t:0.6.0` (Linux amd64). The `latest`,
-`mongot-standalone`, and `mongot-standalone-v0.6.0` tags point to this release. Prefer a versioned
+Release 0.7.0 is available as `mybyte/nomongo-t:0.7.0` (Linux amd64). The `latest`,
+`mongot-standalone`, and `mongot-standalone-v0.7.0` tags point to this release. Prefer a versioned
 tag for reproducible upgrades.
 
-Version 0.6.0 adds cross-index joins and self-joins inside search filters and exclusions.
+Version 0.7.0 enables concurrent gRPC ingestion batches, including into the same index. Each
+batch targets one index and preserves document order internally. Writes default to `INDEXED`,
+without waiting for reader refresh or durable commit. Background refresh and commits default to
+one second. Request `VISIBLE` for read-after-write search or `COMMITTED` for durability. Upgrade
+client bindings with the server: older bindings omit explicit `VISIBLE=0`, which now selects the
+default `INDEXED` behavior. See the [ingestion guide](https://github.com/beardsandbeers/nomongo-t/blob/main/docs/standalone-mongot-grpc-guide.md).
+
+The server also supports cross-index joins and self-joins inside search filters and exclusions.
 Use `from: "indexName"` (omit for self-joins), explicit `localField`/`foreignField`, and a foreign
 `operator` inside `compound.filter` or `compound.mustNot`. Both keys must be strings mapped as
 `token` with matching normalizers. Native typed `_id` keys and foreign-document enrichment
-are outside this release. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/standalone-v0.6.0/README.md#join-searches-across-indexes).
+are outside this release. See the [join examples](https://github.com/beardsandbeers/nomongo-t/blob/main/README.md#join-searches-across-indexes).
 
 `GetIndexStats` and `GetIndexFieldStats` expose document counts, storage averages, and field
 storage/memory diagnostics. `GetIndexMappings` exports static mappings. Matching Python, Rust,
-Java, and TypeScript clients are available; see the [client guide](https://github.com/beardsandbeers/nomongo-t/blob/standalone-v0.6.0/clients/README.md).
+Java, and TypeScript clients are available; see the [client guide](https://github.com/beardsandbeers/nomongo-t/blob/main/clients/README.md).
 
 ```sh
 docker run -d --name mongot -p 127.0.0.1:27029:27029 \
-  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.6.0
+  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.7.0
 docker exec mongot mongotctl status
 ```
 
@@ -52,3 +59,12 @@ or deletion is performed.
 
 For a faster build after `make build.deploy.standalone`, use `make build.docker.standalone.local`.
 The ordinary source Docker build always compiles the current checkout.
+
+
+For an existing deployment using the official MongoDB Search Docker image, build
+`make build.docker.community.local`. The `mongot-community:local` image accepts the official
+`/mongot-community/config.default.yml` mount and preserves the official runtime user for access
+to existing data. Run `make check.docker.compatibility` before shipping changes to this path;
+it tests an image-only swap from official mongot using the same config and data, including
+full-text/vector queries and replication recovery. See the
+[compatibility test guide](../../docs/coexistence-mode.md#standard-docker-replacement-regression).

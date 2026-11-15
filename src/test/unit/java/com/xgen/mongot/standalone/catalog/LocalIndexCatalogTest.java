@@ -13,6 +13,7 @@ import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.nio.file.Files;
 import org.bson.BsonDocument;
+import org.bson.types.ObjectId;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -73,5 +74,68 @@ public class LocalIndexCatalogTest {
     assertThrows(IOException.class, () -> new LocalIndexCatalog(directory));
     assertThat(Files.readString(legacy)).isEqualTo("legacy data");
     assertThrows(IOException.class, () -> new LocalIndexCatalog(directory));
+  }
+
+  @Test
+  public void reopen_droppedIndex_retainsSourceOwnership() throws Exception {
+    var directory = this.folder.getRoot().toPath();
+    String id;
+    try (var catalog = new LocalIndexCatalog(directory)) {
+      id =
+          catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("owned")
+                      .setType(IndexType.INDEX_TYPE_SEARCH)
+                      .setDefinitionBson(
+                          ByteString.copyFrom(
+                              StandaloneDefinitionValidator.encode(
+                                  BsonDocument.parse("{mappings:{dynamic:true}}"))))
+                      .build())
+              .getIndexId();
+      catalog.dropIndex(
+          DropIndexRequest.newBuilder().setIndexId(id).setExpectedRevision(1).build());
+    }
+
+    try (var reopened = new LocalIndexCatalog(directory)) {
+      assertThat(reopened.definitions()).isEmpty();
+      assertThat(reopened.owns(new ObjectId(id))).isTrue();
+    }
+  }
+
+  @Test
+  public void reopen_missingOwnershipAfterCoexistence_refusesToReclassifyIndexes()
+      throws Exception {
+    var directory = this.folder.getRoot().toPath();
+    Files.writeString(directory.resolve("coexistence.json"), "{\"version\":1}");
+
+    assertThrows(IOException.class, () -> new LocalIndexCatalog(directory));
+
+    assertThat(Files.exists(directory.resolve("standalone-owned-ids.json"))).isFalse();
+    assertThrows(IOException.class, () -> new LocalIndexCatalog(directory));
+  }
+
+  @Test
+  public void reopen_conflictingOwnershipAfterCoexistence_preservesMetadataForRepair()
+      throws Exception {
+    var directory = this.folder.getRoot().toPath();
+    try (var catalog = new LocalIndexCatalog(directory)) {
+      catalog.createIndex(
+          CreateIndexRequest.newBuilder()
+              .setName("owned")
+              .setType(IndexType.INDEX_TYPE_SEARCH)
+              .setDefinitionBson(
+                  ByteString.copyFrom(
+                      StandaloneDefinitionValidator.encode(
+                          BsonDocument.parse("{mappings:{dynamic:true}}"))))
+              .build());
+    }
+    Files.writeString(directory.resolve("coexistence.json"), "{\"version\":1}");
+    Files.writeString(directory.resolve("standalone-owned-ids.json"), "{\"ids\":[]}");
+
+    assertThrows(IOException.class, () -> new LocalIndexCatalog(directory));
+
+    assertThat(Files.readString(directory.resolve("standalone-owned-ids.json")))
+        .isEqualTo("{\"ids\":[]}");
   }
 }

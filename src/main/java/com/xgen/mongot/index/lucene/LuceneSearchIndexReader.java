@@ -427,7 +427,14 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
         throws IOException, InvalidQueryException {
       checkState(!this.closed && !this.transferred, "Query snapshot is no longer available");
       tokenField(path);
-      var searcher = this.reference.getIndexSearcher();
+      // A self-join shares this pinned reader with the local query. Use an unprofiled searcher
+      // over that same reader so membership collection cannot pollute the local query's plan.
+      var searcher = LuceneIndexSearcher.create(this.reference.getIndexSearcher());
+      searcher.setTimeout(
+          () -> {
+            checkWork.run();
+            return false;
+          });
       var factory = LuceneSearchIndexReader.this.queryFactory;
       var predicate =
           factory.createQuery(
@@ -449,39 +456,32 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
       String field = FieldName.TypeField.TOKEN.getLuceneFieldName(path, Optional.empty());
       // Collect sequentially: DocValues iterators and the bounded key collector are
       // execution-local.
-      Runnable previousCheck = this.cancellationCheck;
-      this.cancellationCheck = checkWork;
-      try {
-        // The Collector overload searches leaves sequentially even on a concurrent searcher.
-        searcher.search(
-            query,
-            new SimpleCollector() {
-              private SortedSetDocValues values = DocValues.emptySortedSet();
+      searcher.search(
+          query,
+          new SimpleCollector() {
+            private SortedSetDocValues values = DocValues.emptySortedSet();
 
-              @Override
-              protected void doSetNextReader(LeafReaderContext context) throws IOException {
-                checkWork.run();
-                this.values = DocValues.getSortedSet(context.reader(), field);
-              }
+            @Override
+            protected void doSetNextReader(LeafReaderContext context) throws IOException {
+              checkWork.run();
+              this.values = DocValues.getSortedSet(context.reader(), field);
+            }
 
-              @Override
-              public void collect(int doc) throws IOException {
-                checkWork.run();
-                if (this.values.advanceExact(doc)) {
-                  for (int i = 0; i < this.values.docValueCount(); i++) {
-                    keys.accept(this.values.lookupOrd(this.values.nextOrd()).utf8ToString());
-                  }
+            @Override
+            public void collect(int doc) throws IOException {
+              checkWork.run();
+              if (this.values.advanceExact(doc)) {
+                for (int i = 0; i < this.values.docValueCount(); i++) {
+                  keys.accept(this.values.lookupOrd(this.values.nextOrd()).utf8ToString());
                 }
               }
+            }
 
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-              }
-            });
-      } finally {
-        this.cancellationCheck = previousCheck;
-      }
+            @Override
+            public ScoreMode scoreMode() {
+              return ScoreMode.COMPLETE_NO_SCORES;
+            }
+          });
     }
 
     @Override

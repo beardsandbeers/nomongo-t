@@ -28,6 +28,7 @@ format_multirun(
     python = "@aspect_rules_lint//lint:ruff_bin",
     rust = "@rules_rust//tools/upstream_wrapper:rustfmt",
     rust_check_args = [
+        "--check",
         "--edition",
         "2024",
     ],

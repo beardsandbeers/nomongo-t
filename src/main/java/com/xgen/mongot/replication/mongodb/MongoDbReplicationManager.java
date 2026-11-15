@@ -144,6 +144,8 @@ public class MongoDbReplicationManager implements ReplicationManager {
   @GuardedBy("this")
   private boolean shutdown;
 
+  private boolean ownsIndexingSchedulers = true;
+
   private final FeatureFlags featureFlags;
 
   private final Duration requestRateLimitBackoffDuration;
@@ -290,6 +292,42 @@ public class MongoDbReplicationManager implements ReplicationManager {
       BatchMongoClient syncBatchMongoClient,
       Optional<Supplier<EmbeddingServiceManager>> embeddingServiceManagerSupplier,
       Optional<LeaderStatusRegistrar> leaderStatusRegistrar) {
+    return create(
+        dataPath,
+        initialSyncGate,
+        syncSourceConfig,
+        replicationConfig,
+        durabilityConfig,
+        initialSyncConfig,
+        featureFlags,
+        cursorManager,
+        indexCatalog,
+        initializedIndexCatalog,
+        meterAndFtdcRegistry,
+        replicationOptimeUpdaterInterval,
+        syncBatchMongoClient,
+        embeddingServiceManagerSupplier,
+        leaderStatusRegistrar,
+        Optional.empty());
+  }
+
+  public static MongoDbReplicationManager create(
+      Path dataPath,
+      Gate initialSyncGate,
+      Optional<SyncSourceConfig> syncSourceConfig,
+      MongoDbReplicationConfig replicationConfig,
+      DurabilityConfig durabilityConfig,
+      InitialSyncConfig initialSyncConfig,
+      FeatureFlags featureFlags,
+      MongotCursorManager cursorManager,
+      IndexCatalog indexCatalog,
+      InitializedIndexCatalog initializedIndexCatalog,
+      MeterAndFtdcRegistry meterAndFtdcRegistry,
+      Duration replicationOptimeUpdaterInterval,
+      BatchMongoClient syncBatchMongoClient,
+      Optional<Supplier<EmbeddingServiceManager>> embeddingServiceManagerSupplier,
+      Optional<LeaderStatusRegistrar> leaderStatusRegistrar,
+      Optional<IndexingWorkSchedulerFactory> sharedSchedulers) {
     if (syncSourceConfig.isEmpty()) {
       throw new IllegalArgumentException("syncSourceConfig must be provided");
     }
@@ -317,18 +355,22 @@ public class MongoDbReplicationManager implements ReplicationManager {
             bindings.forSubsystem("replication").register(lifecycleExecutor, meterRegistry));
 
     var indexingWorkSchedulerFactory =
-        embeddingServiceManagerSupplier
-            .map(
-                supplier ->
-                    IndexingWorkSchedulerFactory.create(
-                        replicationConfig.numIndexingThreads,
-                        supplier,
-                        meterRegistry,
-                        attributionBindings))
-            .orElseGet(
-                () ->
-                    IndexingWorkSchedulerFactory.createWithoutEmbeddingStrategy(
-                        replicationConfig.numIndexingThreads, meterRegistry, attributionBindings));
+        sharedSchedulers.orElseGet(
+            () ->
+                embeddingServiceManagerSupplier
+                    .map(
+                        supplier ->
+                            IndexingWorkSchedulerFactory.create(
+                                replicationConfig.numIndexingThreads,
+                                supplier,
+                                meterRegistry,
+                                attributionBindings))
+                    .orElseGet(
+                        () ->
+                            IndexingWorkSchedulerFactory.createWithoutEmbeddingStrategy(
+                                replicationConfig.numIndexingThreads,
+                                meterRegistry,
+                                attributionBindings)));
 
     var decodingWorkScheduler =
         DecodingWorkScheduler.create(
@@ -445,31 +487,34 @@ public class MongoDbReplicationManager implements ReplicationManager {
             featureFlags,
             meterRegistry);
 
-    return MongoDbReplicationManager.create(
-        lifecycleExecutor,
-        indexingWorkSchedulerFactory,
-        cursorManager,
-        clientSessionRecords,
-        syncSourceConfig,
-        featureFlags,
-        initialSyncQueue,
-        steadyStateManager,
-        synonymManager,
-        syncBatchMongoClient,
-        decodingWorkScheduler,
-        synonymsMongoClient,
-        synonymsSessionRefresher,
-        ReplicationIndexManager::create,
-        meterRegistry,
-        new ConcurrentHashMap<>(), // ConcurrentHashMap to make copy without locks
-        commitExecutor,
-        replicationOptimeMetricUpdater,
-        sourceCollectionCountUpdater,
-        initializedIndexCatalog,
-        durabilityConfig.commitInterval,
-        Duration.ofMillis(replicationConfig.requestRateLimitBackoffMs),
-        initialSyncConfig.enableNaturalOrderScan(),
-        leaderStatusRegistrar);
+    var manager =
+        MongoDbReplicationManager.create(
+            lifecycleExecutor,
+            indexingWorkSchedulerFactory,
+            cursorManager,
+            clientSessionRecords,
+            syncSourceConfig,
+            featureFlags,
+            initialSyncQueue,
+            steadyStateManager,
+            synonymManager,
+            syncBatchMongoClient,
+            decodingWorkScheduler,
+            synonymsMongoClient,
+            synonymsSessionRefresher,
+            ReplicationIndexManager::create,
+            meterRegistry,
+            new ConcurrentHashMap<>(), // ConcurrentHashMap to make copy without locks
+            commitExecutor,
+            replicationOptimeMetricUpdater,
+            sourceCollectionCountUpdater,
+            initializedIndexCatalog,
+            durabilityConfig.commitInterval,
+            Duration.ofMillis(replicationConfig.requestRateLimitBackoffMs),
+            initialSyncConfig.enableNaturalOrderScan(),
+            leaderStatusRegistrar);
+    manager.ownsIndexingSchedulers = sharedSchedulers.isEmpty();
+    return manager;
   }
 
   @VisibleForTesting
@@ -548,6 +593,62 @@ public class MongoDbReplicationManager implements ReplicationManager {
         ReplicationOptimeUpdater.DEFAULT_UPDATE_INTERVAL,
         embeddingServiceManagerSupplier,
         leaderStatusRegistrar);
+  }
+
+  public static MongoDbReplicationManager create(
+      Path dataPath,
+      Optional<SyncSourceConfig> syncSourceConfig,
+      MongoDbReplicationConfig replicationConfig,
+      DurabilityConfig durabilityConfig,
+      InitialSyncConfig initialSyncConfig,
+      FeatureFlags featureFlags,
+      MongotCursorManager cursorManager,
+      IndexCatalog indexCatalog,
+      InitializedIndexCatalog initializedIndexCatalog,
+      MeterAndFtdcRegistry meterAndFtdcRegistry,
+      Gate initialSyncGate,
+      Optional<Supplier<EmbeddingServiceManager>> embeddingServiceManagerSupplier,
+      Optional<LeaderStatusRegistrar> leaderStatusRegistrar,
+      Optional<IndexingWorkSchedulerFactory> sharedSchedulers) {
+    if (sharedSchedulers.isEmpty()) {
+      return create(
+          dataPath,
+          syncSourceConfig,
+          replicationConfig,
+          durabilityConfig,
+          initialSyncConfig,
+          featureFlags,
+          cursorManager,
+          indexCatalog,
+          initializedIndexCatalog,
+          meterAndFtdcRegistry,
+          initialSyncGate,
+          embeddingServiceManagerSupplier,
+          leaderStatusRegistrar);
+    }
+    var client =
+        getSyncBatchMongoClient(
+            syncSourceConfig.orElseThrow(),
+            replicationConfig.numConcurrentChangeStreams,
+            DEFAULT.metricsNamespacePrefix,
+            meterAndFtdcRegistry.meterRegistry());
+    return create(
+        dataPath,
+        initialSyncGate,
+        syncSourceConfig,
+        replicationConfig,
+        durabilityConfig,
+        initialSyncConfig,
+        featureFlags,
+        cursorManager,
+        indexCatalog,
+        initializedIndexCatalog,
+        meterAndFtdcRegistry,
+        ReplicationOptimeUpdater.DEFAULT_UPDATE_INTERVAL,
+        client,
+        embeddingServiceManagerSupplier,
+        leaderStatusRegistrar,
+        sharedSchedulers);
   }
 
   /** Creates gauges to track the number of index replication managers by state */
@@ -863,10 +964,13 @@ public class MongoDbReplicationManager implements ReplicationManager {
         .thenRunAsync(() -> this.synonymsSyncClient.ifPresent(MongoClient::close), shutdownExecutor)
         .thenRunAsync(this.decodingWorkScheduler::shutdown, shutdownExecutor)
         .thenRunAsync(
-            () ->
+            () -> {
+              if (this.ownsIndexingSchedulers) {
                 this.indexingWorkSchedulerFactory
                     .getIndexingWorkSchedulers()
-                    .forEach((strategy, scheduler) -> scheduler.shutdown()),
+                    .forEach((strategy, scheduler) -> scheduler.shutdown());
+              }
+            },
             shutdownExecutor)
         .thenRunAsync(() -> Executors.shutdownOrFail(this.commitExecutor), shutdownExecutor)
         .thenRunAsync(() -> Executors.shutdownOrFail(this.lifecycleExecutor), shutdownExecutor)

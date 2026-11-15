@@ -50,7 +50,10 @@ public final class StandaloneControl {
             HealthGrpc.newBlockingStub(channel)
                 .withInterceptors(authentication)
                 .withDeadlineAfter(5, TimeUnit.SECONDS)
-                .check(HealthCheckRequest.getDefaultInstance());
+                .check(
+                    HealthCheckRequest.newBuilder()
+                        .setService(OperationsServiceGrpc.SERVICE_NAME)
+                        .build());
         if (health.getStatus() != ServingStatus.SERVING) {
           throw new IllegalStateException("Service reports " + health.getStatus());
         }

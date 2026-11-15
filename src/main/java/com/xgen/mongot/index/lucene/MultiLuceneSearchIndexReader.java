@@ -297,8 +297,11 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
       throws IOException, ReaderClosedException {
     List<QuerySnapshot> snapshots = new ArrayList<>();
     try {
-      for (var reader : this.readers) {
-        snapshots.add(reader.acquireQuerySnapshot(concurrent));
+      for (int i = 0; i < this.readers.size(); i++) {
+        // Searchers capture their profiler at acquisition, before the pinned query executes.
+        try (var ignored = Explain.maybeEnterIndexPartitionQueryContext(i)) {
+          snapshots.add(this.readers.get(i).acquireQuerySnapshot(concurrent));
+        }
       }
       return new PinnedQuerySnapshot(List.copyOf(snapshots));
     } catch (IOException | ReaderClosedException | RuntimeException | Error e) {

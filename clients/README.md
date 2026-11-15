@@ -13,7 +13,7 @@ per-call deadlines, BSON helpers and all current RPCs. No automatic retries are 
 ## Python
 
 ```sh
-python3 -m pip install mongot-standalone-client==0.6.0
+python3 -m pip install mongot-standalone-client==0.7.0
 ```
 
 ```python
@@ -27,7 +27,7 @@ with Client("127.0.0.1:27029") as client:
     ))
     while client.get_index(api.GetIndexRequest(index_id=index.index_id)).lifecycle_state != "READY":
         time.sleep(0.05)
-    client.upsert(index.index_id, {"_id": "a", "title": "Coffee guide"})
+    client.upsert(index.index_id, {"_id": "a", "title": "Coffee guide"}, concern="visible")
     response = client.search(api.QueryRequest(
         index_id=index.index_id,
         query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}}),
@@ -38,9 +38,13 @@ with Client("127.0.0.1:27029") as client:
 
 For TLS, pass `ca_file` and `token_file` to Client. Bind helpers with
 `client.index(index_id)`; the result has upsert/upsert_many/delete/delete_many methods.
-Use `concern="committed"` for a Lucene commit before acknowledgement. Default `visible`
-refreshes the reader but does not promise crash durability. Batches can partially apply on error;
-order retries against newer writes yourself. Delete returns a processed-ID count.
+Writes default to `indexed`, returning without waiting for reader refresh or durable commit.
+Use `concern="visible"` for read-after-write searches, or `concern="committed"` for a Lucene commit
+before acknowledgement. Background refresh and commits default to one second. Each batch targets
+exactly one `index_id`. Concurrent batches can index in parallel against the same or different
+indexes; documents within a batch remain ordered. Batches can partially apply on error; sequence overlapping writes and retries yourself. Delete returns a
+processed-ID count. Older generated clients must be upgraded to transmit explicit `VISIBLE=0`;
+see the [protocol compatibility notes](../docs/standalone-mongot-grpc-guide.md).
 
 ## Backpressure
 
@@ -48,7 +52,7 @@ Bound concurrent requests and back off with jitter on `RESOURCE_EXHAUSTED`. The 
 count and aggregate request bytes; slow synchronous Lucene work retains that capacity. There is
 no persistent ingestion queue or automatic retry. A timed-out write can have applied a prefix;
 order retries against newer updates. See the [server backpressure contract](../docs/standalone-mongot.md#backpressure-and-overload)
-for defaults and the current shared ingestion lock.
+for admission defaults and indexing concurrency.
 
 ## Other languages
 
@@ -63,6 +67,69 @@ UpsertRequest contains `index_id`, `documents_bson`, optional `generation_id` an
 DeleteRequest substitutes `ids_bson`, each containing `{_id: value}`. Queries continue to use
 `index_id` and BSON search/vector expressions. CreateIndex takes name, type and definition BSON;
 ListIndexes takes an empty request. Index names are instance-wide.
+
+## Explain and trace queries
+
+`Search` and `VectorSearch` accept `QueryRequest.explain_verbosity`. Regenerate/build the clients
+together with a server containing these fields. Omitted or `EXPLAIN_VERBOSITY_UNSPECIFIED` keeps
+ordinary query behavior and leaves `QueryResponse.explain_bson` empty.
+
+| Verbosity | Behavior |
+| --- | --- |
+| `EXPLAIN_VERBOSITY_QUERY_PLANNER` | Returns the Lucene query plan, an empty results array, and `cursor_id = 0`. |
+| `EXPLAIN_VERBOSITY_EXECUTION_STATS` | Returns normal result batches with the plan, execution timings, collector statistics, and resource usage where provided by the engine. |
+| `EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION` | Uses the engine's most detailed explain level, retaining all recorded query plans across batches. |
+
+```python
+from bson.json_util import dumps
+
+response = client.search(api.QueryRequest(
+    index_id=index.index_id,
+    query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}}),
+    batch_size=100,
+    explain_verbosity=api.EXPLAIN_VERBOSITY_EXECUTION_STATS,
+))
+while True:
+    print(decode_bson(response.batch_bson)["results"])
+    print(dumps(decode_bson(response.explain_bson), indent=2))
+    if not response.cursor_id:
+        break
+    response = client.get_more(api.GetMoreRequest(
+        cursor_id=response.cursor_id, batch_size=100,
+    ))
+```
+
+The same options apply to `client.vector_search(...)`. Keep the search/vector expression in
+`query_bson`; explain is a request option outside that expression. `explain_bson` is a complete
+BSON document using the upstream engine's format. Sections depend on the query and verbosity;
+examples include `query`, `collectors`, `resultMaterialization`, `resourceUsage`, and
+`indexPartitionExplain` for partitioned indexes.
+For joins, the query tree describes the local predicate after foreign keys have been materialized;
+partitioned local indexes report their plans and collector statistics in `indexPartitionExplain`.
+Foreign key collection does not emit a separate explain tree or contribute to the local query's
+collector statistics, including for self-joins. Foreign indexes may use a different partition count.
+
+Execution-level `GetMore` responses carry cumulative explain snapshots for that cursor; do not
+sum snapshots. Statistics cover work performed so far, including any engine prefetch, rather than
+an automatic drain of every matching document. Consume the cursor to completion for the full
+execution, or call `KillCursor` when finished early. Explain state stays with the existing cursor,
+including its index generation, snapshots, idle timeout, authorization, and join dependencies.
+
+Other generated clients expose the same fields:
+
+- Java: `QueryRequest.newBuilder().setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)`;
+  decode `response.getExplainBson()` with `StandaloneClient.decodeBson(...)`.
+- TypeScript: pass `explainVerbosity: 'EXPLAIN_VERBOSITY_EXECUTION_STATS'`; decode
+  `response.explainBson` with `decodeBson(...)`.
+- Rust: set `explain_verbosity: api::ExplainVerbosity::ExecutionStats as i32`; decode
+  `response.explain_bson` with `decode_bson(...)`.
+
+Tracing adds profiling work, so enable it for queries you want to inspect. Planner requests still
+perform query preparation, including join key materialization and metadata/count work where
+required. Explain output obeys the existing query response limits; oversized output fails with
+`RESOURCE_EXHAUSTED` rather than being silently truncated. Unknown verbosity values fail with
+`INVALID_ARGUMENT`. This API returns query diagnostics directly; it does not configure an
+external trace collector. See the [server contract](../docs/standalone-mongot.md#query-explain).
 
 ## Join searches across indexes
 

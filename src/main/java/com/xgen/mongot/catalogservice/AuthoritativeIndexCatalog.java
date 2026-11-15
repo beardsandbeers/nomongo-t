@@ -46,4 +46,11 @@ public interface AuthoritativeIndexCatalog {
 
   /** Lists all indexes defined on the specified collection in the Authoritative Index Catalog. */
   List<IndexDefinition> listIndexDefinitions(UUID collectionUuid) throws MetadataServiceException;
+
+  /**
+   * Complete reconciliation snapshot; implementations may reject rather than omit malformed rows.
+   */
+  default List<IndexDefinition> listCompleteIndexDefinitions() throws MetadataServiceException {
+    return listIndexDefinitions();
+  }
 }

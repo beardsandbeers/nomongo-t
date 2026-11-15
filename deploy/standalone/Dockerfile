@@ -63,3 +63,15 @@ STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD ["mongotctl", "health"]
 ENTRYPOINT ["mongot-entrypoint"]
+
+# Match the official mongot image's user, configuration path and existing data permissions.
+# The common launcher still selects ingestion behavior from syncSource.
+FROM runtime AS community-compatible
+USER 0:0
+WORKDIR /
+HEALTHCHECK NONE
+ENTRYPOINT ["/opt/mongot/mongot"]
+CMD ["--config", "/mongot-community/config.default.yml"]
+
+# Preserve the default standalone image and its non-root runtime.
+FROM runtime AS standalone
