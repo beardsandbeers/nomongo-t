@@ -1,8 +1,13 @@
 # Running the push-mode container
 
-Release 0.7.0 is available as `mybyte/nomongo-t:0.7.0` (Linux amd64). The `latest`,
-`mongot-standalone`, and `mongot-standalone-v0.7.0` tags point to this release. Prefer a versioned
+Release 0.8.0 is available as `mybyte/nomongo-t:0.8.0` (Linux amd64). The `latest`,
+`mongot-standalone`, and `mongot-standalone-v0.8.0` tags point to this release. Prefer a versioned
 tag for reproducible upgrades.
+
+The `community-0.8.0` and `community` tags provide the official-container replacement, using
+`/mongot-community/config.default.yml` and the upstream runtime user. Both variants select
+standalone or dual ingestion from `syncSource`; remote standalone API calls on a native listener
+require TLS and configured bearer principals.
 
 Version 0.7.0 enables concurrent gRPC ingestion batches, including into the same index. Each
 batch targets one index and preserves document order internally. Writes default to `INDEXED`,
@@ -24,7 +29,7 @@ Java, and TypeScript clients are available; see the [client guide](https://githu
 
 ```sh
 docker run -d --name mongot -p 127.0.0.1:27029:27029 \
-  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.7.0
+  -v nomongo-t-push_state:/var/lib/mongot mybyte/nomongo-t:0.8.0
 docker exec mongot mongotctl status
 ```
 

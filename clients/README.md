@@ -13,7 +13,7 @@ per-call deadlines, BSON helpers and all current RPCs. No automatic retries are 
 ## Python
 
 ```sh
-python3 -m pip install mongot-standalone-client==0.7.0
+python3 -m pip install mongot-standalone-client==0.8.0
 ```
 
 ```python

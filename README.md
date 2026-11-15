@@ -8,6 +8,10 @@ Use it for keyword search with mongot's mappings and analyzers, vector similarit
 your own embeddings, or both. Indexes persist on disk. Clients are available for
 [Python, Rust, Java, and TypeScript](clients/README.md).
 
+Version 0.8.0 adds automatic standalone/dual startup, native ObjectId joins, query explain,
+and an official-image replacement regression test. The `community-0.8.0` Docker tag matches
+the official mongot image's configuration path and runtime user.
+
 Version 0.7.0 enables concurrent gRPC ingestion batches and defaults writes to `INDEXED`.
 Background reader refresh and commits default to one second; request `VISIBLE` for read-after-write
 searches or `COMMITTED` for durability. Each batch still targets one index. Upgrade clients along
@@ -71,7 +75,7 @@ See the [explain guide](clients/README.md#explain-and-trace-queries) for levels 
 
 ## Quick start
 
-You need Docker. The image includes Java 21 and the native libraries. The published `0.7.0`
+You need Docker. The image includes Java 21 and the native libraries. The published `0.8.0`
 image targets Linux amd64. ARM hosts need amd64 emulation and the `--platform linux/amd64`
 option.
 
@@ -80,7 +84,7 @@ docker run --detach --name nomongo-t \
   --publish 127.0.0.1:27029:27029 \
   --memory 4g \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.7.0
+  mybyte/nomongo-t:0.8.0
 ```
 
 The API listens at **localhost:27029 over gRPC with TLS**. On first startup, the container
@@ -111,7 +115,7 @@ docker cp nomongo-t:/var/lib/mongot/config/admin.token .nomongo-t/admin.token
 chmod 600 .nomongo-t/admin.token
 
 python3 -m venv .venv-nomongo-t
-.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.7.0
+.venv-nomongo-t/bin/python -m pip install mongot-standalone-client==0.8.0
 ```
 
 Save the following as `demo.py`, then run `.venv-nomongo-t/bin/python demo.py`. It creates a
@@ -342,7 +346,7 @@ docker run --detach --name nomongo-t \
   --memory 8g \
   --env JAVA_TOOL_OPTIONS="-Xms512m -Xmx4g -XX:MaxDirectMemorySize=512m" \
   --volume nomongo-t-data:/var/lib/mongot \
-  mybyte/nomongo-t:0.7.0
+  mybyte/nomongo-t:0.8.0
 ```
 
 `--memory` limits the entire container; `-Xmx` limits only the Java heap. Leave space outside the
@@ -415,7 +419,7 @@ docker run --detach --name nomongo-t \
   --env MONGOT_CONTROL_ADDRESS=localhost:27029 \
   --env MONGOT_CONTROL_CA=/etc/nomongo-t/ca.crt \
   --env MONGOT_CONTROL_TOKEN_FILE=/etc/nomongo-t/admin.token \
-  mybyte/nomongo-t:0.7.0 --config /etc/nomongo-t/standalone.yaml
+  mybyte/nomongo-t:0.8.0 --config /etc/nomongo-t/standalone.yaml
 ```
 
 `--config` selects your YAML file instead of automatic credential generation. The
