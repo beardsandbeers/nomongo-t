@@ -826,6 +826,100 @@ public class DefaultIndexingWorkSchedulerTest {
     return DefaultIndexingWorkScheduler.create(executor);
   }
 
+  @Test
+  public void scheduleOperation_failedOrderedWork_releasesOnlyItsGenerationLane() throws Exception {
+    var scheduler = scheduler();
+    var indexer = indexer();
+    var firstGeneration = new GenerationId(new ObjectId(), Generation.CURRENT);
+    var secondGeneration = new GenerationId(new ObjectId(), Generation.CURRENT);
+    var started = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var sequence = new java.util.concurrent.CopyOnWriteArrayList<String>();
+    var first =
+        scheduler.scheduleOperation(
+            List.of(),
+            indexer,
+            firstGeneration,
+            IGNORE_METRICS,
+            () -> {
+              sequence.add("first");
+              started.countDown();
+              if (!release.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("Operation did not release");
+              }
+              throw new IllegalArgumentException("request failed");
+            });
+    assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+    var next =
+        scheduler.scheduleOperation(
+            List.of(),
+            indexer,
+            firstGeneration,
+            IGNORE_METRICS,
+            () -> {
+              sequence.add("next");
+              return null;
+            });
+    var independent =
+        scheduler.scheduleOperation(
+            List.of(),
+            indexer,
+            secondGeneration,
+            IGNORE_METRICS,
+            () -> {
+              sequence.add("independent");
+              return null;
+            });
+
+    try {
+      independent.get(5, TimeUnit.SECONDS);
+      assertThat(next.isDone()).isFalse();
+      release.countDown();
+      assertThrows(ExecutionException.class, () -> first.get(5, TimeUnit.SECONDS));
+      next.get(5, TimeUnit.SECONDS);
+
+      assertThat(sequence).containsExactly("first", "independent", "next").inOrder();
+    } finally {
+      release.countDown();
+      scheduler.shutdown().get(5, TimeUnit.SECONDS);
+    }
+  }
+
+  @Test
+  public void cancel_operationInProgress_waitsForActualDrain() throws Exception {
+    var scheduler = scheduler();
+    var generation = new GenerationId(new ObjectId(), Generation.CURRENT);
+    var started = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var work =
+        scheduler.scheduleOperation(
+            List.of(),
+            indexer(),
+            generation,
+            IGNORE_METRICS,
+            () -> {
+              started.countDown();
+              if (!release.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("Operation did not release");
+              }
+              return null;
+            });
+    assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+
+    var drain =
+        scheduler.cancel(generation, Optional.empty(), new IllegalStateException("retired"));
+
+    try {
+      assertThat(drain.isDone()).isFalse();
+      release.countDown();
+      drain.get(5, TimeUnit.SECONDS);
+      work.get(5, TimeUnit.SECONDS);
+    } finally {
+      release.countDown();
+      scheduler.shutdown().get(5, TimeUnit.SECONDS);
+    }
+  }
+
   private DocumentIndexer indexer() {
     return com.xgen.testing.mongot.mock.replication.mongodb.common.DocumentIndexer
         .mockDocumentIndexer();

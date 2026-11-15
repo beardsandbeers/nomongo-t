@@ -26,6 +26,7 @@ import com.xgen.mongot.standalone.grpc.UpsertResponse;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import io.grpc.Server;
 import io.grpc.ServerInterceptors;
+import io.grpc.ServerServiceDefinition;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 import io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.NettyServerBuilder;
@@ -33,8 +34,12 @@ import io.grpc.protobuf.services.HealthStatusManager;
 import io.grpc.stub.StreamObserver;
 import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 
 /** Ordinary generated protobuf services on a dedicated standalone listener. */
 public final class StandaloneGrpcServer implements AutoCloseable {
@@ -42,13 +47,19 @@ public final class StandaloneGrpcServer implements AutoCloseable {
   private final RpcDispatcher dispatcher;
   private final ScheduledThreadPoolExecutor deadlines;
   private final HealthStatusManager health = new HealthStatusManager();
-  private final Server server;
+  private final Optional<Server> server;
+  private final List<ServerServiceDefinition> services;
   private final StandaloneQueryService queries;
 
   /**
    * Registers bounded standalone services and their transport security without starting listeners.
    */
   public StandaloneGrpcServer(StandaloneRuntime runtime) throws IOException {
+    this(runtime, false);
+  }
+
+  /** Constructs only service definitions when attached to a native listener. */
+  public StandaloneGrpcServer(StandaloneRuntime runtime, boolean shared) throws IOException {
     this.runtime = runtime;
     this.dispatcher = new RpcDispatcher(runtime.config(), runtime.metrics());
     this.queries = new StandaloneQueryService(runtime, this.dispatcher);
@@ -58,24 +69,27 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.deadlines.setRemoveOnCancelPolicy(true);
     var interceptor =
         new StandaloneAuthInterceptor(runtime.config(), this.deadlines, runtime.metrics());
+    this.services =
+        List.of(
+            ServerInterceptors.intercept(new Catalog(), interceptor),
+            ServerInterceptors.intercept(new Documents(), interceptor),
+            ServerInterceptors.intercept(this.queries, interceptor),
+            ServerInterceptors.intercept(new Operations(), interceptor));
     var builder =
         NettyServerBuilder.forAddress(runtime.config().address())
             .directExecutor()
             .maxInboundMessageSize(runtime.config().documentLimits().maxBatchBytes() + 65536)
-            .maxConcurrentCallsPerConnection(runtime.config().maxInFlightRequests() + 16)
-            .addService(ServerInterceptors.intercept(new Catalog(), interceptor))
-            .addService(ServerInterceptors.intercept(new Documents(), interceptor))
-            .addService(ServerInterceptors.intercept(this.queries, interceptor))
-            .addService(ServerInterceptors.intercept(new Operations(), interceptor))
-            .addService(ServerInterceptors.intercept(this.health.getHealthService(), interceptor));
-    if (runtime.config().tls().isPresent()) {
+            .maxConcurrentCallsPerConnection(runtime.config().maxInFlightRequests() + 16);
+    this.services.forEach(builder::addService);
+    builder.addService(ServerInterceptors.intercept(this.health.getHealthService(), interceptor));
+    if (!shared && runtime.config().tls().isPresent()) {
       var tls = runtime.config().tls().get();
       builder.sslContext(
           GrpcSslContexts.forServer(tls.certificate().toFile(), tls.privateKey().toFile())
               .sslProvider(SslProvider.JDK)
               .build());
     }
-    this.server = builder.build();
+    this.server = shared ? Optional.empty() : Optional.of(builder.build());
     this.health.setStatus("", ServingStatus.SERVING);
     this.health.setStatus(CatalogServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
     this.health.setStatus(DocumentServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
@@ -91,26 +105,45 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.deadlines.scheduleWithFixedDelay(this.queries::expireIdle, 10, 10, TimeUnit.SECONDS);
   }
 
+  public List<ServerServiceDefinition> services() {
+    return this.services;
+  }
+
+  public void publishHealth(BiConsumer<String, Boolean> update) {
+    this.deadlines.scheduleWithFixedDelay(
+        () ->
+            this.services.forEach(
+                service ->
+                    update.accept(
+                        service.getServiceDescriptor().getName(), this.runtime.managementReady())),
+        0,
+        1,
+        TimeUnit.SECONDS);
+  }
+
   public StandaloneGrpcServer start() throws IOException {
-    this.server.start();
+    this.server.orElseThrow().start();
     return this;
   }
 
   public int port() {
-    return this.server.getPort();
+    return this.server.orElseThrow().getPort();
   }
 
   public void awaitTermination() throws InterruptedException {
-    this.server.awaitTermination();
+    this.server.orElseThrow().awaitTermination();
   }
 
   @Override
   public synchronized void close() throws InterruptedException {
     this.health.enterTerminalState();
-    this.server.shutdown();
-    if (!this.server.awaitTermination(30, TimeUnit.SECONDS)) {
-      this.server.shutdownNow();
-      this.server.awaitTermination(10, TimeUnit.SECONDS);
+    if (this.server.isPresent()) {
+      var owned = this.server.get();
+      owned.shutdown();
+      if (!owned.awaitTermination(30, TimeUnit.SECONDS)) {
+        owned.shutdownNow();
+        owned.awaitTermination(10, TimeUnit.SECONDS);
+      }
     }
     this.dispatcher.close();
     this.queries.close();
@@ -248,80 +281,80 @@ public final class StandaloneGrpcServer implements AutoCloseable {
   private final class Documents extends DocumentServiceGrpc.DocumentServiceImplBase {
     @Override
     public void upsert(UpsertRequest request, StreamObserver<UpsertResponse> observer) {
-      StandaloneGrpcServer.this.dispatcher.unary(
+      StandaloneGrpcServer.this.dispatcher.async(
           request.getSerializedSize(),
           observer,
-          () -> {
-            StandaloneAuthInterceptor.requireIndex(request.getIndexId());
-            return StandaloneGrpcServer.this
-                .runtime
-                .ingestion()
-                .coordinate(
-                    () -> {
-                      var index =
-                          StandaloneGrpcServer.this
-                              .runtime
-                              .catalog()
-                              .getIndex(request.getIndexId());
-                      StandaloneGrpcServer.this.runtime.checkWriteAdmission(
-                          request.getSerializedSize());
-                      String generation =
-                          StandaloneGrpcServer.this
-                              .runtime
-                              .ingestion()
-                              .write(
-                                  request.getIndexId(),
-                                  index.getDesiredRevision(),
-                                  request.getGenerationId(),
-                                  request.getDocumentsBsonList(),
-                                  false,
-                                  request.getWriteConcern());
-                      return UpsertResponse.newBuilder()
-                          .setIndexId(request.getIndexId())
-                          .setGenerationId(generation)
-                          .setIndexedCount(request.getDocumentsBsonCount())
-                          .build();
-                    });
-          });
+          () ->
+              StandaloneGrpcServer.this
+                  .runtime
+                  .ingestion()
+                  .coordinate(
+                      () -> {
+                        StandaloneAuthInterceptor.requireIndex(request.getIndexId());
+                        var index =
+                            StandaloneGrpcServer.this
+                                .runtime
+                                .catalog()
+                                .getIndex(request.getIndexId());
+                        StandaloneGrpcServer.this.runtime.checkWriteAdmission(
+                            request.getSerializedSize());
+                        return StandaloneGrpcServer.this
+                            .runtime
+                            .ingestion()
+                            .writeAsync(
+                                request.getIndexId(),
+                                index.getDesiredRevision(),
+                                request.getGenerationId(),
+                                request.getDocumentsBsonList(),
+                                false,
+                                request.getWriteConcern())
+                            .thenApply(
+                                generation ->
+                                    UpsertResponse.newBuilder()
+                                        .setIndexId(request.getIndexId())
+                                        .setGenerationId(generation)
+                                        .setIndexedCount(request.getDocumentsBsonCount())
+                                        .build());
+                      }));
     }
 
     @Override
     public void delete(DeleteRequest request, StreamObserver<DeleteResponse> observer) {
-      StandaloneGrpcServer.this.dispatcher.unary(
+      StandaloneGrpcServer.this.dispatcher.async(
           request.getSerializedSize(),
           observer,
-          () -> {
-            StandaloneAuthInterceptor.requireIndex(request.getIndexId());
-            return StandaloneGrpcServer.this
-                .runtime
-                .ingestion()
-                .coordinate(
-                    () -> {
-                      var index =
-                          StandaloneGrpcServer.this
-                              .runtime
-                              .catalog()
-                              .getIndex(request.getIndexId());
-                      StandaloneGrpcServer.this.runtime.checkWriteAdmission(
-                          request.getSerializedSize());
-                      String generation =
-                          StandaloneGrpcServer.this
-                              .runtime
-                              .ingestion()
-                              .write(
-                                  request.getIndexId(),
-                                  index.getDesiredRevision(),
-                                  request.getGenerationId(),
-                                  request.getIdsBsonList(),
-                                  true,
-                                  request.getWriteConcern());
-                      return DeleteResponse.newBuilder()
-                          .setIndexId(request.getIndexId())
-                          .setGenerationId(generation)
-                          .setProcessedCount(request.getIdsBsonCount())
-                          .build();
-                    });
-          });
+          () ->
+              StandaloneGrpcServer.this
+                  .runtime
+                  .ingestion()
+                  .coordinate(
+                      () -> {
+                        StandaloneAuthInterceptor.requireIndex(request.getIndexId());
+                        var index =
+                            StandaloneGrpcServer.this
+                                .runtime
+                                .catalog()
+                                .getIndex(request.getIndexId());
+                        StandaloneGrpcServer.this.runtime.checkWriteAdmission(
+                            request.getSerializedSize());
+                        return StandaloneGrpcServer.this
+                            .runtime
+                            .ingestion()
+                            .writeAsync(
+                                request.getIndexId(),
+                                index.getDesiredRevision(),
+                                request.getGenerationId(),
+                                request.getIdsBsonList(),
+                                true,
+                                request.getWriteConcern())
+                            .thenApply(
+                                generation ->
+                                    DeleteResponse.newBuilder()
+                                        .setIndexId(request.getIndexId())
+                                        .setGenerationId(generation)
+                                        .setProcessedCount(request.getIdsBsonCount())
+                                        .build());
+                      }));
     }
   }
 
@@ -336,7 +369,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
             try {
               return StandaloneGrpcServer.this.runtime.serviceStatus();
             } catch (Exception e) {
-              throw new java.util.concurrent.CompletionException(e);
+              throw new CompletionException(e);
             }
           });
     }

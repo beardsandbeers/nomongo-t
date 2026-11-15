@@ -39,6 +39,12 @@ public record CommunityConfig(
   private static final Logger LOG = LoggerFactory.getLogger(CommunityConfig.class);
 
   private static class Fields {
+    static final Field.Optional<BsonDocument> STANDALONE =
+        Field.builder("standalone")
+            .documentField()
+            .edition(DeploymentEnvironment.COMMUNITY)
+            .optional()
+            .noDefault();
     public static final Field.Required<SyncSourceConfig> SYNC_SOURCE =
         Field.builder("syncSource")
             .classField(SyncSourceConfig::fromBson)
@@ -253,6 +259,8 @@ public record CommunityConfig(
   }
 
   public static CommunityConfig fromBson(DocumentParser parser) throws BsonParseException {
+    // The extension is strictly validated by its own adapter at the composition boundary.
+    parser.getField(Fields.STANDALONE).unwrap();
     return new CommunityConfig(
         parser.getField(Fields.SYNC_SOURCE).unwrap(),
         parser.getField(Fields.STORAGE).unwrap(),

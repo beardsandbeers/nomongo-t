@@ -40,6 +40,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class MongotCursorManagerImpl implements MongotCursorManager {
+  private final java.util.Set<Long> directCursorIds =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+  /** Origin marker for transport facades; engine lifecycle retains privileged cursor cleanup. */
+  public boolean isDirectCursor(long cursorId) {
+    return this.directCursorIds.contains(cursorId);
+  }
 
   private static final Logger LOG = LoggerFactory.getLogger(MongotCursorManagerImpl.class);
 
@@ -51,6 +58,16 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
   private final ConcurrentHashMap<GenerationId, IndexCursorManager> indexManagers;
 
   private final ConcurrentHashMap<Long, IndexCursorManager> cursorToIndex;
+
+  private java.util.function.Predicate<org.bson.types.ObjectId> namespaceAccess = id -> true;
+
+  /**
+   * Optional composition-time scope for native namespace lookups; direct generation access is
+   * separate.
+   */
+  public void restrictNamespaceLookup(java.util.function.Predicate<org.bson.types.ObjectId> scope) {
+    this.namespaceAccess = java.util.Objects.requireNonNull(scope);
+  }
 
   private final IndexCatalog indexCatalog;
   private final InitializedIndexCatalog initializedIndexCatalog;
@@ -214,6 +231,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
               cursorQuery,
               options,
               optimizationFlags);
+      this.directCursorIds.add(cursor.cursorId);
       this.cursorToIndex.put(cursor.cursorId, manager);
       return cursor;
     }
@@ -331,6 +349,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
 
       indexManager.killCursor(cursorId);
       this.cursorToIndex.remove(cursorId);
+      this.directCursorIds.remove(cursorId);
     }
   }
 
@@ -348,6 +367,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
       for (IndexCursorManager manager : this.indexManagers.values()) {
         List<Long> killed = manager.killIdleCursorsSince(idleSince);
         killed.forEach(this.cursorToIndex::remove);
+        killed.forEach(this.directCursorIds::remove);
       }
     }
   }
@@ -382,6 +402,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
       // indexManager.killAll() to be properly synchronized.
       Collection<Long> killedIds = indexManager.killAll();
       killedIds.forEach(this.cursorToIndex::remove);
+      killedIds.forEach(this.directCursorIds::remove);
     }
   }
 
@@ -397,6 +418,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
       }
 
       this.cursorToIndex.clear();
+      this.directCursorIds.clear();
       this.metrics.close();
 
       this.closed = true;
@@ -435,6 +457,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
     Optional<InitializedIndex> optionalInitializedIndex =
         this.indexCatalog
             .getIndex(databaseName, collectionUuid, viewName, query.index())
+            .filter(index -> this.namespaceAccess.test(index.getDefinition().getIndexId()))
             .flatMap(
                 indexGeneration -> {
                   var initializedIndex =
@@ -472,6 +495,7 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
   private void checkCursorExhausted(MongotCursorResultInfo batch, long cursorId) {
     if (batch.exhausted) {
       this.cursorToIndex.remove(cursorId);
+      this.directCursorIds.remove(cursorId);
       // We do not evacuate empty IndexCursorManagers. However, we do remove them in
       // killIndexCursors so there is no leak.
     }

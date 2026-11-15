@@ -2,9 +2,13 @@ package com.xgen.mongot.standalone.runtime;
 
 import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.catalog.DefaultIndexCatalog;
+import com.xgen.mongot.catalog.IndexCatalog;
 import com.xgen.mongot.catalog.InitializedIndexCatalog;
+import com.xgen.mongot.config.backup.ConfigJournalV1;
+import com.xgen.mongot.config.backup.QuarantinePolicy;
 import com.xgen.mongot.config.manager.DefaultConfigManager;
 import com.xgen.mongot.config.manager.IncompatibleIndexes;
+import com.xgen.mongot.config.util.HysteresisConfig;
 import com.xgen.mongot.cursor.CursorConfig;
 import com.xgen.mongot.cursor.MongotCursorManagerImpl;
 import com.xgen.mongot.featureflag.FeatureFlags;
@@ -20,11 +24,13 @@ import com.xgen.mongot.index.lucene.LuceneIndexFactory;
 import com.xgen.mongot.index.lucene.LuceneIndexMappingExporter;
 import com.xgen.mongot.index.lucene.config.LuceneConfig;
 import com.xgen.mongot.index.lucene.directory.EnvironmentVariantPerfConfig;
+import com.xgen.mongot.index.status.IndexStatus;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.lifecycle.DefaultLifecycleManager;
 import com.xgen.mongot.lifecycle.LifecycleConfig;
 import com.xgen.mongot.metrics.MeterAndFtdcRegistry;
 import com.xgen.mongot.monitor.ReplicationStateMonitor;
+import com.xgen.mongot.replication.mongodb.common.IndexingWorkSchedulerFactory;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
@@ -42,6 +48,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -49,6 +56,8 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
 import org.bson.types.ObjectId;
@@ -60,7 +69,8 @@ import org.jetbrains.annotations.Nullable;
 public final class StandaloneRuntime implements Closeable {
   private final StandaloneConfig config;
   private final LocalIndexCatalog catalog;
-  private final DefaultIndexCatalog liveIndexes;
+  private final IndexCatalog liveIndexes;
+  private final Optional<Runnable> externalReconcile;
   private final InitializedIndexCatalog initializedIndexes;
   private final MongotCursorManagerImpl cursors;
   private final ApiIngestionManager ingestion;
@@ -78,9 +88,25 @@ public final class StandaloneRuntime implements Closeable {
   /** Opens the index metadata and composes the Lucene lifecycle without a source database. */
   public StandaloneRuntime(StandaloneConfig config) throws Exception {
     this.config = config;
+    this.externalReconcile = Optional.empty();
+    if (Files.exists(config.dataPath().resolve("coexistence.json"))) {
+      throw new IOException("Mixed data requires the native launch with standalone.enabled: true");
+    }
     this.catalog = new LocalIndexCatalog(config.dataPath());
     this.resources.addFirst(this.catalog);
     try {
+      var previous =
+          ConfigJournalV1.fromFileIfExists(
+              config.dataPath().resolve("configJournal.json"), QuarantinePolicy.QUARANTINE);
+      if (previous.isPresent()
+          && Stream.of(
+                  previous.get().getLiveEntries(),
+                  previous.get().getStagedEntries(),
+                  previous.get().getDeletedEntries())
+              .flatMap(Collection::stream)
+              .anyMatch(entry -> !this.catalog.owns(entry.getGenerationId().indexId))) {
+        throw new IOException("Replicated generations require the native mongot launcher");
+      }
       this.metrics = MeterAndFtdcRegistry.createWithSimpleRegistries();
       this.serviceMetrics = new StandaloneMetrics(this.metrics.meterRegistry());
       this.resources.addFirst(
@@ -117,9 +143,24 @@ public final class StandaloneRuntime implements Closeable {
               initialized);
       AutoCloseable cursorOwner = this.cursors::close;
       this.resources.addFirst(cursorOwner);
+      var schedulers =
+          IndexingWorkSchedulerFactory.createWithoutEmbeddingStrategy(
+              4, this.metrics.meterRegistry(), false);
+      this.resources.addFirst(
+          () -> {
+            for (var scheduler : Set.copyOf(schedulers.getIndexingWorkSchedulers().values())) {
+              scheduler.shutdown().get(30, TimeUnit.SECONDS);
+            }
+          });
       this.ingestion =
           new ApiIngestionManager(
-              this.liveIndexes, initialized, config.documentLimits(), config.commitInterval());
+              this.liveIndexes,
+              initialized,
+              config.documentLimits(),
+              config.commitInterval(),
+              schedulers
+                  .getIndexingWorkSchedulers()
+                  .get(IndexingWorkSchedulerFactory.IndexingStrategy.DEFAULT));
       this.resources.addFirst(() -> this.ingestion.shutdown().get(30, TimeUnit.SECONDS));
       var lifecycle =
           new DefaultLifecycleManager(
@@ -139,7 +180,7 @@ public final class StandaloneRuntime implements Closeable {
       var desiredIds =
           this.catalog.definitions().stream()
               .map(index -> index.getIndexId())
-              .collect(java.util.stream.Collectors.toSet());
+              .collect(Collectors.toSet());
       this.configManager =
           DefaultConfigManager.initialize(
               this.liveIndexes,
@@ -193,6 +234,45 @@ public final class StandaloneRuntime implements Closeable {
     }
   }
 
+  /** Attaches local services to an externally owned engine without changing its configuration. */
+  public StandaloneRuntime(
+      StandaloneConfig config,
+      LocalIndexCatalog catalog,
+      IndexCatalog indexes,
+      InitializedIndexCatalog initialized,
+      MongotCursorManagerImpl cursors,
+      ApiIngestionManager ingestion,
+      DefaultConfigManager manager,
+      MeterAndFtdcRegistry metrics,
+      Runnable reconcile) {
+    this.config = config;
+    this.catalog = catalog;
+    this.liveIndexes = indexes;
+    this.initializedIndexes = initialized;
+    this.cursors = cursors;
+    this.ingestion = ingestion;
+    this.configManager = manager;
+    this.metrics = metrics;
+    this.externalReconcile = Optional.of(reconcile);
+    this.serviceMetrics = new StandaloneMetrics(metrics.meterRegistry());
+    this.statistics =
+        new StandaloneIndexStatistics(
+            catalog, indexes, ingestion, config.maxRpcDuration(), this.serviceMetrics);
+    this.resources.addFirst(this.statistics);
+    this.reconciler =
+        new ScheduledThreadPoolExecutor(
+            1, Thread.ofPlatform().name("standalone-catalog").factory());
+    this.reconciler.setRemoveOnCancelPolicy(true);
+    this.resources.addFirst(
+        () -> {
+          this.reconciler.shutdown();
+          if (!this.reconciler.awaitTermination(30, TimeUnit.SECONDS)) {
+            throw new IOException("Local reconciliation did not drain");
+          }
+        });
+    this.reconciler.scheduleWithFixedDelay(this::reconcileSafely, 0, 1, TimeUnit.SECONDS);
+  }
+
   public StandaloneConfig config() {
     return this.config;
   }
@@ -213,7 +293,7 @@ public final class StandaloneRuntime implements Closeable {
     return this.cursors;
   }
 
-  public DefaultIndexCatalog liveIndexes() {
+  public IndexCatalog liveIndexes() {
     return this.liveIndexes;
   }
 
@@ -331,6 +411,10 @@ public final class StandaloneRuntime implements Closeable {
   }
 
   private void reconcile() throws Exception {
+    if (this.externalReconcile.isPresent()) {
+      this.externalReconcile.get().run();
+      return;
+    }
     var desired = this.catalog.definitions();
     this.configManager.update(
         desired.stream()
@@ -366,6 +450,10 @@ public final class StandaloneRuntime implements Closeable {
           describeIndex(index.getIndexId().toHexString()).toBuilder().clearDesiredDefinitionBson());
     }
     for (var meter : this.metrics.meterRegistry().getMeters()) {
+      if (this.externalReconcile.isPresent()
+          && !meter.getId().getName().startsWith("standalone.")) {
+        continue;
+      }
       var metric = ServiceMetric.newBuilder().setName(meter.getId().getName());
       meter.getId().getTags().forEach(tag -> metric.putLabels(tag.getKey(), tag.getValue()));
       meter
@@ -424,8 +512,7 @@ public final class StandaloneRuntime implements Closeable {
           state = active == desired.getDesiredRevision() ? "READY" : "BUILDING";
         } else {
           state =
-              generation.getIndex().getStatus().getStatusCode()
-                      == com.xgen.mongot.index.status.IndexStatus.StatusCode.FAILED
+              generation.getIndex().getStatus().getStatusCode() == IndexStatus.StatusCode.FAILED
                   ? "FAILED"
                   : "BUILDING";
         }
@@ -494,7 +581,7 @@ public final class StandaloneRuntime implements Closeable {
         Optional.empty(),
         Optional.empty(),
         Optional.empty(),
-        Optional.of(new com.xgen.mongot.config.util.HysteresisConfig(0.90, 0.95)),
+        Optional.of(new HysteresisConfig(0.90, 0.95)),
         Optional.empty(),
         Optional.empty());
   }

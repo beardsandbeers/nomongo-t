@@ -17,6 +17,7 @@ import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.definition.VectorIndexDefinition;
 import com.xgen.mongot.index.version.GenerationId;
+import com.xgen.mongot.lifecycle.LifecycleManager;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.Crash;
 import com.xgen.mongot.util.FutureUtils;
@@ -24,6 +25,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.stream.Collectors;
 import org.bson.types.ObjectId;
 import org.slf4j.Logger;
@@ -163,10 +165,10 @@ public class IndexActions {
    * Whether initialization of {@code indexGeneration} should be deferred because it is a custom
    * vector engine index that is not yet ready to initialize.
    *
-   * <p>When {@code true}, callers must skip {@link com.xgen.mongot.lifecycle.LifecycleManager#add}
-   * and leave the index in the catalog (reported as {@code NOT_STARTED}). A promotion sweep
-   * enqueues it once {@link IndexFactory#isReadyToInitialize} returns true. Availability of custom
-   * vector engine indexes is controlled externally, so no mongot feature flag is consulted here.
+   * <p>When {@code true}, callers must skip {@link LifecycleManager#add} and leave the index in the
+   * catalog (reported as {@code NOT_STARTED}). A promotion sweep enqueues it once {@link
+   * IndexFactory#isReadyToInitialize} returns true. Availability of custom vector engine indexes is
+   * controlled externally, so no mongot feature flag is consulted here.
    */
   static boolean deferInitializationUntilReady(
       IndexFactory indexFactory, IndexGeneration indexGeneration) {
@@ -303,6 +305,10 @@ public class IndexActions {
   }
 
   private void dropAllOrFail(List<IndexGeneration> indexes) {
+    if (this.configState.defersRetirement()) {
+      indexes.forEach(index -> this.configState.deferRetirement(index, () -> dropIndex(index)));
+      return;
+    }
     List<CompletableFuture<?>> dropFutures =
         indexes.stream().map(this::dropIndex).collect(Collectors.toList());
 
@@ -337,6 +343,9 @@ public class IndexActions {
     return replicationDropFuture.handle(
         (result, exception) -> {
           if (exception != null) {
+            if (this.configState.defersRetirement()) {
+              throw new CompletionException(exception);
+            }
             LOG.atError()
                 .addKeyValue("indexId", generationId.indexId)
                 .addKeyValue("generationId", generationId)

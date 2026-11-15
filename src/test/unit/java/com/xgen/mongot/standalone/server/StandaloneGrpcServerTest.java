@@ -4,6 +4,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.index.lucene.vector.Similarity;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
@@ -31,8 +32,10 @@ import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyChannelBuilder;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
@@ -614,7 +617,57 @@ public class StandaloneGrpcServerTest {
     try (var paths = Files.list(data)) {
       assertThat(paths.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).toList())
           .containsExactly(
-              "standalone.lock", "indexes.json", "configJournal.json", "dynamicFeatureFlags.json");
+              "standalone.lock",
+              "indexes.json",
+              "standalone-owned-ids.json",
+              "configJournal.json",
+              "dynamicFeatureFlags.json");
+    }
+  }
+
+  @Test
+  public void standaloneLaunch_journalHasNonLocalGeneration_refusesBeforeRemovingData()
+      throws Exception {
+    Path directory = data();
+    try (var fixture = new Fixture(directory)) {
+      fixture.create("replicated-directory-fixture");
+    }
+    Files.move(directory.resolve("indexes.json"), directory.resolve("saved-indexes.json"));
+    Files.move(
+        directory.resolve("standalone-owned-ids.json"), directory.resolve("saved-ownership.json"));
+    String journal = Files.readString(directory.resolve("configJournal.json"));
+
+    var error =
+        assertThrows(
+            IOException.class,
+            () -> new StandaloneRuntime(StandaloneConfig.development(directory, 0)));
+
+    assertThat(error).hasMessageThat().contains("native mongot launcher");
+    assertThat(Files.readString(directory.resolve("configJournal.json"))).isEqualTo(journal);
+  }
+
+  @Test
+  public void sharedServices_nativeTls_doesNotLoadStandaloneCertificateFiles() throws Exception {
+    var base = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            base.documentLimits(),
+            base.maxInFlightRequests(),
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            Optional.of(
+                new StandaloneConfig.Tls(
+                    base.dataPath().resolve("unused.crt"), base.dataPath().resolve("unused.key"))),
+            base.principals());
+
+    try (var runtime = new StandaloneRuntime(config);
+        var services = new StandaloneGrpcServer(runtime, true)) {
+      assertThat(services.services()).hasSize(4);
     }
   }
 
@@ -710,7 +763,7 @@ public class StandaloneGrpcServerTest {
 
   @Test
   public void vectorPush_usesExistingVectorSchemaAndReader() throws Exception {
-    com.xgen.mongot.index.lucene.vector.Similarity.load();
+    Similarity.load();
     try (var f = new Fixture(data())) {
       var index =
           f.catalog.createIndex(
@@ -742,8 +795,7 @@ public class StandaloneGrpcServerTest {
     Path data = data();
     try (var f = new Fixture(data)) {
       assertThrows(
-          java.io.IOException.class,
-          () -> new StandaloneRuntime(StandaloneConfig.development(data, 0)));
+          IOException.class, () -> new StandaloneRuntime(StandaloneConfig.development(data, 0)));
     }
   }
 

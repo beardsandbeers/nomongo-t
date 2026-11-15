@@ -10,6 +10,7 @@ java_library(
     ],
     deps = [
         "//src/main/java/com/xgen/mongot/catalog",
+        "//src/main/java/com/xgen/mongot/config/backup",
         "//src/main/java/com/xgen/mongot/config/manager",
         "//src/main/java/com/xgen/mongot/config/util",
         "//src/main/java/com/xgen/mongot/cursor",
@@ -26,6 +27,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/lifecycle",
         "//src/main/java/com/xgen/mongot/metrics",
         "//src/main/java/com/xgen/mongot/monitor",
+        "//src/main/java/com/xgen/mongot/replication/mongodb/common",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "//src/main/java/com/xgen/mongot/standalone/config",
         "//src/main/java/com/xgen/mongot/standalone/ingestion",

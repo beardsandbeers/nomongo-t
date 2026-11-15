@@ -12,6 +12,7 @@ mongot_java_unit_test_suite(
         "//src/main/java/com/xgen/mongot/index/query/operators",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "//src/main/java/com/xgen/mongot/standalone/config",
+        "//src/main/java/com/xgen/mongot/standalone/metrics",
         "//src/main/java/com/xgen/mongot/standalone/runtime",
         "//src/main/java/com/xgen/mongot/standalone/server",
         "//src/main/java/com/xgen/mongot/util",

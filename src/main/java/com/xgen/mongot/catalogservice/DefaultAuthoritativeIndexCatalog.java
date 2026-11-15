@@ -91,6 +91,22 @@ public class DefaultAuthoritativeIndexCatalog implements AuthoritativeIndexCatal
         .toList();
   }
 
+  @Override
+  public List<IndexDefinition> listCompleteIndexDefinitions() throws MetadataServiceException {
+    var result = new java.util.ArrayList<IndexDefinition>();
+    for (var raw : this.aicMongoClient.list(new BsonDocument())) {
+      try {
+        var entry = IndexEntry.fromBson(BsonDocumentParser.fromRoot(raw).build());
+        try (var parser = BsonDocumentParser.fromRoot(entry.definitionBson()).build()) {
+          result.add(IndexDefinition.fromBson(parser));
+        }
+      } catch (BsonParseException e) {
+        throw MetadataServiceException.createFailed(e);
+      }
+    }
+    return List.copyOf(result);
+  }
+
   private static Stream<IndexDefinition> parseDefinitionToStream(IndexEntry entry) {
     try (var parser = BsonDocumentParser.fromRoot(entry.definitionBson()).build()) {
       return Stream.of(IndexDefinition.fromBson(parser));

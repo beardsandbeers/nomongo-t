@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Native bootstrap keeps all upstream source and transport configuration. Never generate or
+# guess MongoDB credentials/configuration from a standalone data directory.
+case "${MONGOT_MODE:-standalone}" in
+  coexistence)
+    if (( $# == 0 )); then
+      echo 'mongot: MONGOT_MODE=coexistence requires --config pointing to a native configuration' >&2
+      exit 2
+    fi
+    exec /opt/mongot/mongot "$@"
+    ;;
+  standalone) ;;
+  *) echo 'mongot: MONGOT_MODE must be standalone or coexistence' >&2; exit 2 ;;
+esac
+
 # Explicit application arguments opt into an operator-supplied configuration.
 if (( $# > 0 )); then
   exec /opt/mongot/mongot-standalone "$@"

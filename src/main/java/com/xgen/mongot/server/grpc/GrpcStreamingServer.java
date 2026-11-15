@@ -78,6 +78,51 @@ public class GrpcStreamingServer implements CommandServer {
       boolean internalListAllIndexesForTesting,
       IndexDefinitionConfig indexDefinitionConfig,
       Supplier<EmbeddingServiceManager> embeddingServiceManagerSupplier) {
+    return createCommunity(
+        address,
+        securityConfig,
+        cursorManager,
+        configManager,
+        meterRegistry,
+        executorManager,
+        indexCatalog,
+        initializedIndexCatalog,
+        quarantinedIndexLookup,
+        metadata,
+        healthManager,
+        bsonSizeSoftLimit,
+        inboundMessageSizeLimit,
+        metadataService,
+        catalogAccessGuard,
+        internalListAllIndexesForTesting,
+        indexDefinitionConfig,
+        embeddingServiceManagerSupplier,
+        java.util.List.of());
+  }
+
+  /**
+   * Creates the native listener with additive service definitions and unchanged native handlers.
+   */
+  public static GrpcStreamingServer createCommunity(
+      SocketAddress address,
+      SecurityConfig securityConfig,
+      MongotCursorManager cursorManager,
+      ConfigManager configManager,
+      MeterRegistry meterRegistry,
+      ExecutorManager executorManager,
+      IndexCatalog indexCatalog,
+      InitializedIndexCatalog initializedIndexCatalog,
+      QuarantinedIndexLookup quarantinedIndexLookup,
+      SearchCommandsRegister.BootstrapperMetadata metadata,
+      HealthManager healthManager,
+      Bytes bsonSizeSoftLimit,
+      Bytes inboundMessageSizeLimit,
+      MetadataService metadataService,
+      CatalogAccessGuard catalogAccessGuard,
+      boolean internalListAllIndexesForTesting,
+      IndexDefinitionConfig indexDefinitionConfig,
+      Supplier<EmbeddingServiceManager> embeddingServiceManagerSupplier,
+      java.util.List<ServerServiceDefinition> additionalServices) {
     CommandRegistry commandRegistry =
         registerCommands(
             meterRegistry,
@@ -106,7 +151,9 @@ public class GrpcStreamingServer implements CommandServer {
         executorManager,
         commandRegistry,
         healthManager,
-        inboundMessageSizeLimit);
+        inboundMessageSizeLimit,
+        FeatureFlags.getDefault(),
+        additionalServices);
   }
 
   /**
@@ -221,6 +268,28 @@ public class GrpcStreamingServer implements CommandServer {
       HealthManager healthManager,
       Bytes inboundMessageSizeLimit,
       FeatureFlags featureFlags) {
+    return create(
+        address,
+        securityConfigOpt,
+        cursorManager,
+        executorManager,
+        commandRegistry,
+        healthManager,
+        inboundMessageSizeLimit,
+        featureFlags,
+        java.util.List.of());
+  }
+
+  public static GrpcStreamingServer create(
+      SocketAddress address,
+      Optional<SecurityConfig> securityConfigOpt,
+      MongotCursorManager cursorManager,
+      ExecutorManager executorManager,
+      CommandRegistry commandRegistry,
+      HealthManager healthManager,
+      Bytes inboundMessageSizeLimit,
+      FeatureFlags featureFlags,
+      java.util.List<ServerServiceDefinition> additionalServices) {
     NettyUtil.SocketType socketType = NettyUtil.getSocketType(address);
 
     var wireMessageCallHandler =
@@ -308,6 +377,7 @@ public class GrpcStreamingServer implements CommandServer {
                 executorManager.getEventLoopGroup(
                     socketType, ExecutorManager.EventLoopGroupType.BOSS))
             .channelType(NettyUtil.getServerChannelType(socketType));
+    additionalServices.forEach(serverBuilder::addService);
     switch (socketType) {
       case TCP -> {
         serverBuilder.withChildOption(ChannelOption.SO_KEEPALIVE, true);

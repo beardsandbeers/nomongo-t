@@ -3,6 +3,7 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "ingestion",
     srcs = [
+        "ApiDocumentIndexer.java",
         "ApiIngestionManager.java",
     ],
     deps = [
@@ -13,6 +14,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/status",
         "//src/main/java/com/xgen/mongot/index/version",
         "//src/main/java/com/xgen/mongot/replication",
+        "//src/main/java/com/xgen/mongot/replication/mongodb/common",
         "//src/main/java/com/xgen/mongot/standalone:bson",
         "//src/main/java/com/xgen/mongot/standalone/config",
         "//src/main/java/com/xgen/mongot/standalone/metrics",
@@ -22,6 +24,7 @@ java_library(
         "@com_google_protobuf//:protobuf_java",
         "@io_grpc_grpc_java//api",
         "@maven//:com_google_errorprone_error_prone_annotations",
+        "@maven//:org_jetbrains_annotations",
         "@maven//:org_mongodb_bson",
     ],
 )

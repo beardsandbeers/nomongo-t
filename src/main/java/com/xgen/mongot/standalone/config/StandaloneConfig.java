@@ -15,7 +15,10 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import org.jetbrains.annotations.Nullable;
@@ -97,16 +100,21 @@ public record StandaloneConfig(
     if (Files.size(configPath) > 65536) {
       throw new IllegalArgumentException("Standalone configuration exceeds 64 KiB");
     }
+    return fromText(Files.readString(configPath), configPath);
+  }
+
+  /** Parses an adapter-produced standalone document using the same strict validation. */
+  public static StandaloneConfig fromText(String text, Path configPath) throws IOException {
     var mapper =
         JsonMapper.builder(
                 YAMLFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
             .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
             .build();
-    var raw = mapper.readValue(Files.readString(configPath), FileConfig.class);
+    var raw = mapper.readValue(text, FileConfig.class);
     if (!or(raw.mode(), "standalone").equals("standalone")) {
       throw new IllegalArgumentException("Configuration mode must be standalone");
     }
-    Path base = java.util.Objects.requireNonNull(configPath.toAbsolutePath().getParent());
+    Path base = Objects.requireNonNull(configPath.toAbsolutePath().getParent());
     var storage = or(raw.storage(), new Storage(null));
     if (storage.dataPath() == null || storage.dataPath().isBlank()) {
       throw new IllegalArgumentException("storage.dataPath is required");
@@ -138,12 +146,12 @@ public record StandaloneConfig(
             "Bearer tokens must contain 32 to 4096 non-whitespace ASCII characters");
       }
       byte[] digest = LocalIndexCatalog.digest(token.getBytes(StandardCharsets.US_ASCII));
-      if (!digests.add(java.util.HexFormat.of().formatHex(digest))) {
+      if (!digests.add(HexFormat.of().formatHex(digest))) {
         throw new IllegalArgumentException("Bearer tokens must be unique across principals");
       }
       var roles = new HashSet<Role>();
       for (String role : principal.roles()) {
-        roles.add(Role.valueOf(role.toUpperCase(java.util.Locale.ROOT)));
+        roles.add(Role.valueOf(role.toUpperCase(Locale.ROOT)));
       }
       if (roles.isEmpty() || principal.indexes().isEmpty()) {
         throw new IllegalArgumentException("Principals require explicit roles and indexes");

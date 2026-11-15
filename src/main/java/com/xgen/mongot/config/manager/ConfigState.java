@@ -17,6 +17,7 @@ import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.index.IndexFactory;
 import com.xgen.mongot.index.IndexGeneration;
+import com.xgen.mongot.index.InitializedIndex;
 import com.xgen.mongot.index.autoembedding.AutoEmbeddingFailureMessages;
 import com.xgen.mongot.index.autoembedding.AutoEmbeddingIndexGenerationFactory;
 import com.xgen.mongot.index.autoembedding.MaterializedViewIndexFactory;
@@ -42,6 +43,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BinaryOperator;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -59,6 +64,52 @@ import org.slf4j.LoggerFactory;
  * members and the persisted config journal.
  */
 public class ConfigState {
+  private Optional<Executor> retirementExecutor = Optional.empty();
+  private final ConcurrentHashMap<GenerationId, IndexGeneration> retiring =
+      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<GenerationId, CompletableFuture<Void>> retirements =
+      new ConcurrentHashMap<>();
+
+  /** Opt-in asynchronous physical retirement; native callers retain synchronous behavior. */
+  public void enableDeferredRetirement(Executor executor) {
+    this.retirementExecutor = Optional.of(executor);
+  }
+
+  boolean defersRetirement() {
+    return this.retirementExecutor.isPresent();
+  }
+
+  void deferRetirement(IndexGeneration index, Supplier<CompletableFuture<Void>> drop) {
+    var id = index.getGenerationId();
+    this.retiring.put(id, index);
+    var future =
+        CompletableFuture.supplyAsync(drop, this.retirementExecutor.orElseThrow())
+            .thenCompose(value -> value);
+    this.retirements.put(id, future);
+    future.whenComplete(
+        (ignored, error) -> {
+          if (error == null) {
+            this.retiring.remove(id, index);
+            this.retirements.remove(id, future);
+          } else {
+            LoggerFactory.getLogger(ConfigState.class)
+                .error(
+                    "Physical retirement failed for {}; retaining resources and recovery entry",
+                    id,
+                    error);
+          }
+        });
+  }
+
+  void awaitRetirements() {
+    try {
+      CompletableFuture.allOf(this.retirements.values().toArray(CompletableFuture<?>[]::new))
+          .get(30, TimeUnit.SECONDS);
+    } catch (Exception e) {
+      throw new IllegalStateException("Physical retirements did not drain safely", e);
+    }
+  }
+
   public static final String STAGED_INDEXES_FEATURE_VERSION_FOUR =
       "stagedIndexesFeatureVersionFour";
   public static final String LIVE_INDEXES_FEATURE_VERSION_FOUR =
@@ -95,9 +146,9 @@ public class ConfigState {
   public final PhasingOutIndexes phasingOut;
 
   /**
-   * The collection of initialized indexes ({@link com.xgen.mongot.index.InitializedIndex}) for the
-   * corresponding indexes managed in this ConfigState. The indexes themselves could be in various
-   * states (staged, phasing out, catalog).
+   * The collection of initialized indexes ({@link InitializedIndex}) for the corresponding indexes
+   * managed in this ConfigState. The indexes themselves could be in various states (staged, phasing
+   * out, catalog).
    *
    * <p>An index in the ConfigState, once initialized, must be added to this collection.
    */
@@ -415,7 +466,10 @@ public class ConfigState {
         entries(this.staged.getIndexes(), this.incompatibleIndexes.getStagedIndexes()),
         entries(this.indexCatalog.getIndexes(), this.incompatibleIndexes.getLiveIndexes()),
         // if we restart at any point, we can just drop the phasing out indexes.
-        entries(this.phasingOut.getIndexes(), List.of()));
+        entries(
+            Stream.concat(this.phasingOut.getIndexes().stream(), this.retiring.values().stream())
+                .toList(),
+            List.of()));
   }
 
   private static List<JournalEntry<? extends IndexDefinitionGeneration>> entries(

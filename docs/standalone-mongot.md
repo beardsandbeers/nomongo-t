@@ -13,7 +13,8 @@ cd /tmp/mongot-standalone
 ./mongot-standalone --config standalone.yaml
 ```
 
-The archive includes Java 21, native libraries, the API schema, and an example configuration.
+The archive includes Java 21, native libraries, the API schema, and example configurations.
+It also includes the native `mongot` launcher for [replication and standalone indexes together](coexistence-mode.md).
 Docker build and TLS bootstrap instructions are in [the container guide](../deploy/standalone/DOCKERHUB.md).
 
 ## Configuration

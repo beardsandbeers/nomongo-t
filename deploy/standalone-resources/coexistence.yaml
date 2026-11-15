@@ -1,0 +1,24 @@
+# Launch with ./mongot --config coexistence.yaml (the native bootstrap).
+# Keep native settings and storage.dataPath when enabling this on existing data.
+syncSource:
+  replicaSet:
+    hostAndPort: localhost:27017
+    scramAuth:
+      username: mongotUser
+      passwordFile: password
+      authSource: admin
+      tls:
+        enabled: false
+storage:
+  dataPath: ./data
+server:
+  grpc:
+    address: 127.0.0.1:27028
+standalone:
+  enabled: true
+  grpc:
+    listener: shared
+  ingestion:
+    maxInFlightRequests: 64
+    maxQueuedBytes: 268435456
+    commitIntervalMillis: 1000

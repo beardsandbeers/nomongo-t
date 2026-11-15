@@ -900,6 +900,7 @@ def main():
                 check(not (data / "standalone.sqlite").exists(), "Unexpected source database")
                 allowed = {
                     "standalone.lock",
+                    "standalone-owned-ids.json",
                     "indexes.json",
                     "configJournal.json",
                     "dynamicFeatureFlags.json",

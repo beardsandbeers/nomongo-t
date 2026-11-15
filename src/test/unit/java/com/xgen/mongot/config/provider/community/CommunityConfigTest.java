@@ -17,7 +17,9 @@ import com.xgen.mongot.config.provider.community.ServerConfig.GrpcServerConfig.G
 import com.xgen.mongot.config.provider.community.embedding.EmbeddingConfig;
 import com.xgen.mongot.config.util.TlsMode;
 import com.xgen.mongot.util.DeploymentEnvironment;
+import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.mongot.util.bson.parser.BsonParseException;
+import com.xgen.mongot.util.bson.parser.PermissiveBsonParseContext;
 import com.xgen.mongot.util.mongodb.Databases;
 import com.xgen.testing.BsonDeserializationTestSuite;
 import com.xgen.testing.BsonSerializationTestSuite;
@@ -31,6 +33,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
+import org.bson.BsonDocument;
 import org.bson.BsonInt32;
 import org.bson.BsonString;
 import org.bson.BsonValue;
@@ -879,6 +882,23 @@ public class CommunityConfigTest {
 
   @SuppressWarnings("NewClassNamingConvention")
   public static class CommunityConfigTestClass {
+
+    @Test
+    public void fromBson_standaloneExtension_preservesNativeConfiguration() throws Exception {
+      var path = Path.of("src/test/unit/resources/config/provider/community/communityConfig.yaml");
+      var expected =
+          CommunityConfig.readFromFile(path, Optional.of(DeploymentEnvironment.COMMUNITY)).config();
+      var bson = expected.toBson();
+      bson.put("standalone", new BsonDocument("enabled", BsonBoolean.TRUE));
+
+      var context = PermissiveBsonParseContext.root(Optional.of(DeploymentEnvironment.COMMUNITY));
+      try (var parser = BsonDocumentParser.withContext(context, bson).build()) {
+        var parsed = CommunityConfig.fromBson(parser);
+
+        assertEquals(expected, parsed);
+        assertTrue(context.getUnknownFieldExceptions().isEmpty());
+      }
+    }
 
     @Test
     public void deserializeFromYaml() throws IOException, BsonParseException {

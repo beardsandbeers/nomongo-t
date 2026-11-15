@@ -5,6 +5,7 @@ load("//deploy:def.bzl", "extracted_libraries")
 exports_files([
     "docs/join-design-guide.md",
     "docs/standalone-mongot.md",
+    "docs/coexistence-mode.md",
     "scripts/standalone/client.py",
 ])
 

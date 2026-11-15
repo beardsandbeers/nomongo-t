@@ -206,6 +206,22 @@ public class OnPremMongotBootstrapper {
                 () ->
                     CommunityConfig.readFromFile(configPath, cliValues, Optional.of(this.edition)));
     CommunityConfig config = parsedConfig.config();
+    var standaloneConfig =
+        Crash.because("failed to parse standalone extension")
+            .ifThrowsExceptionOrError(
+                () ->
+                    com.xgen.mongot.standalone.config.CoexistenceConfig.fromFile(
+                        configPath,
+                        config.storageConfig().dataPath(),
+                        parseInetSocketAddress(config.serverConfig().grpc().address()),
+                        config.serverConfig().getGrpcTlsMode()
+                            != com.xgen.mongot.config.util.TlsMode.DISABLED));
+
+    if (standaloneConfig.isEmpty()
+        && (Files.exists(config.storageConfig().dataPath().resolve("coexistence.json"))
+            || Files.exists(config.storageConfig().dataPath().resolve("indexes.json")))) {
+      throw new IllegalArgumentException("Mixed data requires standalone.enabled: true");
+    }
 
     config
         .loggingConfig()
@@ -300,6 +316,25 @@ public class OnPremMongotBootstrapper {
         MongotCursorManagerImpl.fromConfig(
             mongotConfigs.cursorConfig, meterRegistry, indexCatalog, initializedIndexCatalog);
 
+    var coexistence =
+        standaloneConfig.map(
+            local ->
+                Crash.because("failed to open standalone ownership/catalog")
+                    .ifThrowsExceptionOrError(
+                        () ->
+                            new com.xgen.mongot.standalone.coexistence.CoexistenceRuntime(
+                                local,
+                                indexCatalog,
+                                initializedIndexCatalog,
+                                cursorManager,
+                                meterAndFtdcRegistry)));
+    IndexCatalog nativeIndexes =
+        coexistence.<IndexCatalog>map(extension -> extension.nativeIndexes()).orElse(indexCatalog);
+    MongotCursorManager nativeCursors =
+        coexistence
+            .<MongotCursorManager>map(extension -> extension.nativeCursors())
+            .orElse(cursorManager);
+
     var diskMonitorConfig = config.diskMonitorConfig();
     var diskMonitor =
         PeriodicDiskMonitor.createAndStart(
@@ -372,27 +407,38 @@ public class OnPremMongotBootstrapper {
             mongotConfigs.featureFlags,
             this.dynamicFeatureFlagRegistry,
             embeddingServiceManagerSupplier,
-            isAutoEmbeddingViewWriter);
+            isAutoEmbeddingViewWriter,
+            coexistence);
+
+    coexistence.ifPresent(
+        extension ->
+            Crash.because("failed to attach standalone services")
+                .ifThrowsExceptionOrError(() -> extension.attach(configManager)));
+    ConfigManager nativeConfig =
+        coexistence.<ConfigManager>map(extension -> extension.nativeConfig()).orElse(configManager);
 
     var metadataUpdater =
         metadataUpdater(
             serverInfo,
             metadataService,
-            configManager,
+            nativeConfig,
             clusterTopologyGuard,
             mongoDbMetadataClient,
             meterRegistry,
             internalListAllIndexesForTesting);
 
-    var healthManager = new HealthManager(configManager, meterRegistry);
+    var healthManager = new HealthManager(nativeConfig, meterRegistry);
     var serverLifecycles =
         servers(
             config,
-            cursorManager,
-            configManager,
-            indexCatalog,
+            nativeCursors,
+            nativeConfig,
+            nativeIndexes,
             initializedIndexCatalog,
-            incompatibleIndexes,
+            coexistence
+                .<QuarantinedIndexLookup>map(
+                    extension -> extension.nativeQuarantine(incompatibleIndexes))
+                .orElse(incompatibleIndexes),
             commandRegisterMetadata,
             mongotConfigs.regularBlockingRequestSettings,
             meterRegistry,
@@ -404,13 +450,17 @@ public class OnPremMongotBootstrapper {
             embeddingServiceManagerSupplier,
             mongotConfigs.featureFlags,
             this.dynamicFeatureFlagRegistry,
-            meterAndFtdcRegistry.threadPoolResourceBindings());
+            meterAndFtdcRegistry.threadPoolResourceBindings(),
+            coexistence.map(extension -> extension.services().services()).orElse(List.of()));
+
+    coexistence.ifPresent(
+        extension -> extension.services().publishHealth(healthManager::setServiceStatus));
 
     var readinessChecker =
         new CommunityReadinessChecker(
             serverInfo,
-            configManager,
-            configManager,
+            nativeConfig,
+            nativeConfig,
             metadataService,
             clusterTopologyGuard,
             serverLifecycles.servers);
@@ -423,12 +473,13 @@ public class OnPremMongotBootstrapper {
         configMonitor(
             metadataService.getAuthoritativeIndexCatalog(),
             mongoDbMetadataClient,
-            configManager,
+            nativeConfig,
             mongotConfigs.featureFlags,
             meterRegistry,
             syncSourceConfig,
             initialSyncHostProvider,
-            clusterTopologyGuard);
+            clusterTopologyGuard,
+            coexistence.isPresent());
 
     // Register shutdown hook prior to starting the server.
     // Close the server to cleanly finish any in-flight requests.
@@ -436,11 +487,20 @@ public class OnPremMongotBootstrapper {
     Shutdown.registerHook(
         healthManager::enterTerminalState,
         serverLifecycles.stop,
+        metadataUpdater::stop,
         () -> systemMetricsInstrumentation.ifPresent(SystemMetricsInstrumentation::stop),
         () -> prometheusServerOptional.ifPresent(PrometheusServer::shutdown),
         () -> ftdcReporterLifecycle.ifPresent(f -> f.stop.run()),
-        metadataUpdater::stop,
-        configManager::close,
+        // Stop updates before closing their manager. The native updater owns its manager; the
+        // coexistence facade leaves the shared physical manager to the engine owner below.
+        configMonitor::stop,
+        () -> coexistence.ifPresent(extension -> extension.stopServices()),
+        () -> {
+          if (coexistence.isPresent()) {
+            configManager.close();
+          }
+        },
+        () -> coexistence.ifPresent(extension -> extension.closeResources()),
         healthCheckServer::stop,
         diskMonitor::stop,
         metadataService::close,
@@ -952,7 +1012,8 @@ public class OnPremMongotBootstrapper {
       FeatureFlags featureFlags,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry,
       Supplier<EmbeddingServiceManager> embeddingServiceManagerSupplier,
-      boolean isAutoEmbeddingViewWriter) {
+      boolean isAutoEmbeddingViewWriter,
+      Optional<com.xgen.mongot.standalone.coexistence.CoexistenceRuntime> coexistence) {
     LuceneGlobalSettings.apply(mongotConfigs.luceneConfig);
     var analyzerRegistryFactory =
         Crash.because("failed to get AnalyzerRegistry.Factory instance")
@@ -1003,6 +1064,16 @@ public class OnPremMongotBootstrapper {
             mvCollectionResolver,
             dbResolver,
             mongotConfigs.autoEmbeddingMaterializedViewConfig);
+    var sharedSchedulers =
+        coexistence.map(
+            extension ->
+                extension.createSchedulers(
+                    mongotConfigs.replicationConfig.numIndexingThreads,
+                    embeddingServiceManagerSupplier,
+                    mongotConfigs.featureFlags.isEnabled(Feature.LIFECYCLE_ATTRIBUTION_METRICS)));
+    IndexCatalog replicationIndexes =
+        coexistence.<IndexCatalog>map(extension -> extension.nativeIndexes()).orElse(indexCatalog);
+
     var replicationManagerFactory =
         CommonUtils.getReplicationManagerFactory(
             dataPath,
@@ -1011,13 +1082,14 @@ public class OnPremMongotBootstrapper {
             mongotConfigs.durabilityConfig,
             mongotConfigs.featureFlags,
             cursorManager,
-            indexCatalog,
+            replicationIndexes,
             initializedIndexCatalog,
             meterAndFtdcRegistry,
             DefaultConfigManager.ReplicationMode.DISK_UTILIZATION_BASED,
             replicationStateMonitor,
             Optional.of(embeddingServiceManagerSupplier),
-            Optional.empty());
+            Optional.empty(),
+            sharedSchedulers);
 
     AutoEmbeddingMaterializedViewManagerFactory autoEmbeddingMaterializedViewManagerFactory =
         CommonUtils.getAutoEmbeddingMaterializedViewManagerFactory(
@@ -1030,12 +1102,12 @@ public class OnPremMongotBootstrapper {
             DefaultConfigManager.ReplicationMode.ENABLE,
             Optional.of(embeddingServiceManagerSupplier),
             leaseManager,
-            indexCatalog,
+            replicationIndexes,
             mvMetadataCatalog,
             autoEmbeddingMongoClient,
             dynamicFeatureFlagRegistry);
 
-    var lifecycleManager =
+    var nativeLifecycleManager =
         CommonUtils.getLifecycleManager(
             mongotConfigs.lifecycleConfig,
             Optional.of(syncSourceConfig),
@@ -1049,6 +1121,13 @@ public class OnPremMongotBootstrapper {
             mongotConfigs.featureFlags,
             meterAndFtdcRegistry.threadPoolResourceBindings());
 
+    var lifecycleManager =
+        coexistence
+            .map(
+                extension ->
+                    extension.routeLifecycle(
+                        nativeLifecycleManager, indexFactory, replicationStateMonitor))
+            .orElse(nativeLifecycleManager);
     return DefaultConfigManager.initialize(
         indexCatalog,
         Optional.empty(),
@@ -1084,7 +1163,8 @@ public class OnPremMongotBootstrapper {
       Supplier<EmbeddingServiceManager> embeddingServiceManagerSupplier,
       FeatureFlags featureFlags,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry,
-      ThreadPoolResourceMetrics.Bindings threadPoolResourceBindings) {
+      ThreadPoolResourceMetrics.Bindings threadPoolResourceBindings,
+      List<io.grpc.ServerServiceDefinition> additionalServices) {
     boolean shouldRetryViaEnvoy =
         SearchQueryAdmissionControlConfigMapper.shouldRetryViaLoadBalancer(
             config.advancedConfigs().flatMap(AdvancedConfigs::regularBlockingRequestConfig));
@@ -1118,7 +1198,8 @@ public class OnPremMongotBootstrapper {
             catalogAccessGuard,
             internalListAllIndexesForTesting,
             indexDefinitionConfig,
-            embeddingServiceManagerSupplier);
+            embeddingServiceManagerSupplier,
+            additionalServices);
 
     return new ServerLifecycles(
         grpcServer::start,
@@ -1143,7 +1224,8 @@ public class OnPremMongotBootstrapper {
       MeterRegistry meterRegistry,
       SyncSourceConfig initialSyncSourceConfig,
       InitialSyncHostProvider initialSyncHostProvider,
-      CatalogAccessGuard catalogAccessGuard) {
+      CatalogAccessGuard catalogAccessGuard,
+      boolean requireCompleteSnapshot) {
     var configUpdater =
         new CommunityConfigUpdater(
             authoritativeIndexCatalog,
@@ -1152,7 +1234,8 @@ public class OnPremMongotBootstrapper {
             featureFlags,
             initialSyncSourceConfig,
             initialSyncHostProvider,
-            catalogAccessGuard);
+            catalogAccessGuard,
+            requireCompleteSnapshot);
     return PeriodicConfigMonitor.create(configUpdater, DEFAULT_CONFIG_UPDATE_PERIOD, meterRegistry);
   }
 

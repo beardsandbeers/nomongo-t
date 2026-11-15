@@ -900,6 +900,48 @@ public class IndexActionsTest {
     this.mocks.assertIndexDropped(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION, initializedIndex);
   }
 
+  @Test
+  public void dropFromCatalog_deferredDrain_preservesWriterAndJournalUntilCompletion()
+      throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var initialized = this.mocks.waitAndGetInitializedIndex(indexes.get(0).getGenerationId());
+    var drain = new CompletableFuture<Void>();
+    doReturn(drain).when(this.mocks.lifecycleManager).dropIndex(any());
+    this.mocks.configState.enableDeferredRetirement(Runnable::run);
+
+    this.actions.dropFromCatalog(indexes);
+
+    this.mocks.assertIndexCatalogSize(0);
+    verify(initialized, never()).close();
+    verify(indexes.get(0).getIndex(), never()).drop();
+    Assert.assertEquals(1, this.mocks.configState.currentJournal().getDeletedEntries().size());
+
+    drain.complete(null);
+    this.mocks.configState.awaitRetirements();
+
+    this.mocks.assertIndexDropped(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION, initialized);
+    Assert.assertTrue(this.mocks.configState.currentJournal().getDeletedEntries().isEmpty());
+  }
+
+  @Test
+  public void dropFromCatalog_deferredDrainFailure_keepsWriterAndRecoveryEntry() throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var initialized = this.mocks.waitAndGetInitializedIndex(indexes.get(0).getGenerationId());
+    doReturn(CompletableFuture.failedFuture(new IllegalStateException("drain failed")))
+        .when(this.mocks.lifecycleManager)
+        .dropIndex(any());
+    this.mocks.configState.enableDeferredRetirement(Runnable::run);
+
+    this.actions.dropFromCatalog(indexes);
+
+    verify(initialized, never()).close();
+    verify(indexes.get(0).getIndex(), never()).drop();
+    Assert.assertEquals(1, this.mocks.configState.currentJournal().getDeletedEntries().size());
+    Assert.assertThrows(IllegalStateException.class, this.mocks.configState::awaitRetirements);
+  }
+
   /** Stands in for {@code Runtime.halt()}, which the halt handler replaces under test. */
   private static final class HaltError extends Error {
     private HaltError() {
