@@ -80,7 +80,7 @@ class Driver:
         check(method in RPC_NAMES, f"Unknown RPC {method}")
         self.called.add(method)
         # These functional scenarios query immediately after mutation. Exercise explicit visibility.
-        if method in ("Upsert", "Delete"):
+        if method in ("Upsert", "Delete", "DeleteByQuery"):
             request = dict(request or {})
             request.setdefault("writeConcern", "DOCUMENT_WRITE_CONCERN_VISIBLE")
         self.process.stdin.write(json.dumps({"method": method, "request": request or {}}) + "\n")
@@ -530,6 +530,42 @@ def verify_explain(client, method, index, expression, expected_ids):
     all_results(client, ordinary)
 
 
+def exercise_delete_by_query(client, index):
+    documents = [
+        {"_id": "delete-1", "title": "coffee"},
+        {"_id": "delete-2", "title": "coffee"},
+        {"_id": "keep", "title": "tea"},
+    ]
+    client.call(
+        "Upsert",
+        {"indexId": index["indexId"], "documentsBson": [encoded(d) for d in documents]},
+    )
+    request = {
+        "indexId": index["indexId"],
+        "generationId": index["generationId"],
+        "searchQueryBson": encoded({"text": {"path": "title", "query": "coffee"}}),
+        "maxMatches": "2",
+    }
+    preview = client.call("DeleteByQuery", dict(request, dryRun=True))
+    check(int(preview["matchedCount"]) == 2, "Delete preview missed matching documents")
+    check(int(preview.get("processedCount", 0)) == 0, "Delete preview processed documents")
+    check(preview["dryRun"], "Delete preview omitted its dry-run status")
+    check(
+        ids(all_results(client, search(client, index, "coffee"))) == {"delete-1", "delete-2"},
+        "Delete preview changed index contents",
+    )
+    deleted = client.call("DeleteByQuery", request)
+    check(int(deleted["matchedCount"]) == 2, "Delete query missed matching documents")
+    check(int(deleted["processedCount"]) == 2, "Delete query did not process both matches")
+    check(
+        not all_results(client, search(client, index, "coffee")), "Deleted matches remain visible"
+    )
+    check(
+        ids(all_results(client, search(client, index, "tea"))) == {"keep"},
+        "Delete query removed a nonmatching document",
+    )
+
+
 def exercise(client):
     checks = []
     name = client.language + "-" + uuid.uuid4().hex
@@ -561,6 +597,8 @@ def exercise(client):
         not all_results(client, search(client, other, "coffee")), "Writes leaked into another index"
     )
     checks.append("direct text writes, cursor pagination, BSON preservation, index isolation")
+    exercise_delete_by_query(client, other)
+    checks.append("delete-by-query preview, visible deletion, and preservation of nonmatches")
     verify_explain(
         client,
         "Search",
