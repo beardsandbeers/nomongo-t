@@ -127,11 +127,14 @@ set_version = rule(
 )
 
 def extract_library(out, paths, lib):
+    compatible = {condition: [] for condition in paths if condition != "//conditions:default"}
+    compatible["//conditions:default"] = ["@platforms//:incompatible"]
     native.genrule(
         name = "extract_" + out,
         srcs = [lib],
         outs = [out],
         cmd = "unzip -p $(location " + lib + ") " + select(paths) + " > $@",
+        target_compatible_with = select(compatible),
     )
 
 """

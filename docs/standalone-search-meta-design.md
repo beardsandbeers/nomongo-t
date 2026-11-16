@@ -1,8 +1,14 @@
 # Standalone SearchMeta gRPC design
 
-Status: Implemented on `feature/standalone-search-meta`. The RPC, metadata-only execution,
+Status: Implemented in the standalone server and all four clients. The RPC, metadata-only execution,
 shared feature policy and command validation, generation leases, cancellation checks, and all
-four client helpers are present. The pinned MongoDB stage-adapter comparison remains a release check.
+four client helpers are present. A live MongoDB 8.3.17 stage-adapter comparison passed on
+2026-11-16: 114 query comparisons and nine explain checks over 1/2/4 partitions, with matching
+engine bytecode, data, mappings, and Community feature defaults. The corpus compares acceptance,
+query-error messages, metadata presence, BSON types and bucket ordering, including empty/missing
+indexes, vector queries, embedded return scope, drill-sideways, and sorted aggregation metrics.
+See [the live parity runner](../clients/tests/search_meta_parity.py) and
+[its invocation](../clients/README.md#verify). Rerun it for the MongoDB version being released.
 
 An observational local benchmark on 2026-11-16 compared Search (100 returned hits) and SearchMeta
 using 10,000 documents, count/facet/sorted-metric queries, and 1/2/4 partitions. All nine metadata
@@ -26,8 +32,8 @@ does not expose a public hit cursor or implement an arbitrary MongoDB aggregatio
 
 ## Current behavior
 
-[The protocol](../src/proto/standalone/v1/standalone.proto) exposes `Search`, `VectorSearch`,
-`GetMore`, and `KillCursor`. `Search` accepts a facet collector today. In
+[The protocol](../src/proto/standalone/v1/standalone.proto) exposes `Search`, `SearchMeta`,
+`VectorSearch`, `GetMore`, and `KillCursor`. `Search` accepts a facet collector. In
 [StandaloneQueryService](../src/main/java/com/xgen/mongot/standalone/server/StandaloneQueryService.java),
 it parses with the engine's feature policy and default optimization flags, reserves cursor capacity,
 creates a cursor, fetches the first results batch, and returns `cursor.metaResults` in `metadata_bson`. An unexhausted query
@@ -53,9 +59,11 @@ The coupled [SearchCommand](../src/main/java/com/xgen/mongot/server/command/sear
 sharded planning, and standalone `Search` now share
 [SearchQueryFeaturePolicy](../src/main/java/com/xgen/mongot/featureflag/dynamic/SearchQueryFeaturePolicy.java).
 Standalone reads the config manager's effective registry for each request and initializes enabled
-aggregation support at startup. Coupled command-level validation, query preparation, and the
-regex budget scope still need to be accounted for when implementing `SearchMeta`; sharing parse
-options alone does not complete the new RPC's parity contract.
+aggregation support at startup. Both standalone search RPCs apply the shared command-level
+validation, including the `AUTO_NUM_CANDIDATES` gate. `SearchMeta` opens a regex budget scope,
+pins query snapshots and generation leases, and prepares supported joins before cursor creation.
+Standalone mappings support client-provided vectors; auto-embedding mappings are rejected at
+index creation, so no embedding rewrite is needed for these indexes.
 
 ## Compatibility authority
 
@@ -358,15 +366,18 @@ Keep count and numeric bucket decoding lossless in JavaScript.
 
 ## Implementation and validation
 
-1. Add the proto and client method surfaces. Extract shared coupled parsing, feature-policy,
-   validation, and preparation helpers. Implement name resolution and optional identity fences;
-   do not create metadata-specific syntax validation.
-2. Implement the handler, pinned snapshot/lifetime cleanup, explain, cancellation, response-size
-   checks, and shared partition budget enforcement. Generalize join-specific snapshot helper
-   error text when reusing it for non-join metadata queries.
-3. Add integration coverage in
+1. Implemented: proto and client methods, shared parser and feature-policy validation, name
+   resolution, and optional identity fences. Query syntax uses the coupled parser without a
+   metadata-specific allowlist.
+2. Implemented: metadata-only execution, pinned snapshot/lifetime cleanup, explain, cancellation,
+   response-size checks, and shared partition budget enforcement. The common snapshot helper uses
+   query-specific diagnostics for both metadata queries and joins.
+3. Regression coverage is present in
    [StandaloneGrpcServerTest](../src/test/unit/java/com/xgen/mongot/standalone/server/StandaloneGrpcServerTest.java)
-   and client coverage in [the cross-language harness](../clients/tests/e2e.py). Validate:
+   and [the cross-language harness](../clients/tests/e2e.py). It includes vector count/explain
+   execution across partitions and enabled/disabled automatic candidate selection. The live
+   [stage-adapter corpus](../clients/tests/search_meta_parity.py) supplies the MongoDB comparison.
+   Continue extending release coverage against this checklist:
    - Run a shared fixture corpus through an actual coupled `{$searchMeta: Q}` pipeline and this
      RPC using the identical `Q`, data, mappings, and effective flags. Compare accepted/rejected
      queries, error categories, metadata presence, BSON values/types, and bucket-array ordering.

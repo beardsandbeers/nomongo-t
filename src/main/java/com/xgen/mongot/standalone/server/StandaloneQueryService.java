@@ -182,6 +182,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                 expression,
                 QueryOptimizationFlags.DEFAULT_OPTIONS,
                 this.runtime.searchQueryParseOptions());
+        this.runtime.validateSearchQuery(parsed);
         if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(parsed))) {
           joinPlan = this.joinPlanner.prepare(parsed, generation.getGenerationId());
           query = new CursorQuery.Search(joinPlan.query(), Optional.of(joinPlan.snapshot()));
