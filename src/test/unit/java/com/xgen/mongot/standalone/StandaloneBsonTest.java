@@ -14,6 +14,33 @@ import org.junit.Test;
 
 public class StandaloneBsonTest {
   @Test
+  public void validateEncodedId_validIdentity_preservesOriginalBytes() {
+    var bytes = bson("{_id: {$numberLong: '1'}}");
+    var original = bytes.clone();
+
+    StandaloneBson.validateEncodedId(bytes, 1000, 100);
+
+    assertThat(bytes).isEqualTo(original);
+    assertThat(new RawBsonDocument(bytes).get("_id").isInt64()).isTrue();
+  }
+
+  @Test
+  public void validateEncodedId_invalidIdentity_rejectsBeforeApplication() {
+    var extra = bson("{_id:1,extra:2}");
+    var unsupported = bson("{_id:{nested:1}}");
+    var oversized = bson("{_id:'" + "x".repeat(32767) + "'}");
+
+    assertThrows(
+        IllegalArgumentException.class, () -> StandaloneBson.validateEncodedId(extra, 1000, 100));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> StandaloneBson.validateEncodedId(unsupported, 1000, 100));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> StandaloneBson.validateEncodedId(oversized, 65536, 100));
+  }
+
+  @Test
   public void mutation_numericWidths_preservesDistinctEncodedIdentities() {
     var int32 = validate("{_id: {$numberInt: '1'}, title: 'a'}", false);
     var int64 = validate("{_id: {$numberLong: '1'}, title: 'a'}", false);

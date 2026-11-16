@@ -1,7 +1,6 @@
 package com.xgen.mongot.standalone.server;
 
-import com.google.errorprone.annotations.Var;
-import com.google.protobuf.ByteString;
+import com.xgen.mongot.index.IndexReader;
 import com.xgen.mongot.standalone.StandaloneBson;
 import com.xgen.mongot.standalone.grpc.DeleteByQueryRequest;
 import com.xgen.mongot.standalone.grpc.DeleteByQueryResponse;
@@ -11,14 +10,13 @@ import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import io.grpc.Context;
 import io.grpc.Status;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.concurrent.Semaphore;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.util.automaton.TooComplexToDeterminizeException;
 import org.bson.BsonDocument;
 import org.bson.types.ObjectId;
 
-/** Bounded selection followed by ordinary ID deletions; ingestion may interleave. */
+/** Streams root IDs into bounded native delete batches; ingestion may interleave. */
 final class StandaloneDeleteByQuery {
   private final StandaloneRuntime runtime;
   private final Semaphore capacity = new Semaphore(1);
@@ -85,10 +83,8 @@ final class StandaloneDeleteByQuery {
     StandaloneAuthInterceptor.requireIndex(request.getIndexId());
     StandaloneAuthInterceptor.requireRole(
         com.xgen.mongot.standalone.config.StandaloneConfig.Role.WRITE);
-    if (request.getWriteConcern() == DocumentWriteConcern.UNRECOGNIZED
-        || request.getMaxMatches() < 0
-        || request.getMaxMatches() > 10000) {
-      throw new IllegalArgumentException("Invalid deletion limits or write concern");
+    if (request.getWriteConcern() == DocumentWriteConcern.UNRECOGNIZED) {
+      throw new IllegalArgumentException("Invalid write concern");
     }
     boolean all = request.getSelectorCase() == DeleteByQueryRequest.SelectorCase.MATCH_ALL;
     boolean vector =
@@ -162,74 +158,74 @@ final class StandaloneDeleteByQuery {
         var generation = lease.index().getGenerationId();
         String id = generation.uniqueString();
         long revision = lease.index().getDefinition().getDefinitionVersion().orElse(1L);
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        var context = Context.current();
         Runnable check =
             () -> {
-              if (Context.current().isCancelled()) {
+              if (context.isCancelled()) {
                 throw Status.CANCELLED.asRuntimeException();
-              }
-              if (System.nanoTime() >= deadline) {
-                throw Status.DEADLINE_EXCEEDED.asRuntimeException();
               }
               if (lease.retired()) {
                 throw Status.FAILED_PRECONDITION.asRuntimeException();
               }
             };
-        var ids = new LinkedHashSet<ByteString>();
-        long[] bytes = {0};
-        long ceiling = request.getMaxMatches() == 0 ? 10000 : request.getMaxMatches();
-        lease
-            .index()
-            .getReader()
-            .collectDocumentIds(
-                predicate,
-                vector,
-                all,
-                value -> {
-                  StandaloneBson.mutation(
-                      value,
-                      true,
-                      this.runtime.config().documentLimits().maxDocumentBytes(),
-                      this.runtime.config().documentLimits().maxDepth());
-                  var encoded = ByteString.copyFrom(value);
-                  if (!ids.contains(encoded)) {
-                    if (ids.size() >= ceiling || bytes[0] + value.length > 16 * 1024 * 1024) {
-                      throw Status.RESOURCE_EXHAUSTED
-                          .withDescription("Selection limit exceeded")
-                          .asRuntimeException();
-                    }
-                    ids.add(encoded);
-                    bytes[0] += value.length;
-                  }
-                },
-                check);
-        var list = new ArrayList<>(ids);
-        int batchSize = Math.min(100, this.runtime.config().documentLimits().maxBatchDocuments());
-        if (!request.getDryRun()) {
-          for (@Var int start = 0; start < list.size(); ) {
-            @Var int end = start;
-            @Var long batchBytes = 0;
-            while (end < list.size()
-                && end - start < batchSize
-                && batchBytes + list.get(end).size()
-                    <= this.runtime.config().documentLimits().maxBatchBytes()) {
-              batchBytes += list.get(end++).size();
+        var limits = this.runtime.config().documentLimits();
+        int batchSize = Math.min(100, limits.maxBatchDocuments());
+        // Each live root appears once in a pinned reader, and ID routing assigns it to one
+        // partition. Keeping a global set of every selected ID would defeat bounded streaming.
+        class DeleteBatches implements IndexReader.DocumentIdConsumer {
+          private final ArrayList<byte[]> batch = new ArrayList<>();
+          private long batchBytes;
+
+          @Override
+          public void accept(byte[] value) {
+            check.run();
+            StandaloneBson.validateEncodedId(value, limits.maxDocumentBytes(), limits.maxDepth());
+            if (request.getDryRun()) {
+              return;
             }
-            if (end == start) {
-              throw Status.RESOURCE_EXHAUSTED.asRuntimeException();
+            if (this.batchBytes + value.length > limits.maxBatchBytes()) {
+              flush();
             }
-            var batch = list.subList(start, end);
-            start = end;
-            this.runtime.checkWriteAdmission(request.getSerializedSize());
-            ingestion.write(
-                request.getIndexId(),
-                () -> requireRevision(request.getIndexId(), revision),
-                id,
-                batch,
-                true,
-                DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED);
+            this.batch.add(value);
+            this.batchBytes += value.length;
+            if (this.batch.size() >= batchSize) {
+              flush();
+            }
+          }
+
+          @Override
+          public void finish() {
+            flush();
+          }
+
+          private void flush() {
+            check.run();
+            if (this.batch.isEmpty()) {
+              return;
+            }
+            StandaloneDeleteByQuery.this.runtime.checkWriteAdmission(request.getSerializedSize());
+            var previous = context.attach();
+            try {
+              ingestion.deleteDocuments(
+                  request.getIndexId(),
+                  () -> requireRevision(request.getIndexId(), revision),
+                  id,
+                  this.batch,
+                  check);
+            } finally {
+              context.detach(previous);
+            }
+            this.batch.clear();
+            this.batchBytes = 0;
+            check.run();
           }
         }
+
+        long matched =
+            lease
+                .index()
+                .getReader()
+                .collectDocumentIds(predicate, vector, all, DeleteBatches::new, check);
         ingestion.completeWrite(
             request.getIndexId(),
             () -> requireRevision(request.getIndexId(), revision),
@@ -241,8 +237,8 @@ final class StandaloneDeleteByQuery {
             .setIndexId(request.getIndexId())
             .setGenerationId(id)
             .setActiveRevision(revision)
-            .setMatchedCount(ids.size())
-            .setProcessedCount(request.getDryRun() ? 0 : ids.size())
+            .setMatchedCount(matched)
+            .setProcessedCount(request.getDryRun() ? 0 : matched)
             .setDryRun(request.getDryRun())
             .build();
       } catch (IndexSearcher.TooManyClauses | TooComplexToDeterminizeException e) {

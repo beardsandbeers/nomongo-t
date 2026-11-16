@@ -24,6 +24,7 @@ java_library(
         "LuceneAggregationSearchManager.java",
         "LuceneBoundaryFacetMetaBucketProducer.java",
         "LuceneCachingVectorSearchManager.java",
+        "LuceneDocumentIdCollector.java",
         "LuceneDrillSideways.java",
         "LuceneFacetCollectorMetaBatchProducer.java",
         "LuceneFacetCollectorMetaBatchProducerFactory.java",

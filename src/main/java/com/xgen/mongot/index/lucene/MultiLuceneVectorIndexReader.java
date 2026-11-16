@@ -59,6 +59,22 @@ public class MultiLuceneVectorIndexReader implements VectorIndexReader {
   // If this is slow, we can explore querying each underlying LuceneVectorIndexReader with a
   // lowered limit.
   @Override
+  public long collectDocumentIds(
+      org.bson.BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Supplier<DocumentIdConsumer> consumers,
+      Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    @Var long count = 0;
+    for (var reader : this.readers) {
+      check.run();
+      count += reader.collectDocumentIds(predicate, vector, all, consumers, check);
+    }
+    return count;
+  }
+
+  @Override
   public void collectDocumentIds(
       org.bson.BsonDocument predicate,
       boolean vector,

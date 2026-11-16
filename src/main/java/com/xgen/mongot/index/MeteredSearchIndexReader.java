@@ -22,6 +22,17 @@ import org.apache.lucene.util.BytesRef;
 public class MeteredSearchIndexReader implements SearchIndexReader {
 
   @Override
+  public long collectDocumentIds(
+      org.bson.BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Supplier<DocumentIdConsumer> consumers,
+      Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    return this.indexReader.collectDocumentIds(predicate, vector, all, consumers, check);
+  }
+
+  @Override
   public void collectDocumentIds(
       org.bson.BsonDocument predicate,
       boolean vector,

@@ -121,7 +121,6 @@ class Index:
         match_all=False,
         concern="visible",
         generation_id="",
-        max_matches=0,
         dry_run=False,
         timeout=None,
     ) -> api.DeleteByQueryResponse:
@@ -141,7 +140,6 @@ class Index:
                 index_id=self.index_id,
                 generation_id=generation_id,
                 write_concern=_concern(concern),
-                max_matches=max_matches,
                 dry_run=dry_run,
                 **selectors,
             ),

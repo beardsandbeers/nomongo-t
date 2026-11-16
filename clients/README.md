@@ -320,7 +320,6 @@ artifacts independently using `scripts/standalone/verify_release.py`. Neither pu
 result = client.delete_by_query(api.DeleteByQueryRequest(
     index_id=index.index_id,
     search_query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}}),
-    max_matches=1000,
     dry_run=False,
 ))
 print(result.matched_count, result.processed_count)
@@ -328,7 +327,14 @@ print(result.matched_count, result.processed_count)
 
 Java and TypeScript expose `deleteByQuery(request)`; Rust exposes
 `delete_by_query(request).await?`. Vector indexes accept `vector_filter_bson` with the contents
-of their metadata filter. Set `match_all=True` to select all documents within the operation's
-limits. A dry run returns the selection count without deleting. Both query and write roles are
-required. Concurrent ingestion can leave matches; rerun the query for another pass. Counts
-represent selected and processed IDs, rather than confirmed removals under concurrent writes.
+of their metadata filter. Set `match_all=True` to select all documents. Requests always exhaust
+matching roots in the pinned readers; there is no `max_matches` argument. Upgrade/regenerate old
+SDKs to remove that retired option. Old protobuf messages carrying its field cannot impose a
+ceiling on a new server. Servers predating exhaustive streaming still need an upgrade.
+
+IDs stream through bounded collectors into native bulk deletes. RPC deadlines still apply.
+A dry run counts all matches without retaining IDs or deleting documents. Both query and write
+roles are required. New matching documents inserted after a reader was pinned may survive
+normally; the operation does not chase concurrent inserts or rescan automatically. A later pass
+is optional. Scan/write failures and cancellation can leave partial deletions. Counts represent
+selected and processed IDs, rather than confirmed removals under concurrent writes.

@@ -40,6 +40,64 @@ import org.mockito.ArgumentCaptor;
 
 public class ApiIngestionManagerTest {
   @Test
+  public void retired_scanCheck_doesNotAcquireIngestionMonitorAndObservesDrop() throws Exception {
+    try (var f = new Fixture();
+        var caller = Executors.newSingleThreadExecutor()) {
+      java.util.concurrent.CompletableFuture<Void> retirement;
+      try (var lease = f.manager.acquireStatisticsLease(f.generation.getGenerationId())) {
+        var retired =
+            f.manager.coordinate(
+                () ->
+                    java.util.concurrent.CompletableFuture.supplyAsync(lease::retired, caller)
+                        .orTimeout(5, TimeUnit.SECONDS)
+                        .join());
+        retirement = f.manager.dropIndex(f.generation.getGenerationId());
+
+        assertThat(retired).isFalse();
+        assertThat(lease.retired()).isTrue();
+        assertThat(retirement.isDone()).isFalse();
+      }
+      assertThat(retirement.isDone()).isTrue();
+    }
+  }
+
+  @Test
+  public void deleteDocuments_nativeFailure_preservesDirtyTrackingAndReleasesLease()
+      throws Exception {
+    try (var f = new Fixture()) {
+      doAnswer(
+              invocation -> {
+                assertThat(Thread.holdsLock(f.manager)).isFalse();
+                throw new java.io.IOException("injected native deletion failure");
+              })
+          .when(f.writer)
+          .deleteDocuments(any(), any(), any());
+      String id = f.generation.getGenerationId().indexId.toHexString();
+      String generation = f.generation.getGenerationId().uniqueString();
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.manager.deleteDocuments(
+                      id,
+                      () -> f.generation.getDefinition().getDefinitionVersion().orElse(1L),
+                      generation,
+                      List.of(Fixture.bson("a").toByteArray()),
+                      () -> {}));
+      f.manager.completeWrite(
+          id,
+          () -> f.generation.getDefinition().getDefinitionVersion().orElse(1L),
+          generation,
+          DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED);
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      verify(f.writer).commit(EncodedUserData.EMPTY);
+      assertThat(f.manager.dropIndex(f.generation.getGenerationId()).isDone()).isTrue();
+    }
+  }
+
+  @Test
   public void writeAsync_cancelledResponse_retainsLeaseUntilWorkDrains() throws Exception {
     try (var f = new Fixture()) {
       var entered = new CountDownLatch(1);

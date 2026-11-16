@@ -76,6 +76,23 @@ public class MultiLuceneIndexWriter implements LuceneIndexWriter {
   }
 
   @Override
+  public void deleteDocuments(
+      List<byte[]> encodedIds, Runnable check, java.util.function.IntConsumer applied)
+      throws IOException {
+    var partitions = new java.util.ArrayList<List<byte[]>>(this.indexWriters.size());
+    for (int i = 0; i < this.indexWriters.size(); i++) {
+      partitions.add(new java.util.ArrayList<>());
+    }
+    for (var id : encodedIds) {
+      check.run();
+      partitions.get(getIndexPartitionId(id)).add(id);
+    }
+    for (int i = 0; i < partitions.size(); i++) {
+      this.indexWriters.get(i).deleteDocuments(partitions.get(i), check, applied);
+    }
+  }
+
+  @Override
   public void commit(EncodedUserData userData) throws IOException {
     // We commit the userData in the reverse order.
     // So that the first LuceneIndexWriter is the last one to be committed.

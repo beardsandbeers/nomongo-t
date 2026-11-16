@@ -142,22 +142,36 @@ strict INSERT, request-ID deduplication, or replay endpoint.
 
 ### Delete by query
 
-`DocumentService.DeleteByQuery` selects IDs and deletes them in batches from one index. Its
+`DocumentService.DeleteByQuery` streams matching IDs into bounded delete batches from one index. Its
 write concern defaults to `VISIBLE`; the `INDEXED` default for Upsert/Delete does not change
 DeleteByQuery completion. Supply
 exactly one selector: `search_query_bson` containing a search operator, `vector_filter_bson`
 containing a vector metadata filter, or `match_all: true`. Both `write` and `query` roles and an
 index grant are required. Nested and namespaced vector indexes are currently unsupported.
 
-Selection is bounded to 10,000 distinct source IDs, 16 MiB of encoded IDs, and five seconds.
-`max_matches` can lower the document ceiling; exceeding a selection limit applies no deletes.
-`dry_run` returns the selected count without deletion. `processed_count` counts applied ID
-operations, including concurrently removed IDs. The optional generation fence and existing
-write concerns are supported.
+Every successful request exhausts the matching roots in each pinned reader. There is no document
+limit option or fixed total-match, total-ID-byte, or five-second scan limit. `max_matches` has
+been removed; its protobuf field number and name are reserved. Older messages carrying that
+retired field cannot limit deletion. Upgrade older servers that still impose selection caps.
 
-Ingestion continues during selection and between batches. Concurrent inserts can survive;
-replacements of selected IDs can be deleted. Rerun the predicate for another pass if matches
-remain. Failures after application starts may leave partial changes. See the
+Search and vector collectors use the existing bounded concurrent search executor when available,
+with a serial fallback. The standalone launcher provisions that pool by default. Each collector
+holds at most 100 IDs, further bounded by the configured batch document and byte limits, and
+flushes at leaf completion. Native term deletes run once per nonempty partition batch through
+normal ingestion leases and dirty tracking. Buffers and outstanding writes are bounded by active
+collectors, independently of total matches. The final requested refresh/commit runs after all
+workers and writes drain.
+
+`dry_run` counts every matching root without retaining IDs or deleting documents. `processed_count`
+counts applied source-ID operations, including concurrently removed IDs. Generation fences and
+the existing write concerns are supported. The effective client/server RPC deadline still applies;
+cancellation and scan/write failures return errors and may leave earlier batches deleted.
+
+Ingestion continues during scanning and between batches. Each partition uses a pinned reader,
+so the operation's own deletes do not skip later matches. Documents added after that reader was
+pinned may survive; this is expected and does not require automatic rescanning or a zero-match
+live query before success. Replacements of selected IDs can be deleted. An additional pass is
+optional when callers want to select newer matches. See the
 [design](standalone-delete-by-query-design.md) for predicate syntax and completion semantics.
 
 ### Join filters

@@ -741,7 +741,6 @@ class DeleteByQueryRequest(_message.Message):
         "match_all",
         "generation_id",
         "write_concern",
-        "max_matches",
         "dry_run",
     )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
@@ -750,7 +749,6 @@ class DeleteByQueryRequest(_message.Message):
     MATCH_ALL_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     WRITE_CONCERN_FIELD_NUMBER: _ClassVar[int]
-    MAX_MATCHES_FIELD_NUMBER: _ClassVar[int]
     DRY_RUN_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     search_query_bson: bytes
@@ -758,7 +756,6 @@ class DeleteByQueryRequest(_message.Message):
     match_all: bool
     generation_id: str
     write_concern: DocumentWriteConcern
-    max_matches: int
     dry_run: bool
     def __init__(
         self,
@@ -768,7 +765,6 @@ class DeleteByQueryRequest(_message.Message):
         match_all: _Optional[bool] = ...,
         generation_id: _Optional[str] = ...,
         write_concern: _Optional[_Union[DocumentWriteConcern, str]] = ...,
-        max_matches: _Optional[int] = ...,
         dry_run: _Optional[bool] = ...,
     ) -> None: ...
 

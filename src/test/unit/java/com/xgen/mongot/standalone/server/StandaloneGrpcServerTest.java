@@ -40,6 +40,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -408,6 +410,84 @@ public class StandaloneGrpcServerTest {
               DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build());
 
       assertThat(result.getProcessedCount()).isEqualTo(4);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_moreThanTenThousandMatches_streamsWholeEmbeddedBlocks()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "delete-large",
+              "{numPartitions:2,mappings:{dynamic:true,fields:{"
+                  + "items:{type:'embeddedDocuments',dynamic:true}}}}");
+      f.upsertMany(id, 10001, i -> "{_id:" + i + ",items:[{value:'remove'},{value:'remove'}]}");
+      f.upsert(id, "{_id:'keep',title:'tea'}");
+      var request =
+          DeleteByQueryRequest.newBuilder()
+              .setIndexId(id)
+              .setSearchQueryBson(
+                  bson(
+                      "{embeddedDocument:{path:'items',operator:{"
+                          + "text:{path:'items.value',query:'remove'}}}}"));
+
+      var preview = f.docs.deleteByQuery(request.clone().setDryRun(true).build());
+      assertThat(preview.getMatchedCount()).isEqualTo(10001);
+      assertThat(preview.getProcessedCount()).isEqualTo(0);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(10002);
+
+      var deleted = f.docs.deleteByQuery(request.build());
+
+      assertThat(deleted.getMatchedCount()).isEqualTo(10001);
+      assertThat(deleted.getProcessedCount()).isEqualTo(10001);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+      assertThat(f.stats(id).getLuceneDocumentCount()).isEqualTo(1);
+      assertThat(f.results(id, "tea").getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_moreThanSixteenMiBOfIds_streamsAcrossByteBudget() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-large-ids", "{mappings:{dynamic:false}}");
+      String prefix = "x".repeat(20000);
+      f.upsertMany(id, 1000, i -> "{_id:'" + prefix + i + "'}");
+
+      var deleted =
+          f.docs.deleteByQuery(
+              DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build());
+
+      assertThat(deleted.getMatchedCount()).isEqualTo(1000);
+      assertThat(deleted.getProcessedCount()).isEqualTo(1000);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void deleteByQuery_retiredLimitField_isIgnoredAndDeletesAllMatches() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delete-retired-limit");
+      f.upsertMany(id, 201, i -> "{_id:" + i + ",title:'coffee'}");
+      var oldField =
+          com.google.protobuf.UnknownFieldSet.newBuilder()
+              .addField(
+                  7, com.google.protobuf.UnknownFieldSet.Field.newBuilder().addVarint(1).build())
+              .build();
+      var request =
+          DeleteByQueryRequest.newBuilder()
+              .setIndexId(id)
+              .setMatchAll(true)
+              .setUnknownFields(oldField);
+
+      var preview = f.docs.deleteByQuery(request.clone().setDryRun(true).build());
+      var deleted = f.docs.deleteByQuery(request.build());
+
+      assertThat(preview.getMatchedCount()).isEqualTo(201);
+      assertThat(preview.getProcessedCount()).isEqualTo(0);
+      assertThat(deleted.getMatchedCount()).isEqualTo(201);
+      assertThat(deleted.getProcessedCount()).isEqualTo(201);
       assertThat(f.stats(id).getDocumentCount()).isEqualTo(0);
     }
   }
@@ -839,35 +919,6 @@ public class StandaloneGrpcServerTest {
       assertThat(deleted.getProcessedCount()).isEqualTo(1);
       assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
       assertThat(f.docs.deleteByQuery(request.build()).getMatchedCount()).isEqualTo(0);
-    }
-  }
-
-  @Test
-  public void deleteByQuery_exceedsCeiling_deletesNothing() throws Exception {
-    try (var f = new Fixture(data())) {
-      String id = f.create("delete-ceiling");
-      f.upsert(id, "{_id:'a',title:'coffee'}");
-      f.upsert(id, "{_id:'b',title:'coffee'}");
-
-      var error =
-          assertThrows(
-              io.grpc.StatusRuntimeException.class,
-              () ->
-                  f.docs.deleteByQuery(
-                      DeleteByQueryRequest.newBuilder()
-                          .setIndexId(id)
-                          .setMatchAll(true)
-                          .setMaxMatches(1)
-                          .build()));
-
-      assertThat(error.getStatus().getCode()).isEqualTo(io.grpc.Status.Code.RESOURCE_EXHAUSTED);
-      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
-      assertThat(
-              f.docs
-                  .deleteByQuery(
-                      DeleteByQueryRequest.newBuilder().setIndexId(id).setMatchAll(true).build())
-                  .getProcessedCount())
-          .isEqualTo(2);
     }
   }
 
@@ -1826,20 +1877,23 @@ public class StandaloneGrpcServerTest {
     private Fixture(StandaloneConfig config, io.grpc.Metadata headers) throws Exception {
       this.runtime = new StandaloneRuntime(config);
       this.server = new StandaloneGrpcServer(this.runtime).start();
+      // Method timeouts start afresh for every RPC; a deadline stored on a stub is absolute.
       this.channel =
-          NettyChannelBuilder.forAddress("127.0.0.1", this.server.port()).usePlaintext().build();
+          NettyChannelBuilder.forAddress("127.0.0.1", this.server.port())
+              .usePlaintext()
+              .defaultServiceConfig(
+                  Map.of(
+                      "methodConfig", List.of(Map.of("name", List.of(Map.of()), "timeout", "45s"))))
+              .build();
       this.catalog =
           CatalogServiceGrpc.newBlockingStub(this.channel)
-              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
-              .withDeadlineAfter(45, TimeUnit.SECONDS);
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers));
       this.docs =
           DocumentServiceGrpc.newBlockingStub(this.channel)
-              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
-              .withDeadlineAfter(45, TimeUnit.SECONDS);
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers));
       this.queries =
           QueryServiceGrpc.newBlockingStub(this.channel)
-              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers))
-              .withDeadlineAfter(45, TimeUnit.SECONDS);
+              .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers));
     }
 
     private String create(String name) throws Exception {
@@ -1885,6 +1939,26 @@ public class StandaloneGrpcServerTest {
                           .build())
                   .getIndexedCount())
           .isEqualTo(1);
+    }
+
+    private void upsertMany(String id, int count, java.util.function.IntFunction<String> document) {
+      IntStream.range(0, (count + 999) / 1000)
+          .forEach(
+              batch -> {
+                var documents =
+                    IntStream.range(batch * 1000, Math.min(count, (batch + 1) * 1000))
+                        .mapToObj(i -> bson(document.apply(i)))
+                        .toList();
+                assertThat(
+                        this.docs
+                            .upsert(
+                                UpsertRequest.newBuilder()
+                                    .setIndexId(id)
+                                    .addAllDocumentsBson(documents)
+                                    .build())
+                            .getIndexedCount())
+                    .isEqualTo(documents.size());
+              });
     }
 
     private IndexStats stats(String id) {

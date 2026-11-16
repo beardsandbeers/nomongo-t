@@ -35,23 +35,17 @@ import com.xgen.mongot.util.concurrent.LockGuard;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
-import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.IndexSearcher;
-import org.apache.lucene.search.ScoreMode;
-import org.apache.lucene.search.SimpleCollector;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.bson.BsonArray;
 import org.bson.BsonDocument;
-import org.jetbrains.annotations.Nullable;
 
 @SuppressWarnings("GuardedBy") // Uses LockGuard instead
 public class LuceneVectorIndexReader implements VectorIndexReader {
@@ -131,6 +125,29 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
   public void collectDocumentIds(
       BsonDocument predicate, boolean vector, boolean all, Consumer<byte[]> ids, Runnable check)
       throws IOException, ReaderClosedException, InvalidQueryException {
+    collectDocumentIds(predicate, vector, all, () -> ids::accept, check, Optional.empty());
+  }
+
+  @Override
+  public long collectDocumentIds(
+      BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Supplier<DocumentIdConsumer> consumers,
+      Runnable check)
+      throws IOException, ReaderClosedException, InvalidQueryException {
+    return collectDocumentIds(
+        predicate, vector, all, consumers, check, this.concurrentSearchExecutor);
+  }
+
+  private long collectDocumentIds(
+      BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Supplier<DocumentIdConsumer> consumers,
+      Runnable check,
+      Optional<NamedExecutorService> executor)
+      throws IOException, ReaderClosedException, InvalidQueryException {
     if (!all && !vector) {
       throw new IllegalArgumentException("Predicate type does not match reader");
     }
@@ -163,37 +180,7 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
                 .add(query, org.apache.lucene.search.BooleanClause.Occur.FILTER)
                 .add(roots, org.apache.lucene.search.BooleanClause.Occur.FILTER)
                 .build();
-        searcher.search(
-            selected,
-            new SimpleCollector() {
-              @Nullable private StoredFields fields;
-
-              @Override
-              protected void doSetNextReader(LeafReaderContext context) throws IOException {
-                check.run();
-                this.fields = context.reader().storedFields();
-              }
-
-              @Override
-              public void collect(int doc) throws IOException {
-                check.run();
-                var value =
-                    java.util.Objects.requireNonNull(this.fields)
-                        .document(doc, Set.of(FieldName.MetaField.ID.getLuceneFieldName()))
-                        .getBinaryValue(FieldName.MetaField.ID.getLuceneFieldName());
-                if (value == null) {
-                  throw new IOException("Missing document ID");
-                }
-                ids.accept(
-                    Arrays.copyOfRange(value.bytes, value.offset, value.offset + value.length));
-              }
-
-              @Override
-              public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-              }
-            });
-        check.run();
+        return LuceneDocumentIdCollector.collect(searcher, selected, consumers, check, executor);
       }
     }
   }

@@ -1,30 +1,44 @@
 # Standalone delete by query design
 
-Status: Bounded synchronous API implemented. Phase metrics and limit tuning remain follow-up work.
+Status: Exhaustive streaming, native bulk term deletes, and parallel segment collectors are
+implemented. The retired `max_matches` field is reserved. Phase metrics remain follow-up work.
 
 Add `DocumentService.DeleteByQuery` to delete all source documents matching a predicate in one
 standalone index. Support search operators on search indexes and metadata filters on vector
 indexes. Preserve the existing generation fence, authorization model, and write concerns.
 
-The first version is a bounded, synchronous operation: refresh readers, collect the complete
-set of matching IDs, then delete those IDs in batches through the existing ingestion pipeline.
-Ingestion continues during selection and can interleave with delete batches. Concurrent writes
-may leave matching documents behind; callers can rerun the same query if they want another pass.
-There is no document version checking or coordination across the whole operation.
+The operation is synchronous and streams matching root IDs from pinned readers into bounded
+batches through the existing ingestion pipeline. It does not retain the complete selection or
+impose a fixed total-match or total-ID-byte cap. Ingestion continues during scanning and can
+interleave with delete batches. Concurrent writes may leave matching documents behind; callers
+can rerun the same query if they want another pass. There is no document version checking or
+coordination across the whole operation.
 
-Reject selections that exceed resource limits before deleting anything. Failures during
-application can leave partial changes, as with existing writes. Acquire generation leases for batch writes and final completion, and keep a selection lease
-while reader resources are in use. Catalog checks use the ingestion monitor; writes, refresh,
-and commits run outside it. Large purges require narrower predicates initially; background jobs remain
-separate follow-up work.
+Every successful deletion must exhaust all matching source documents visible in the readers
+pinned for that operation. Clients must not specify an upper bound, and the target API has no
+optional or required total-match ceiling. Documents added after a partition's reader was pinned
+may survive the pass; that is expected and does not make a completed deletion unsuccessful.
+The operation does not chase new writes or repeatedly rescan until the live index has no matches.
+
+Scan failures, cancellation, and write failures can leave earlier batches deleted. Acquire
+generation leases for batch writes and final completion, and
+keep a selection lease while reader resources are in use. Catalog checks use the ingestion
+monitor; writes, refresh, and commits run outside it. The effective RPC deadline still applies;
+background jobs remain separate follow-up work.
 
 ## Current behavior and motivation
 
 Standalone is push-only. It has no authoritative source document store, mutation log, or durable
-request ledger. For search indexes, applications currently have to run `Search`, page through
-IDs, and submit `Delete` batches. This API moves that work into the server and avoids transferring
+request ledger. Before this RPC, search-index applications had to run `Search`, page through IDs, and submit
+`Delete` batches. This API moves that work into the server and avoids transferring
 IDs to the client. It accepts the same races with concurrent ingestion as that client-side loop.
 The public vector API has no exhaustive filter-only selection operation.
+
+Matching root IDs stream from pinned readers into independent bounded collector buffers. The
+writer layer submits native term batches through `ApiIngestionManager` leases, admission, dirty
+tracking, and failure handling. Collection uses the existing bounded search executor when it is
+available; the standalone launcher enables that executor by default. A serial fallback preserves
+operation with upstream configurations that do not provision it.
 
 The relevant implementation is:
 
@@ -64,16 +78,20 @@ with `indexNamespace` are rejected until the API explicitly carries and validate
 selection. These restrictions also apply to dry runs; the index namespace restriction applies
 to `match_all` as well.
 
-## Proposed API
+## API
 
-Add a unary RPC and new messages to the existing `mongot.standalone.v1` package. Existing messages
-and RPCs retain their behavior.
+The unary RPC retains the selectors, generation fence, write concern, dry run, and response
+counts. The former `max_matches` field is removed; its number 7 and name are reserved. Older
+messages carrying that field cannot cap deletion. Regenerate or upgrade SDKs to remove the old
+option. Servers predating exhaustive streaming require an upgrade to provide this contract.
 
 ```proto
-// Added to DocumentService.
 rpc DeleteByQuery(DeleteByQueryRequest) returns (DeleteByQueryResponse);
 
 message DeleteByQueryRequest {
+  reserved 7;
+  reserved "max_matches";
+
   string index_id = 1;
   oneof selector {
     bytes search_query_bson = 2; // One supported search operator; SEARCH indexes only.
@@ -82,7 +100,6 @@ message DeleteByQueryRequest {
   }
   string generation_id = 5; // Optional fence against a schema change.
   DocumentWriteConcern write_concern = 6; // VISIBLE by default.
-  uint64 max_matches = 7; // Zero uses the server limit; otherwise a lower safety ceiling.
   bool dry_run = 8;
 }
 
@@ -97,10 +114,10 @@ message DeleteByQueryResponse {
 ```
 
 Require exactly one selector. Missing selectors, empty BSON predicates, `match_all: false`,
-unknown write concerns, and a requested `max_matches` above the server limit are invalid.
-`max_matches` is a ceiling on the complete result, not a request to delete the first N matches.
-If the selection exceeds it, return `RESOURCE_EXHAUSTED` with no documents deleted. There is no
-ordering, cursor, truncation, or continuation token.
+and unknown write concerns are invalid. Selection is exhaustive: the API offers no upper limit,
+top-N deletion, successful truncation, pagination, or continuation token. Batch size and worker
+concurrency bound resources and must never limit the total number of matches processed. Dry runs
+also exhaust the operation's pinned readers to count all matching roots.
 
 `matched_count` counts distinct live source IDs in the selection's pinned readers, excluding
 embedded children and records already deleted in those readers. `processed_count` counts IDs
@@ -110,7 +127,7 @@ documents match at response time. This follows ID-based `Delete` rather than cla
 number of documents removed under concurrent writes.
 
 A zero-match request succeeds with both counts zero. A dry run performs the same validation,
-refresh, and bounded selection, but applies no deletes and does not commit; write concern has no
+refresh, and streaming selection, but applies no deletes and does not commit; write concern has no
 effect on a dry run. Dry runs do not reserve a result for a subsequent execution.
 
 ### Search predicates
@@ -184,11 +201,16 @@ selection. Concurrent mutations may or may not appear, depending on when that pa
 reader was acquired. The selected readers need not represent one common instant across all
 partitions. Once pinned, each reader's selection is stable.
 
-Apply selected IDs through ordinary delete batches, briefly acquiring the coordinator
-to validate the catalog and lease the generation before each batch. Do not re-evaluate the predicate or check document versions before deletion.
+Apply selected IDs through ordinary delete batches as scanning proceeds, briefly acquiring
+the coordinator to validate the catalog and lease the generation before each batch. The scan
+keeps its pinned reader while batches apply, so its own deletes do not change subsequent
+selection or require pagination. Do not re-evaluate the predicate or check document versions
+before deletion.
 The accepted behavior is:
 
-- A new match inserted after selection can survive this pass and be selected on the next pass.
+- A new match inserted after its partition's reader was pinned can survive this pass, even if
+  the scan has not yet reached that part of the index. This is expected snapshot behavior and
+  is not a deletion failure. A later explicitly requested pass may select that new document.
 - An upsert after an ID's deletion can recreate it, including with fields that still match.
 - A selected ID replaced before its deletion can be deleted even if the replacement no longer
   matches. Repeating the query can catch remaining matches; it does not restore that replacement.
@@ -196,6 +218,9 @@ The accepted behavior is:
 These races are part of the API contract. Callers can run the same predicate again when the
 remaining results do not meet their needs. Successful completion means the selected IDs were
 processed with the requested write concern, not that the predicate currently matches nothing.
+Every matching root visible in each pinned reader must be processed before success. The readers
+need not share one global point in time. There is no automatic rescan, tailing cursor, ingestion
+pause, or requirement that callers keep retrying while new matching documents arrive.
 
 Honor the caller's optional generation fence at admission. Even when it is omitted, bind the
 operation internally to the resolved generation and revision; recheck both against the catalog
@@ -211,106 +236,110 @@ their existing freshness semantics.
 ## Execution and implementation
 
 1. Authenticate, require both `WRITE` and `QUERY`, and require a grant for `index_id` before
-   looking up index metadata. The interceptor already enforces `WRITE` for `DocumentService`;
-   the new handler must also call `requireRole(QUERY)`. Counts and dry runs use the same roles.
-2. Admit the request through the bounded RPC dispatcher and the additional delete-by-query
-   capacity limit. Validate BSON structure, size, selector, operator allowlist, and request
-   options before taking the ingestion coordinator where possible.
-3. Briefly acquire the coordinator, recheck cancellation, resolve the catalog entry, desired
-   revision, live generation, and supported definition, check initial write/disk admission,
-   and acquire a generation lease. Capture the generation and revision, then release the lock.
-4. With the lease held, validate the predicate against that definition, refresh readers, and
-   acquire scoped selection snapshots. Compile against those readers and intersect with the
-   appropriate root-document filter. Collect matching root IDs outside the coordinator,
-   checking deadlines and resource budgets throughout.
-5. Finish selection across all partitions before any delete. Verify that collection exhausted
-   normally and did not time out, truncate, or terminate early. Validate collected ID encodings
-   before applying them. On a limit or selection error, release resources and fail without
-   deleting documents. A dry run rechecks the generation and revision and returns the count here.
-6. Close selection readers once IDs are materialized. Submit ordinary delete events in internal
-   batches within existing document and byte limits. Each batch checks disk admission,
-   then briefly acquires the coordinator to validate generation/revision and obtain a write lease.
-   It applies deletes outside the coordinator, checks cancellation between IDs, and advances the
-   generation's write version in a finally block so partial work remains eligible for commit.
-7. Acquire a completion lease while revalidating generation/revision and cancellation, then
-   complete the requested write concern outside the coordinator. Return counts and the selected
-   generation. Always close the lease and remaining readers outside the coordinator, and release
-   the capacity reservation, including on errors and failed response delivery.
+   looking up metadata. Counts and dry runs use the same roles and index grant.
+2. Admit the request through the bounded RPC dispatcher and existing delete-by-query capacity
+   limit. Validate BSON, selector/operator allowlists, write concern, and supported index type.
+3. Briefly acquire the ingestion coordinator, recheck cancellation, resolve the desired revision
+   and ready generation, perform initial write/disk admission, and acquire a generation lease.
+   Release the coordinator before refreshing or scanning.
+4. Refresh and pin one partition's reader. Compile the predicate and intersect with the root
+   filter. Use `CollectorManager` and `ScoreMode.COMPLETE_NO_SCORES` to exhaust segment slices
+   through the existing concurrent search executor; traverse partitions sequentially.
+5. Each collector owns its stored-fields reader and ID buffer. Validate copied encoded IDs once
+   at the collection boundary. Flush before exceeding the configured batch byte limit, on
+   reaching the lesser of 100 IDs and the batch document limit, and at successful leaf completion.
+   Dry runs count roots without retaining IDs or submitting writes.
+6. Each synchronous flush applies encoded IDs through `ApiIngestionManager.deleteDocuments`.
+   The existing indexing scheduler captures the request context and leases the generation before
+   queueing. Recheck revision, generation, cancellation, retirement, and write admission per batch.
+   The writer groups terms by partition and invokes Lucene once per nonempty partition batch.
+7. Drain collection and all admitted writes before releasing readers or the generation lease,
+   including after failure or interruption. Sum successful collector counts. Recheck generation
+   and revision and complete the requested final concern once, after all batches have applied.
+   A dry run performs the completion validation with `INDEXED` and does not refresh/commit deletes.
+8. Always release the capacity reservation, including on failed response delivery. On failure,
+   discard unsubmitted buffers and retain already applied deletes; never report partial success.
 
-Extract the shared event application and completion logic from `ApiIngestionManager.write` so
-both ID-based deletion and query deletion use the same dirty tracking, partition routing,
-writer-limit handling, and failure transitions. Internal batches apply outside catalog coordination
-with `INDEXED`; perform the requested refresh/commit only at final completion.
-Background refresh and commit may also occur between batches. A non-dry-run zero-match request
-still validates the generation and honors the requested completion boundary.
+A zero-match request still validates its generation and honors its completion boundary. Background
+refresh and commit may run between batches. Deletion does not reserve ingestion capacity or block
+ordinary writes across the scan.
 
-### Reader support
+### Native writer batches and lifecycle
 
-Add an internal, scoped root-ID collection capability to the Lucene reader layer. For search,
-extend the pinned snapshot pattern in
-[SearchIndexReader](../src/main/java/com/xgen/mongot/index/SearchIndexReader.java) and
-[LuceneSearchIndexReader](../src/main/java/com/xgen/mongot/index/lucene/LuceneSearchIndexReader.java).
-Its existing `collectKeys` method collects token-field strings for joins; it cannot substitute
-for typed source-ID collection. Add corresponding vector-reader support and multi-partition
-delegation. All partitions share one count, byte budget, and deadline.
+`IndexWriter.deleteDocuments` accepts a bounded list of encoded BSON source IDs, a cooperative
+check, and a callback reporting applied IDs. Its compatible default runs existing preparation
+hooks and ordinary delete events. `MeteredIndexWriter` delegates and accounts for each applied
+prefix, including before a later partition fails; staging/preparation capabilities remain visible.
 
-For vector indexes, expose filter-only compilation through the vector query factory, reusing
-[VectorSearchFilterQueryFactory](../src/main/java/com/xgen/mongot/index/lucene/query/VectorSearchFilterQueryFactory.java).
-Do not fabricate a vector query with an oversized `limit`. Apply a root filter even when a
-negative predicate could otherwise match children. Reject predicates under `nestedRoot` before
-compilation rather than treating them as root fields that happen to return no results.
+`SingleLuceneIndexWriter` creates terms directly from the encoded bytes and invokes
+`IndexWriter.deleteDocuments(Term...)` once under its normal shutdown shared lock.
+`MultiLuceneIndexWriter` routes encoded IDs with the existing hash and delegates partition groups.
+No ID round trip through BSON values or ordinary document events is needed in the native path.
+All Lucene documents sharing an encoded source ID, including embedded children, are removed.
+String, ObjectId, int32, and int64 identities remain distinct.
 
-Use an exhaustive collector with `ScoreMode.COMPLETE_NO_SCORES`, not a top-hits collector or a
-public cursor. Lucene's default top-hits APIs can report a lower-bound hit count, so that value
-cannot establish completion or enforce an exact deletion ceiling.
-See [IndexSearcher](https://lucene.apache.org/core/10_4_0/core/org/apache/lucene/search/IndexSearcher.html).
+`ApiIngestionManager` shares the existing write scheduling and application lifecycle between
+ordinary writes and encoded delete batches. Dirty tracking advances in a finally block even when
+application fails. Required writer-limit checks occur once per native batch. Disk admission,
+index ownership, generation/revision fencing, and index failure transitions remain in place.
+Internal batches use `INDEXED`; final refresh or commit runs only after all work drains.
 
-Read only the stored internal ID field; do not deserialize stored source. Preserve the exact
-encoded BSON ID bytes using
-[LuceneDocumentIdEncoder](../src/main/java/com/xgen/mongot/index/lucene/util/LuceneDocumentIdEncoder.java).
-Use byte equality for deduplication, and copy the actual `BytesRef` slice before retaining it.
-String, ObjectId, int32, and int64 identities must remain distinct, including int32 and int64
-with the same numeric value. Apply deletes through `DocumentEvent.createDelete` using the decoded
-typed value. The existing writer removes the root and all children carrying that ID.
+### Parallel reader ownership and cancellation
 
-Reuse the existing `ApiIngestionManager.IndexLease` mechanism as the generation lease
-for selection and statistics. Retirement may mark the generation unavailable immediately,
-but physical resource close waits for its leases to drain. Check retirement between selection
-phases and before applying batches. Close pinned readers before releasing the lease, and complete
-lease-drain futures outside the ingestion monitor, following the existing implementation. This
-resource protection does not add document conflict detection or serialize concurrent ingestion.
+Search and vector readers share `LuceneDocumentIdCollector`. Each search slice receives its own
+`DocumentIdConsumer`; each successful leaf finishes and clears its buffer during execution.
+Reduction retains counts only, independent of total matches. The legacy sequential consumer
+method remains available for callers that require serial callbacks.
+
+The existing search pool bounds active collectors, and synchronous batch submissions provide
+backpressure against the separate indexing scheduler. There is no task per match, unbounded list
+of batch futures, global ID set, or shared match ceiling. The pinned reader has one live root per
+source ID, and deterministic partition routing prevents duplicates across partitions. Retained
+ID payload is bounded by active collector buffers and admitted batch work, not by total matches
+or the number of segments. A serial fallback uses the same exhaustive collector semantics.
+
+Capture the gRPC context in the request's cancellation check and attach it when submitting batch
+writes. A volatile generation-retirement flag makes hot scan checks independent of the ingestion
+monitor; batch admission still performs the full generation and revision checks. Query timeout hooks also invoke this check, including during scans with few matches.
+The first slice failure stops other workers cooperatively, including failures in scorer
+construction or scoring outside collector callbacks. Each slice publishes its failure before
+Lucene waits for other tasks, preserving the original error. A local executor scope prevents
+queued callbacks from starting after close and drains running callbacks before returning to the
+reader owner, including if waiting on search futures is interrupted. Readers remain pinned and
+the generation lease stays held until that draining finishes.
+
+Vector selection reuses filter-only compilation through the existing vector query factory; it
+does not fabricate an oversized nearest-neighbor query. Root filtering remains mandatory.
+Nested/namespaced vector indexes retain their existing rejection at admission.
 
 ## Limits and cancellation
 
-Proposed initial limits are conservative defaults to validate with benchmarks:
-
-| Limit | Proposed value and behavior |
+| Limit | Value and behavior |
 | --- | --- |
-| Predicate BSON | 1 MiB and depth 100, matching the current standalone query boundary. |
-| Selected source IDs | 10,000 per operation, lowered by a nonzero `max_matches`. Detect the next distinct match and fail before application. |
-| Retained IDs | 16 MiB of copied encoded ID payload, plus bounded per-ID bookkeeping. Reject before retaining bytes beyond the budget. |
-| Selection duration | 5 seconds from lease acquisition, including refresh and query construction, further bounded by the RPC deadline. |
-| Total duration | The existing effective client/server RPC deadline, checked during selection, application, and before completion. |
+| Predicate BSON | 1 MiB and depth 100, matching the standalone query boundary. |
+| Total matching roots | Exhaust all matches in the pinned readers. No total-document ceiling or client limit option. |
+| Buffered IDs | At most 100 per active collector, further bounded by configured batch document and byte limits. Dry runs retain no IDs. |
+| Scan duration | No separate five-second timeout. The effective client/server RPC deadline applies. |
 | Concurrent operations | One admitted delete-by-query operation per process, including dry runs. Additional requests fail with `RESOURCE_EXHAUSTED`. |
 
-The initial implementation uses fixed count, retained-byte, and selection-duration limits.
-A configurable `ingestion.deleteByQuery` object can follow when operational needs require it. Keep one admitted operation initially to bound
-aggregate collection memory and scan work. Acquire its reservation when execution starts and release it on completion. This limit does not reserve ingestion
-capacity or prevent ordinary writes during selection.
+The capacity reservation is acquired when execution starts and released on completion. It bounds
+concurrent scan work without reserving ingestion capacity or preventing ordinary writes.
+The active ID buffers are independent of the total number or total encoded size of matches.
+Lucene's pinned readers, query machinery, and buffered deletes still consume working memory
+under the existing reader/writer settings; the collector bound is not a total-process heap bound.
 
-Request byte accounting alone does not bound the generated ID list or Lucene query allocations.
-Bound IDs independently and retain existing query clause/automaton safeguards. Check cancellation
-at partition/leaf boundaries and between collected IDs, and use query execution timeout hooks
-so a large scan with few matches can also stop. Query rewrite and expensive construction paths
-must propagate cancellation or reject the unsupported expensive form before shipping. A partial
-search result must never proceed to deletion.
+Retain existing query clause/automaton safeguards. Check cancellation at partition/leaf boundaries
+and between collected IDs, and use query timeout hooks so a large scan with few matches can also
+stop. The callback checks cancellation and retirement before and after each batch. A failed scan
+never returns a successful partial count, although earlier delete batches can remain applied.
 
 The time limits are cooperative, not hard latency guarantees. Waiting to enter the existing Java
 monitor cannot be cancelled, and a Lucene refresh, write, or commit already in progress may
 overrun a deadline. Recheck cancellation immediately after monitor acquisition and every such
 call; do not continue mutation work after observing it. Retain admission capacity until server
-work actually stops. The selection timeout runs without holding the ingestion lock. Writes and refresh/commit can still compete for CPU, memory, and disk,
-and shared RPC workers remain a source of contention.
+work actually stops. Scanning and deadline checks run without holding the ingestion lock.
+Writes and refresh/commit can still compete for CPU, memory, and disk, and shared RPC workers
+remain a source of contention.
 
 Retain existing disk admission for deletion: applying and committing deletes can require disk
 headroom. This API is not an emergency way to recover a full volume. It schedules no force
@@ -340,8 +369,8 @@ that all partitions reached the requested concern.
 | Selector incompatible with index type or unsupported namespace definition | `FAILED_PRECONDITION`; no deletes. |
 | Stale or replaced generation | `FAILED_PRECONDITION`; no deletes at admission, potentially partial changes if replaced between batches. |
 | Initializing or transitioning generation | `UNAVAILABLE`; no deletes at admission, potentially partial changes if a transition starts between batches. |
-| Admission, disk, selection count/bytes, or query complexity limit | `RESOURCE_EXHAUSTED`; no deletes when rejected before application. |
-| Selection duration or RPC deadline; caller cancellation | `DEADLINE_EXCEEDED` or `CANCELLED`; no deletes if still selecting, potentially partial changes after application starts. |
+| Admission, disk, or query complexity limit | `RESOURCE_EXHAUSTED`; no deletes before the first batch, potentially partial changes afterward. |
+| RPC deadline or caller cancellation | `DEADLINE_EXCEEDED` or `CANCELLED`; potentially partial changes once a batch has been applied. |
 | Writer limit during application | `RESOURCE_EXHAUSTED`; potentially partial changes, following ordinary writer-limit behavior. |
 | Lucene I/O failure during application, refresh, or commit | `UNAVAILABLE`; potentially partial changes. Follow existing index failure handling. |
 
@@ -358,13 +387,29 @@ clients must treat such an outcome as unknown rather than zero deletions.
 
 Rerunning the same predicate is the normal way to make another pass after concurrent ingestion
 or an interrupted operation. Each call refreshes and selects again, so it can catch documents
-missed or recreated during an earlier pass. Once writes stop and calls complete successfully
-within the limits, repeated passes leave no matches; continuous ingestion has no such guarantee.
-Selection-limit failures require a narrower predicate rather than repeating the same oversized
-selection. SDKs retain their existing policy of caller-controlled retries. No request ledger,
-version check, or conflict-resolution workflow is required.
+missed or recreated during an earlier pass. If writes stop before readers are pinned, a completed
+exhaustive pass removes every matching source ID. With concurrent ingestion, documents added or
+recreated outside the selected snapshots can still match. A further pass is the caller's choice,
+not a prerequisite for reporting success after exhausting the selected readers. SDKs retain
+caller-controlled retries. No request ledger, version check, or conflict-resolution workflow is
+required.
+
+## Native bulk deletes and parallel collection
+
+The native writer and collector paths above are the selected implementation. They retain the
+ordinary writer fallback and preserve normal MongoDB replication, standalone ingestion, and
+simultaneous operation into indexes with separate owners. The optimization changes neither
+index formats nor the request/response shape apart from retirement of field 7.
+
+A shared writer is not assumed to serialize every deletion. Native term batches reduce repeated
+validation, event allocation, and writer entry calls. Parallel collection may improve throughput,
+but scanning, writer bookkeeping, executor scheduling, refresh/commit, and storage bandwidth
+must be measured separately. Logical deletion throughput is distinct from later space reclamation.
 
 ## Alternatives
+
+Native term batches with parallel collectors are implemented above. The following alternatives
+remain outside this change.
 
 Running a public search cursor and submitting ID batches is possible today and has acceptable
 concurrency semantics for this feature. The server-side implementation removes client paging
@@ -374,72 +419,68 @@ cursor ownership.
 Passing the translated predicate directly to `IndexWriter.deleteDocuments(Query...)` avoids
 materializing IDs. However, a search predicate can select a parent without selecting its embedded
 children; a raw query delete is not automatically a source-document delete. It also does not
-provide this API's preflight count/byte ceiling and dry-run contract. Lucene returns a sequence
+provide this API's source-ID counts and dry-run behavior. Lucene returns a sequence
 number rather than a deleted-source count, and writer-level atomicity does not provide a
 transaction across our partition writers.
 See [IndexWriter](https://lucene.apache.org/core/10_4_0/core/org/apache/lucene/index/IndexWriter.html#deleteDocuments(org.apache.lucene.search.Query...)).
-An optimized path can be considered later if it preserves the same root/block and failure rules.
+Revisit direct predicate deletion only if it preserves root/block deletion, selected-ID counts,
+and the existing races with concurrent replacements and inserts.
+
+`IndexWriter.tryDeleteDocument(reader, docID)` avoids ID term lookup, but it is synchronized in
+the current Lucene fork, needs a fallback when a segment has merged away, and targets only
+document versions visible to that reader. It also requires explicit deletion of embedded
+children. Do not use it as the basis for this optimization or mutate reader live-doc bits directly.
 
 Holding the global coordinator across selection and deletion would prevent replacement races,
 but would delay ingestion and fresh searches for the full operation. That guarantee is outside
 the intended contract. Document version checks and conflict retries would add similar complexity
 without being required; use ordinary ID deletion and caller-initiated repeat passes instead.
 
-Asynchronous deletion would support purges beyond synchronous limits. It requires task ownership,
-progress, cancellation, restart/recovery semantics, and an explicit decision about mutation
+Asynchronous deletion would support purges that outlive the synchronous RPC deadline. It requires
+task ownership, progress, cancellation, restart/recovery semantics, and a decision about mutation
 logging. Defer it until workloads justify those changes rather than treating an RPC timeout as
 an implicit background job.
 
 ## Delivery and validation
 
-Implement the parser and root-ID collector first, then generation leases, batched writes, and the RPC.
-Expose the new method in Java, Python, Rust, and TypeScript clients, regenerate protocol bindings
-and the Rust schema copy, and add optional generation, concern, ceiling, and dry-run arguments
-to index-bound helpers. TypeScript counts use decimal strings like the existing uint64 fields.
-No client performs automatic retries.
+The protocol reserves the retired field number 7 and name `max_matches`. Python and TypeScript
+bindings are regenerated from the authoritative schema; Rust carries the synchronized schema
+copy and Java generates messages during its normal build. Index helpers expose selectors,
+generation, concern, and dry run without a document-limit argument. Old wire messages carrying
+field 7 have no effect on the new server's traversal. Existing clients control retries.
 
-Update the standalone operating guide, architecture guide, client examples, and release checks
-when implementation lands. The change is additive and requires no Lucene format migration or
-new persistent state. Old clients continue using existing RPCs; a new client calling an old
-server receives `UNIMPLEMENTED`. This draft does not change the current API documentation.
+Correctness coverage includes exhaustive scans above 10,000 matches and 16 MiB of total IDs,
+typed IDs, complete embedded blocks, partition routing, native batch application, wrapper metrics
+on a partially applied prefix, and fallback writer preparation. Reader tests exercise parallel
+segment slices, serial fallback, exact counts, inserts after pinning, and draining after worker
+failure. Fault injection during scorer construction and scoring verifies that a failed slice
+stops peer emission, suppresses pending leaf flushes, and preserves the original exception.
+Ingestion tests cover dirty tracking and lease release after native writer failure;
+existing cancellation, generation-fence, committed recovery, and authorization tests still apply.
 
-Required tests should establish behavior, including:
+Run the collector and end-to-end RPC regressions with enough time for the large-ID fixtures:
 
-- Compare deletion's selected IDs with supported search/filter matching on the same snapshot;
-  cover zero matches, explicit match-all, analyzers, missing/null values, compound negation,
-  embedded parents, and vector roots without vectors. Reject every excluded option recursively.
-- Cover typed ID distinctions, duplicates in child blocks, multiple partitions, stored source
-  disabled, maximum-size IDs, and boundary values for count and byte budgets. An overflow in
-  the last partition must leave all partitions untouched.
-- Verify ingestion progresses during selection and can interleave between delete batches.
-  Cover concurrent removal, replacement, and insertion, then rerun after writers stop to remove
-  remaining matches. Counts report processed IDs rather than inferred removals. Race mapping
-  update, drop, retirement, and shutdown; no batch may target a replacement generation. Verify
-  leases and admission reservations are released.
-- Verify pre-selection refresh includes prior `INDEXED` upserts and deletes. Verify all three
-  completion concerns, old-cursor behavior, and that deletion removes entire embedded blocks.
-- Inject selection timeout, cancellation with no matching hits, cancellation between deletes,
-  writer failure, refresh failure, and a commit failure between partitions. Check zero mutation
-  before application, dirty tracking afterward, and committed recovery after a process crash.
-- Require both roles and the target index grant for execution and dry run. Exercise all four
-  client wrappers over TLS, generation mismatch, deadlines, and old-server `UNIMPLEMENTED`.
-- Measure broad sparse scans, expensive text predicates, large IDs, and partitioned indexes
-  under concurrent search/upsert load. Record heap, coordinator hold time, delayed commits,
-  unrelated-index write/search latency, cursor latency under worker saturation, and cancellation
-  delay before finalizing default limits.
+```sh
+bazel test \
+  //src/test/unit/java/com/xgen/mongot/index/lucene:LuceneDocumentIdCollectorTest \
+  //src/test/unit/java/com/xgen/mongot/standalone/server:StandaloneGrpcServerTest \
+  --test_timeout=300 --test_output=errors
+```
 
-Existing RPC metrics include operation `DeleteByQuery`. Future diagnostics can add bounded labels
-for selector kind, dry run, completion phase, and rejection reason, plus selection/application time,
-coordinator wait/hold time, matched/applied IDs, and retained ID bytes. Those counters should record
-applied work even when response delivery fails and exclude raw queries, IDs, and request-specific
-labels.
+Validate the affected standalone, MongoDB replication, and coexistence lifecycle/configuration
+paths. Live deployment checks and benchmarks must identify the exact artifacts tested and any
+gaps. Resource and performance checks should compare serial individual deletes, serial native
+batches, and parallel native batches on identical data, including sparse/dense matches, large IDs,
+multiple segments/partitions, and concurrent ingestion/search load. Record allocations, buffer
+bounds, native call counts, CPU, throughput, writer contention, final completion cost, and drain
+latency. Do not infer production scaling from an isolated Lucene microbenchmark.
 
-## Decisions to confirm in review
+## Follow-up scope
 
-1. Is the initial 10,000-document, synchronous ceiling sufficient for expected deletion workloads,
-   or must the first release support large background purges?
+1. Do expected purges fit within the configured synchronous RPC deadline, or are background
+   jobs with progress and recovery required?
 2. Are root-level vector filters and the listed search operators enough initially, or are nested
    vector selection, namespaced indexes, or join predicates required at launch?
 
-The proposal above supplies defaults for these choices; changing them requires revisiting the
+The implementation above supplies defaults for these choices; changing them requires revisiting the
 selection, resource, and concurrency contracts together.

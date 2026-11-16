@@ -36,7 +36,7 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 | --- | --- |
 | Dual ingestion | Configure `syncSource.replicaSet` to run MongoDB replication alongside direct gRPC writes into separate standalone indexes in one process. See [configuration](docs/coexistence-mode.md). |
 | Standalone indexes | Run without MongoDB. Create independent named indexes and write BSON directly through gRPC `Upsert` and `Delete`. Each index owns its content and lifecycle. |
-| Delete by query | `DeleteByQuery` removes documents selected by search predicates or vector metadata filters from one index, with dry runs and bounded selection. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
+| Delete by query | `DeleteByQuery` exhausts matching roots in pinned readers, with parallel segment collection, native bulk deletes, dry runs, and no client-supplied document limit. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
 | Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. See [join examples](#join-searches-across-indexes). |
 | Public gRPC API and four clients | Manage indexes, ingest documents, search, and page results from Python, Rust, Java, and TypeScript, with TLS and bearer tokens restricted by role and index. See the [client guide](clients/README.md). |
 | Concurrent gRPC ingestion | Apply batches concurrently to the same or different indexes. Writes default to `INDEXED`; background reader refresh and commits default to one second. Request `VISIBLE` or `COMMITTED` when needed. See [write behavior](#write-behavior-and-persistence). |
@@ -60,8 +60,11 @@ starts official mongot first and then swaps in our image with the same config an
 
 For example, `client.delete_by_query(api.DeleteByQueryRequest(index_id=index.index_id,
 search_query_bson=encode_bson({"text": {"path": "title", "query": "coffee"}})))` deletes matching
-documents from one search index. It requires query and write access and selects up to 10,000 IDs.
-Ingestion can continue during deletion; run the predicate again for another pass if matches remain.
+documents from one search index. It requires query and write access. Each collector keeps one
+bounded ID batch and submits native bulk deletes through the existing ingestion lifecycle.
+Successful completion exhausts the pinned readers; documents added after a reader was pinned
+may survive normally. RPC deadlines still apply. Scan failures stop peer collectors cooperatively
+and drain running work before releasing readers; earlier delete batches can remain applied.
 
 For query tracing, set `explain_verbosity` on the ordinary query request and decode the returned
 `explain_bson`:

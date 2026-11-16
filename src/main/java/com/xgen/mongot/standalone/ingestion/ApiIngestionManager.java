@@ -47,6 +47,8 @@ public final class ApiIngestionManager implements ReplicationManager {
 
   private static final class IndexState {
     private final InitializedIndex index;
+    // Hot scan checks must not take the ingestion monitor for every matching ID.
+    private volatile boolean retired;
     // Serializes explicit/background commits, including multipart writers, without blocking writes.
     private final Object commitLock = new Object();
     // Accessed under the ingestion monitor. A completed batch advances the version even on failure.
@@ -80,7 +82,8 @@ public final class ApiIngestionManager implements ReplicationManager {
     }
 
     public boolean retired() {
-      return !isGenerationReady(this.generation);
+      return this.state.retired
+          || this.state.index.getStatus().getStatusCode() != IndexStatus.StatusCode.STEADY;
     }
 
     @Override
@@ -220,6 +223,56 @@ public final class ApiIngestionManager implements ReplicationManager {
         || documents.stream().mapToLong(ByteString::size).sum() > this.limits.maxBatchBytes()) {
       throw new IllegalArgumentException("Batch size is outside the configured limits");
     }
+    return executeWrite(
+        indexId,
+        revision,
+        requestedGeneration,
+        lease -> applyBatch(lease, documents, delete, concern));
+  }
+
+  /** Applies trusted reader IDs without decoding them back into ordinary document events. */
+  public String deleteDocuments(
+      String indexId,
+      LongSupplier revision,
+      String requestedGeneration,
+      List<byte[]> encodedIds,
+      Runnable check) {
+    if (encodedIds.isEmpty()
+        || encodedIds.size() > this.limits.maxBatchDocuments()
+        || encodedIds.stream().mapToLong(id -> id.length).sum() > this.limits.maxBatchBytes()) {
+      throw new IllegalArgumentException("Batch size is outside the configured limits");
+    }
+    try {
+      return executeWrite(
+              indexId,
+              revision,
+              requestedGeneration,
+              lease ->
+                  applyWrite(
+                      lease,
+                      () -> {
+                        check.run();
+                        lease.index().getWriter().deleteDocuments(encodedIds, check, ignored -> {});
+                        var exceeded = lease.index().getWriter().exceededLimits();
+                        if (exceeded.isPresent()) {
+                          throw exceeded.get();
+                        }
+                      },
+                      DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED))
+          .join();
+    } catch (java.util.concurrent.CompletionException error) {
+      if (error.getCause() instanceof RuntimeException cause) {
+        throw cause;
+      }
+      throw error;
+    }
+  }
+
+  private CompletableFuture<String> executeWrite(
+      String indexId,
+      LongSupplier revision,
+      String requestedGeneration,
+      java.util.function.Function<IndexLease, String> operation) {
     var lease = acquireWriteLease(indexId, revision, requestedGeneration);
     var context = Context.current();
     Supplier<String> work =
@@ -232,7 +285,7 @@ public final class ApiIngestionManager implements ReplicationManager {
             if (lease.retired()) {
               throw Status.UNAVAILABLE.withDescription("Index is retiring").asRuntimeException();
             }
-            return applyBatch(lease, documents, delete, concern);
+            return operation.apply(lease);
           } finally {
             context.detach(previous);
           }
@@ -279,7 +332,6 @@ public final class ApiIngestionManager implements ReplicationManager {
 
   private String applyBatch(
       IndexLease lease, List<ByteString> documents, boolean delete, DocumentWriteConcern concern) {
-    String id = lease.generation.uniqueString();
     var index = lease.index();
     // Validate the whole input before mutating Lucene; field mapping uses the current index schema.
     var events =
@@ -299,20 +351,37 @@ public final class ApiIngestionManager implements ReplicationManager {
                           validated.document());
                 })
             .toList();
+    return applyWrite(
+        lease,
+        () -> {
+          for (var event : index.getWriter().prepareBatch(events)) {
+            if (Context.current().isCancelled()) {
+              throw Status.CANCELLED.asRuntimeException();
+            }
+            try (var ignored = RegexBudget.openScope()) {
+              index.getWriter().updateIndex(event);
+            }
+            var exceeded = index.getWriter().exceededLimits();
+            if (exceeded.isPresent()) {
+              throw exceeded.get();
+            }
+          }
+        },
+        concern);
+  }
+
+  @FunctionalInterface
+  private interface BatchOperation {
+    void run() throws java.io.IOException, com.xgen.mongot.index.ExceededLimitsException;
+  }
+
+  private String applyWrite(
+      IndexLease lease, BatchOperation operation, DocumentWriteConcern concern) {
+    String id = lease.generation.uniqueString();
+    var index = lease.index();
     try {
       try {
-        for (var event : index.getWriter().prepareBatch(events)) {
-          if (Context.current().isCancelled()) {
-            throw Status.CANCELLED.asRuntimeException();
-          }
-          try (var ignored = RegexBudget.openScope()) {
-            index.getWriter().updateIndex(event);
-          }
-          var exceeded = index.getWriter().exceededLimits();
-          if (exceeded.isPresent()) {
-            throw exceeded.get();
-          }
-        }
+        operation.run();
       } finally {
         // Mark after applying the batch: a commit racing an in-flight write must not clear it.
         synchronized (this) {
@@ -414,7 +483,10 @@ public final class ApiIngestionManager implements ReplicationManager {
   @Override
   public synchronized CompletableFuture<Void> dropIndex(GenerationId generation) {
     String id = generation.uniqueString();
-    this.indexes.remove(id);
+    var state = this.indexes.remove(id);
+    if (state != null) {
+      state.retired = true;
+    }
     var leases = this.leases.get(id);
     var drained = leases == null ? CompletableFuture.<Void>completedFuture(null) : leases.drained;
     return this.stopping ? CompletableFuture.allOf(drained, this.shutdownFuture) : drained;
@@ -448,6 +520,7 @@ public final class ApiIngestionManager implements ReplicationManager {
       this.commits.shutdown();
       result = this.shutdownFuture;
       states = List.copyOf(this.indexes.values());
+      states.forEach(state -> state.retired = true);
       drained =
           CompletableFuture.allOf(
               this.leases.values().stream()

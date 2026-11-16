@@ -24,6 +24,25 @@ public interface IndexWriter extends Closeable {
   void updateIndex(DocumentEvent event) throws IOException, FieldExceededLimitsException;
 
   /**
+   * Deletes a bounded batch of encoded BSON source IDs. The caller validates the encodings before
+   * application. Checks may abort between writes; the callback accounts for successfully applied
+   * IDs, including a prefix when a later write fails. Specialized writers may apply native batches.
+   */
+  default void deleteDocuments(
+      List<byte[]> encodedIds, Runnable check, java.util.function.IntConsumer applied)
+      throws IOException, FieldExceededLimitsException {
+    var events =
+        encodedIds.stream()
+            .map(id -> DocumentEvent.createDelete(new org.bson.RawBsonDocument(id).get("_id")))
+            .toList();
+    for (var event : prepareBatch(events)) {
+      check.run();
+      updateIndex(event);
+      applied.accept(1);
+    }
+  }
+
+  /**
    * Pre-processes a batch of document events before individual indexing. Writers that maintain
    * auxiliary mappings (e.g. custom vector engine IDs) can override this to resolve those mappings
    * in batch (single query) rather than per-document, setting the resolved data directly on each

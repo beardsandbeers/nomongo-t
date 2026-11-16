@@ -11,6 +11,7 @@ import java.util.HashSet;
 import java.util.Set;
 import org.apache.lucene.index.IndexWriter;
 import org.bson.BsonType;
+import org.bson.BsonValue;
 import org.bson.RawBsonDocument;
 
 /** Structural validation before any document reaches the Lucene writer. */
@@ -38,6 +39,23 @@ public final class StandaloneBson {
   public static ValidatedMutation mutation(
       byte[] bson, boolean delete, int maxBytes, int maxDepth) {
     var document = document(bson, maxBytes, maxDepth);
+    var id = requireId(document, delete);
+    byte[] encodedId = LuceneDocumentIdEncoder.encodeDocumentId(id);
+    if (encodedId.length > IndexWriter.MAX_TERM_LENGTH) {
+      throw new IllegalArgumentException("Encoded _id exceeds Lucene's maximum term length");
+    }
+    return new ValidatedMutation(document, encodedId, delete);
+  }
+
+  /** Validates copied internal ID bytes without re-encoding an already encoded source ID. */
+  public static void validateEncodedId(byte[] bson, int maxBytes, int maxDepth) {
+    requireId(document(bson, maxBytes, maxDepth), true);
+    if (bson.length > IndexWriter.MAX_TERM_LENGTH) {
+      throw new IllegalArgumentException("Encoded _id exceeds Lucene's maximum term length");
+    }
+  }
+
+  private static BsonValue requireId(RawBsonDocument document, boolean delete) {
     var id = document.get("_id");
     if (id == null
         || !Set.of(BsonType.STRING, BsonType.OBJECT_ID, BsonType.INT32, BsonType.INT64)
@@ -47,11 +65,7 @@ public final class StandaloneBson {
     if (delete && document.size() != 1) {
       throw new IllegalArgumentException("DELETE requires exactly the _id field");
     }
-    byte[] encodedId = LuceneDocumentIdEncoder.encodeDocumentId(id);
-    if (encodedId.length > IndexWriter.MAX_TERM_LENGTH) {
-      throw new IllegalArgumentException("Encoded _id exceeds Lucene's maximum term length");
-    }
-    return new ValidatedMutation(document, encodedId, delete);
+    return id;
   }
 
   // Driver decoders intentionally tolerate some malformed inputs (for example noncanonical array

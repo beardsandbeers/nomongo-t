@@ -20,9 +20,42 @@ public interface IndexReader {
    */
   void refresh() throws IOException, ReaderClosedException;
 
+  /** One collector's ID sink. Finish flushes a successful leaf; it is not called after failure. */
+  interface DocumentIdConsumer extends java.util.function.Consumer<byte[]> {
+    default void finish() {}
+  }
+
   /**
-   * Refreshes and exhaustively selects root IDs from this reader's partitions. Selection may
-   * overlap writes. The callback receives copied internal BSON ID bytes; it may abort collection
+   * Exhaustively collects IDs, with an independent sink for each search slice. Implementations may
+   * collect concurrently and must drain all running collectors before returning, including on
+   * failure. Finish each leaf's sink during execution so reduction retains only counts.
+   */
+  default long collectDocumentIds(
+      org.bson.BsonDocument predicate,
+      boolean vector,
+      boolean all,
+      java.util.function.Supplier<DocumentIdConsumer> consumers,
+      Runnable check)
+      throws IOException, ReaderClosedException, com.xgen.mongot.index.query.InvalidQueryException {
+    var consumer = consumers.get();
+    long[] count = {0};
+    collectDocumentIds(
+        predicate,
+        vector,
+        all,
+        (byte[] id) -> {
+          consumer.accept(id);
+          count[0]++;
+        },
+        check);
+    consumer.finish();
+    return count[0];
+  }
+
+  /**
+   * Refreshes and exhaustively selects live root IDs from this reader's partitions. Each partition
+   * uses a pinned reader and invokes the callback sequentially, once per live root. The callback
+   * receives copied internal BSON ID bytes and may synchronously apply writes or abort collection
    * with a runtime exception. The check must throw on cancellation or budget exhaustion.
    */
   default void collectDocumentIds(

@@ -292,6 +292,49 @@ public class SingleLuceneIndexWriterTest {
   @RunWith(Theories.class)
   public static class MainTests {
 
+    private static org.apache.lucene.document.Document nativeDocument(byte[] id) {
+      var document = new org.apache.lucene.document.Document();
+      document.add(
+          new org.apache.lucene.document.StringField(
+              FieldName.MetaField.ID.getLuceneFieldName(),
+              new BytesRef(id),
+              org.apache.lucene.document.Field.Store.YES));
+      return document;
+    }
+
+    @Test
+    public void deleteDocuments_nativeBatch_preservesTypedIdsWithOneWriterOperation()
+        throws Exception {
+      try (var directory = new org.apache.lucene.store.ByteBuffersDirectory();
+          var writer = getWriter(directory, AnalyzerRegistryBuilder.empty())) {
+        var integerId = LuceneDocumentIdEncoder.encodeDocumentId(new BsonInt32(1));
+        var stringId = LuceneDocumentIdEncoder.encodeDocumentId(new BsonString("1"));
+        var longId = LuceneDocumentIdEncoder.encodeDocumentId(new BsonInt64(1));
+        writer
+            .getLuceneWriter()
+            .addDocuments(
+                List.of(
+                    nativeDocument(integerId), nativeDocument(stringId), nativeDocument(longId)));
+        long before = writer.getLuceneWriter().getMaxCompletedSequenceNumber();
+        var applied = new java.util.concurrent.atomic.AtomicInteger();
+
+        writer.deleteDocuments(List.of(integerId, stringId), () -> {}, applied::addAndGet);
+
+        assertThat(applied.get()).isEqualTo(2);
+        assertThat(writer.getLuceneWriter().getMaxCompletedSequenceNumber() - before).isEqualTo(1);
+        try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+          assertThat(reader.numDocs()).isEqualTo(1);
+          var matches = new IndexSearcher(reader).search(new MatchAllDocsQuery(), 10);
+          var stored =
+              reader
+                  .storedFields()
+                  .document(matches.scoreDocs[0].doc)
+                  .getBinaryValue(FieldName.MetaField.ID.getLuceneFieldName());
+          assertThat(stored).isEqualTo(new BytesRef(longId));
+        }
+      }
+    }
+
     @Test
     public void updateIndex_regexLimit_countsOnceWithoutInternalFailure() throws Exception {
       assertRegexFailureMetrics(new RegexLimitExceededException(), 1.0);

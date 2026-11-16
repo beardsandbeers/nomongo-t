@@ -33,6 +33,21 @@ public class MeteredIndexWriter implements IndexWriter {
   }
 
   @Override
+  public void deleteDocuments(
+      java.util.List<byte[]> encodedIds, Runnable check, java.util.function.IntConsumer applied)
+      throws IOException, FieldExceededLimitsException {
+    this.indexWriter.deleteDocuments(
+        encodedIds,
+        check,
+        count -> {
+          this.indexingMetricsUpdater
+              .getDocumentEventTypeCounter(DocumentEvent.EventType.DELETE)
+              .increment(count);
+          applied.accept(count);
+        });
+  }
+
+  @Override
   public void commit(EncodedUserData userData) throws IOException {
     Timed.runnable(
         this.indexingMetricsUpdater.getCommitTimer(), () -> this.indexWriter.commit(userData));

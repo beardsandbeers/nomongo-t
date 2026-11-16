@@ -544,7 +544,6 @@ def exercise_delete_by_query(client, index):
         "indexId": index["indexId"],
         "generationId": index["generationId"],
         "searchQueryBson": encoded({"text": {"path": "title", "query": "coffee"}}),
-        "maxMatches": "2",
     }
     preview = client.call("DeleteByQuery", dict(request, dryRun=True))
     check(int(preview["matchedCount"]) == 2, "Delete preview missed matching documents")

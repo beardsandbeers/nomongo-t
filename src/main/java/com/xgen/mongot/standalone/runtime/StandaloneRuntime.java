@@ -570,7 +570,7 @@ public final class StandaloneRuntime implements Closeable {
         Optional.empty(),
         Optional.empty(),
         Optional.empty(),
-        Optional.of(false),
+        Optional.of(true), // Reuse the bounded search pool for exhaustive delete collectors.
         Optional.empty(),
         Optional.empty(),
         Optional.empty(),

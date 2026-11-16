@@ -14,6 +14,45 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class MeteredIndexWriterTest {
+
+  @Test
+  public void deleteDocuments_partialFailure_recordsAppliedPrefixWithoutCountingBytes()
+      throws Exception {
+    var metrics =
+        IndexMetricsUpdaterBuilder.IndexingMetricsUpdaterBuilder.builder()
+            .metricsFactory(SearchIndex.mockMetricsFactory())
+            .build();
+    var wrapped = mock(IndexWriter.class);
+    var writer = new MeteredIndexWriter(wrapped, metrics);
+    var expected = new java.io.IOException("injected deletion failure");
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              invocation.<java.util.function.IntConsumer>getArgument(2).accept(1);
+              throw expected;
+            })
+        .when(wrapped)
+        .deleteDocuments(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any());
+    var applied = new java.util.concurrent.atomic.AtomicInteger();
+
+    var error =
+        Assert.assertThrows(
+            java.io.IOException.class,
+            () ->
+                writer.deleteDocuments(
+                    java.util.List.of(new byte[] {1}, new byte[] {2}),
+                    () -> {},
+                    applied::addAndGet));
+
+    Assert.assertSame(expected, error);
+    Assert.assertEquals(1, applied.get());
+    Assert.assertEquals(
+        1, metrics.getDocumentEventTypeCounter(DocumentEvent.EventType.DELETE).count(), 0);
+    Assert.assertEquals(0, metrics.getTotalBytesProcessedCounter().count(), 0);
+  }
+
   @Test
   public void testMetrics() throws Exception {
     IndexMetricsUpdater.IndexingMetricsUpdater indexingMetricsUpdater =

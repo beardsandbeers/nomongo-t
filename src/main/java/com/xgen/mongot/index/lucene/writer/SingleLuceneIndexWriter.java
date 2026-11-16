@@ -352,6 +352,35 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
   }
 
   @Override
+  public void deleteDocuments(
+      List<byte[]> encodedIds, Runnable check, java.util.function.IntConsumer applied)
+      throws IOException {
+    if (encodedIds.isEmpty()) {
+      return;
+    }
+    var terms = new org.apache.lucene.index.Term[encodedIds.size()];
+    for (int i = 0; i < terms.length; i++) {
+      check.run();
+      var id = encodedIds.get(i);
+      if (id.length > org.apache.lucene.index.IndexWriter.MAX_TERM_LENGTH) {
+        throw new IllegalArgumentException("Encoded _id exceeds Lucene's maximum term length");
+      }
+      terms[i] = LuceneDocumentIdEncoder.documentIdTerm(id);
+    }
+    try (var ignored = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("deleteDocuments");
+      check.run();
+      try {
+        this.luceneWriter.deleteDocuments(terms);
+      } catch (Exception e) {
+        recordIndexingFailure(e, DocumentEvent.EventType.DELETE.name());
+        throw e;
+      }
+      applied.accept(terms.length);
+    }
+  }
+
+  @Override
   public void commit(EncodedUserData userData) throws IOException {
     try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
       ensureOpen("commit");

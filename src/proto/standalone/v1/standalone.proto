@@ -256,11 +256,13 @@ message ServiceMetric {
   map<string,double> measurements = 3;
 }
 
-// Selects a bounded set of source IDs, then deletes in batches. Ingestion may interleave.
+// Streams source IDs into bounded delete batches. Ingestion may interleave.
 // Concurrent inserts can survive and replacements of selected IDs can be deleted.
-// Rerun the predicate for another pass; failures during application may partially apply.
+// Rerun the predicate for another pass; scan/write failures may leave partial deletions.
 // Requires WRITE and QUERY. No automatic retries.
 message DeleteByQueryRequest {
+  reserved 7;
+  reserved "max_matches";
   string index_id = 1;
   oneof selector {
     bytes search_query_bson = 2;
@@ -269,7 +271,6 @@ message DeleteByQueryRequest {
   }
   string generation_id = 5;
   DocumentWriteConcern write_concern = 6;
-  uint64 max_matches = 7; // Zero defaults to 10000; larger values are rejected.
   bool dry_run = 8;
 }
 message DeleteByQueryResponse {

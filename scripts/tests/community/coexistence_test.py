@@ -12,6 +12,7 @@ import socket
 import struct
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import grpc
@@ -292,6 +293,32 @@ def run(args):
             "concurrent local refresh",
             lambda: len(local_results(local.index_id, "concurrent")) == 1,
         )
+        print("Deleting every local match while MongoDB replication continues", flush=True)
+        for start in range(0, 10001, 1000):
+            client.upsert_many(
+                local.index_id,
+                [
+                    {"_id": f"purge-{i}", "title": "purge"}
+                    for i in range(start, min(start + 1000, 10001))
+                ],
+            )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            deletion = executor.submit(
+                client.delete_by_query,
+                api.DeleteByQueryRequest(
+                    index_id=local.index_id,
+                    search_query_bson=encode_bson({"text": {"path": "title", "query": "purge"}}),
+                ),
+            )
+            collection.insert_one(
+                {"_id": "remote-during-delete", "title": "replicated duringpurge"}
+            )
+            deleted = deletion.result(timeout=60)
+        assert deleted.matched_count == 10001
+        assert deleted.processed_count == 10001
+        assert not local_results(local.index_id, "purge")
+        assert len(local_results(local.index_id, "manual")) == 2
+        wait_for("replication during local deletion", lambda: native_results("duringpurge"))
         assert not native_results("manual")
         assert not local_results(local.index_id, "replicated")
         listed = native_wire(dict(management_base, userCommand={"listSearchIndexes": "records"}))

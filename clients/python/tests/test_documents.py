@@ -61,13 +61,12 @@ class IndexHelpersTest(unittest.TestCase):
             client.upsert("index", {"_id": "a"}, concern="anything")
         self.assertEqual(len(client.calls), 1)
 
-    def test_delete_by_query_forwards_selector_concern_and_limits(self):
+    def test_delete_by_query_forwards_selector_concern_and_dry_run(self):
         client = RecordingClient()
         client.index("index").delete_by_query(
             {"equals": {"path": "value", "value": Int64(1)}},
             concern="committed",
             generation_id="generation",
-            max_matches=7,
             dry_run=True,
             timeout=5,
         )
@@ -77,10 +76,16 @@ class IndexHelpersTest(unittest.TestCase):
         self.assertIsInstance(bson.decode(request.search_query_bson)["equals"]["value"], Int64)
         self.assertEqual(request.write_concern, api.DOCUMENT_WRITE_CONCERN_COMMITTED)
         self.assertEqual(request.generation_id, "generation")
-        self.assertEqual(request.max_matches, 7)
         self.assertTrue(request.dry_run)
         self.assertEqual(options["timeout"], 5)
         self.assertEqual(len(client.calls), 1)
+
+    def test_delete_by_query_rejects_retired_limit_option(self):
+        client = RecordingClient()
+        with self.assertRaises(TypeError):
+            client.index("index").delete_by_query(match_all=True, max_matches=1)
+        self.assertNotIn("max_matches", api.DeleteByQueryRequest.DESCRIPTOR.fields_by_name)
+        self.assertEqual(len(client.calls), 0)
 
     def test_delete_by_query_vector_and_match_all_are_explicit(self):
         client = RecordingClient()
