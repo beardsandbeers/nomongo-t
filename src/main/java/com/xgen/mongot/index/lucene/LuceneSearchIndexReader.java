@@ -71,6 +71,7 @@ import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.mongot.util.bson.Vector;
 import com.xgen.mongot.util.concurrent.LockGuard;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
@@ -550,7 +551,8 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
         BatchSizeStrategy strategy,
         QueryOptimizationFlags flags)
         throws IOException, InvalidQueryException, InterruptedException {
-      try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock)) {
+      try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock);
+          var cancellation = QueryCancellation.openScope(this.cancellationCheck)) {
         LuceneSearchIndexReader.this.ensureOpen("executePinnedQuery");
         checkState(!this.closed && !this.transferred, "Query snapshot was already consumed");
         validateStoredSource(query);
@@ -568,7 +570,8 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
         BatchSizeStrategy strategy,
         QueryOptimizationFlags flags)
         throws IOException, InvalidQueryException, InterruptedException {
-      try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock)) {
+      try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock);
+          var cancellation = QueryCancellation.openScope(this.cancellationCheck)) {
         LuceneSearchIndexReader.this.ensureOpen("executePinnedQuery");
         checkState(!this.closed && !this.transferred, "Query snapshot was already consumed");
         validateStoredSource(query);

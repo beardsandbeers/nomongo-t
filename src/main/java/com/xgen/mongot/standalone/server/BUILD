@@ -9,6 +9,7 @@ java_library(
         "StandaloneGrpcServer.java",
         "StandaloneJoinPlanner.java",
         "StandaloneQueryService.java",
+        "StandaloneSearchMeta.java",
     ],
     visibility = ["//visibility:public"],
     exports = [
@@ -38,6 +39,9 @@ java_library(
         "//src/main/java/com/xgen/mongot/standalone/metrics",
         "//src/main/java/com/xgen/mongot/standalone/runtime",
         "//src/main/java/com/xgen/mongot/util",
+        "//src/main/java/com/xgen/mongot/util/bson",
+        "//src/main/java/com/xgen/mongot/util/bson/parser",
+        "//src/main/java/com/xgen/mongot/util/regex",
         "//src/proto/standalone/v1:standalone_java",
         "@com_google_protobuf//:protobuf_java",
         "@io_grpc_grpc_java//api",

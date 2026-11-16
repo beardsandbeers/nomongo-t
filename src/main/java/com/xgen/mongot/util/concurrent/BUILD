@@ -5,6 +5,7 @@ java_library(
     srcs = [
         "DefaultNamedExecutorService.java",
         "DefaultNamedScheduledExecutorService.java",
+        "DrainingExecutor.java",
         "Executors.java",
         "FileLockGuard.java",
         "LiveThreadIdsRegistry.java",
@@ -16,6 +17,7 @@ java_library(
         "PrioritizedTask.java",
         "RecurringTimer.java",
         "Sleeper.java",
+        "WorkSharingExecutor.java",
     ],
     visibility = ["//visibility:public"],
     exports = ["@maven//:io_micrometer_micrometer_core"],

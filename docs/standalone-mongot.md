@@ -100,7 +100,7 @@ The authoritative [protobuf schema](../src/proto/standalone/v1/standalone.proto)
 | --- | --- |
 | CatalogService | CreateIndex, GetIndex, GetIndexMappings, GetIndexStats, GetIndexFieldStats, ListIndexes, UpdateIndex, DropIndex |
 | DocumentService | Upsert, Delete, DeleteByQuery |
-| QueryService | Search, VectorSearch, GetMore, KillCursor |
+| QueryService | Search, SearchMeta, VectorSearch, GetMore, KillCursor |
 | OperationsService | GetStatus |
 
 Create an index by name, explicit type (`SEARCH` or `VECTOR_SEARCH`), and user mapping BSON.
@@ -232,6 +232,10 @@ resubmitting the same mapping through UpdateIndex is an explicit empty rebuild.
 DropIndex removes the definition and its Lucene data through the ordinary mongot lifecycle.
 A later index with the same name receives a new ID and starts empty. Physical cleanup runs
 asynchronously. Query cursors pin their reader snapshot; index drop invalidates those cursors.
+
+`SearchMeta` accepts the unchanged `$searchMeta` stage body and returns count/facet metadata
+without a public cursor. Its `index` option selects a name (default `default`); optional IDs fence
+that selection. See the [metadata-only RPC guide](standalone-mongot-grpc-guide.md#metadata-only-search).
 
 Search and VectorSearch execute ordinary BSON search expressions against `index_id`; use
 GetMore for nonzero cursor IDs and KillCursor to release them early. Results contain IDs/scores

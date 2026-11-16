@@ -1,10 +1,10 @@
 package com.xgen.mongot.index.lucene;
 
-import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.IndexReader.DocumentIdConsumer;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.searcher.ConcurrentIndexSearcher;
 import com.xgen.mongot.index.lucene.searcher.LuceneIndexSearcher;
+import com.xgen.mongot.util.concurrent.DrainingExecutor;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.io.IOException;
 import java.util.Arrays;
@@ -104,7 +104,8 @@ final class LuceneDocumentIdCollector {
       }
     }
 
-    try (var tasks = new TaskGroup(executor.<Executor>map(value -> value).orElse(Runnable::run))) {
+    try (var tasks =
+        new DrainingExecutor(executor.<Executor>map(value -> value).orElse(Runnable::run))) {
       var searcher =
           executor.isPresent()
               ? new ConcurrentIndexSearcher(source, tasks) {
@@ -168,59 +169,6 @@ final class LuceneDocumentIdCollector {
         throw fatal;
       }
       throw error;
-    }
-  }
-
-  /**
-   * Uses the existing pool. Queued work becomes a no-op after close; running work drains before the
-   * caller may release its reader. This also protects against interruption during Future.get().
-   */
-  private static final class TaskGroup implements Executor, AutoCloseable {
-    private final Executor executor;
-    private boolean closing;
-    private int running;
-
-    private TaskGroup(Executor executor) {
-      this.executor = executor;
-    }
-
-    @Override
-    public void execute(Runnable command) {
-      this.executor.execute(
-          () -> {
-            synchronized (this) {
-              if (this.closing) {
-                return;
-              }
-              this.running++;
-            }
-            try {
-              command.run();
-            } finally {
-              synchronized (this) {
-                this.running--;
-                notifyAll();
-              }
-            }
-          });
-    }
-
-    @Override
-    public void close() {
-      @Var boolean interrupted = false;
-      synchronized (this) {
-        this.closing = true;
-        while (this.running != 0) {
-          try {
-            wait();
-          } catch (InterruptedException e) {
-            interrupted = true;
-          }
-        }
-      }
-      if (interrupted) {
-        Thread.currentThread().interrupt();
-      }
     }
   }
 }

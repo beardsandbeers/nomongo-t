@@ -91,6 +91,11 @@ public final class ClientCli {
               JsonFormat.parser().merge(request, b);
               response = client.search(b.build());
             }
+            case "SearchMeta" -> {
+              var b = SearchMetaRequest.newBuilder();
+              JsonFormat.parser().merge(request, b);
+              response = client.searchMeta(b.build());
+            }
             case "VectorSearch" -> {
               var b = QueryRequest.newBuilder();
               JsonFormat.parser().merge(request, b);

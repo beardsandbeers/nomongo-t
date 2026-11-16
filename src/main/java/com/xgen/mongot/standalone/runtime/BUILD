@@ -34,6 +34,8 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/lucene",
         "//src/main/java/com/xgen/mongot/index/lucene/config",
         "//src/main/java/com/xgen/mongot/index/lucene/directory",
+        "//src/main/java/com/xgen/mongot/index/query",
+        "//src/main/java/com/xgen/mongot/index/query/aggregation",
         "//src/main/java/com/xgen/mongot/index/statistics",
         "//src/main/java/com/xgen/mongot/index/status",
         "//src/main/java/com/xgen/mongot/index/version",

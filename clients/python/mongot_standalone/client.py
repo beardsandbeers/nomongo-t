@@ -136,6 +136,15 @@ class Client(DocumentCommandsMixin):
             metadata=self.metadata,
         )
 
+    def search_meta(
+        self, request: api.SearchMetaRequest, *, timeout=None
+    ) -> api.SearchMetaResponse:
+        return self.queries.SearchMeta(
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata,
+        )
+
     def vector_search(self, request: api.QueryRequest, *, timeout=None) -> api.QueryResponse:
         return self.queries.VectorSearch(
             request,

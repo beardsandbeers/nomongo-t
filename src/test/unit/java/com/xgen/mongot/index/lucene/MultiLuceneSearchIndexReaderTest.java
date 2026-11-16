@@ -61,6 +61,7 @@ import com.xgen.mongot.util.AtomicDirectoryRemover;
 import com.xgen.mongot.util.BsonUtils;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.mongot.util.concurrent.Executors;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import com.xgen.mongot.util.concurrent.NamedScheduledExecutorService;
@@ -96,8 +97,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import org.apache.lucene.index.TieredMergePolicy;
+import org.apache.lucene.util.ThreadInterruptedException;
 import org.bson.BsonArray;
 import org.bson.BsonDateTime;
 import org.bson.BsonDocument;
@@ -377,14 +384,10 @@ public class MultiLuceneSearchIndexReaderTest {
   /** Set up resources for test. */
   @Before
   public void setUp() throws Exception {
-    // Need more threads than NUM_PARTITIONS (8) to avoid deadlock:
-    // - 8 threads for partition queries
-    // - Additional threads for nested facet counting (ConcurrentSortedSetDocValuesFacetCounts
-    //   uses the same executor for parallel facet counting within each partition)
     this.concurrentSearchExecutor =
         spy(
             Executors.fixedSizeThreadScheduledExecutor(
-                "testConcurrentSearchExecutor", 16, new SimpleMeterRegistry()));
+                "testConcurrentSearchExecutor", 2, new SimpleMeterRegistry()));
     setupIndexWithPartitions(MOCK_DYNAMIC_MULTI_FACET_INDEX_PARTITION_DEFINITION_GENERATION);
 
     this.searchIndexNoPartition =
@@ -990,6 +993,66 @@ public class MultiLuceneSearchIndexReaderTest {
   }
 
   @Test
+  public void query_cancelDuringFacetMerge_releasesPinnedReferences() throws Exception {
+    assertFacetCancellationReleasesReferences("mergeToResult");
+  }
+
+  @Test
+  public void query_cancelDuringFacetMetadataConversion_releasesPinnedReferences()
+      throws Exception {
+    assertFacetCancellationReleasesReferences("getMetaResultsAndClose");
+  }
+
+  private void assertFacetCancellationReleasesReferences(String methodName) throws Exception {
+    var reader =
+        (MultiLuceneSearchIndexReader)
+            ((MeteredSearchIndexReader) this.searchIndexWithPartitions.getReader()).unwrap();
+    var partitions = getUnderlyingReaders(reader);
+    var refCountsBefore = new ArrayList<Integer>();
+    for (var partition : partitions) {
+      refCountsBefore.add(getCurrentSearcherRefCount(partition));
+    }
+    var expected = new CancellationException("cancel during " + methodName);
+
+    try (var snapshot = reader.acquireQuerySnapshot(false);
+        var cancellation =
+            QueryCancellation.openScope(
+                () -> {
+                  // Inject cancellation only at the requested merge stage, after partitions
+                  // have transferred their reader references to the result producers.
+                  boolean atStage =
+                      StackWalker.getInstance()
+                          .walk(
+                              frames ->
+                                  frames.anyMatch(
+                                      frame ->
+                                          frame
+                                                  .getClassName()
+                                                  .equals(FacetMergingBatchProducer.class.getName())
+                                              && frame.getMethodName().equals(methodName)));
+                  if (atStage) {
+                    throw expected;
+                  }
+                })) {
+      var actual =
+          Assert.assertThrows(
+              CancellationException.class,
+              () ->
+                  snapshot.query(
+                      COLLECTOR_QUERY_DEF,
+                      QueryCursorOptions.empty(),
+                      BatchSizeStrategySelector.forQuery(
+                          COLLECTOR_QUERY_DEF, QueryCursorOptions.empty()),
+                      new QueryOptimizationFlags(true)));
+      Assert.assertSame(expected, actual);
+    }
+
+    for (int i = 0; i < partitions.size(); i++) {
+      assertEquals((int) refCountsBefore.get(i), getCurrentSearcherRefCount(partitions.get(i)));
+    }
+  }
+
+  @Test
   public void testOmitResultsClosesSearcherReferencesForAllPartitions() throws Exception {
     @Var SearchIndexReader reader = this.searchIndexWithPartitions.getReader();
     if (reader instanceof MeteredSearchIndexReader meteredReader) {
@@ -1151,7 +1214,8 @@ public class MultiLuceneSearchIndexReaderTest {
   }
 
   @Test
-  public void testConcurrentQueryWithFeatureFlagDisabledDoesNotHaveTaskExecutor() throws Exception {
+  public void testConcurrentQueryWithFeatureFlagDisabledDoesNotHaveConcurrentExecutor()
+      throws Exception {
     // Create a new executor
     NamedExecutorService testExecutor =
         Executors.fixedSizeThreadScheduledExecutor(
@@ -1165,7 +1229,7 @@ public class MultiLuceneSearchIndexReaderTest {
             FEATURE_FLAGS_CONCURRENT_DISABLED);
 
     try {
-      // Verify the MultiReader does NOT have a TaskExecutor when feature flag is disabled
+      // Verify the MultiReader does NOT have a concurrent executor when feature flag is disabled
       @Var SearchIndexReader reader = indexWithFlagDisabled.getReader();
       if (reader instanceof MeteredSearchIndexReader meteredReader) {
         reader = meteredReader.unwrap();
@@ -1175,13 +1239,15 @@ public class MultiLuceneSearchIndexReaderTest {
           reader instanceof MultiLuceneSearchIndexReader);
       MultiLuceneSearchIndexReader multiReader = (MultiLuceneSearchIndexReader) reader;
 
-      // Use reflection to verify the taskExecutor field is empty
-      var taskExecutorField = MultiLuceneSearchIndexReader.class.getDeclaredField("taskExecutor");
+      // Use reflection to verify the concurrentSearchExecutor field is empty
+      var taskExecutorField =
+          MultiLuceneSearchIndexReader.class.getDeclaredField("concurrentSearchExecutor");
       taskExecutorField.setAccessible(true);
       @SuppressWarnings("unchecked")
       Optional<Object> taskExecutor = (Optional<Object>) taskExecutorField.get(multiReader);
       assertTrue(
-          "TaskExecutor should be empty when feature flag is disabled", taskExecutor.isEmpty());
+          "Concurrent executor should be empty when feature flag is disabled",
+          taskExecutor.isEmpty());
 
       // Add some documents and verify queries still work (sequential execution)
       int numDocs = 5;
@@ -1208,7 +1274,7 @@ public class MultiLuceneSearchIndexReaderTest {
   }
 
   @Test
-  public void testConcurrentQueryWithFeatureFlagEnabledHasTaskExecutor() throws Exception {
+  public void testConcurrentQueryWithFeatureFlagEnabledHasConcurrentExecutor() throws Exception {
     // Create a new executor
     NamedExecutorService testExecutor =
         Executors.fixedSizeThreadScheduledExecutor(
@@ -1222,7 +1288,7 @@ public class MultiLuceneSearchIndexReaderTest {
             FEATURE_FLAGS);
 
     try {
-      // Verify the MultiReader HAS a TaskExecutor when feature flag is enabled
+      // Verify the MultiReader HAS a concurrent executor when feature flag is enabled
       @Var SearchIndexReader reader = indexWithFlagEnabled.getReader();
       if (reader instanceof MeteredSearchIndexReader meteredReader) {
         reader = meteredReader.unwrap();
@@ -1232,13 +1298,15 @@ public class MultiLuceneSearchIndexReaderTest {
           reader instanceof MultiLuceneSearchIndexReader);
       MultiLuceneSearchIndexReader multiReader = (MultiLuceneSearchIndexReader) reader;
 
-      // Use reflection to verify the taskExecutor field is present
-      var taskExecutorField = MultiLuceneSearchIndexReader.class.getDeclaredField("taskExecutor");
+      // Use reflection to verify the concurrentSearchExecutor field is present
+      var taskExecutorField =
+          MultiLuceneSearchIndexReader.class.getDeclaredField("concurrentSearchExecutor");
       taskExecutorField.setAccessible(true);
       @SuppressWarnings("unchecked")
       Optional<Object> taskExecutor = (Optional<Object>) taskExecutorField.get(multiReader);
       assertTrue(
-          "TaskExecutor should be present when feature flag is enabled", taskExecutor.isPresent());
+          "Concurrent executor should be present when feature flag is enabled",
+          taskExecutor.isPresent());
 
       // Add some documents and verify queries work
       int numDocs = 5;
@@ -1532,6 +1600,74 @@ public class MultiLuceneSearchIndexReaderTest {
 
     List<FacetBucket> buckets = facets.get("facet").buckets();
     assertEquals(2, buckets.size());
+  }
+
+  @Test
+  public void query_interruptedPartitionJoin_drainsAndClosesLateProducer() throws Exception {
+    var workerEntered = new CountDownLatch(1);
+    var callerFinished = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var firstReader = mock(LuceneSearchIndexReader.class);
+    var secondReader = mock(LuceneSearchIndexReader.class);
+    var producer = mock(LuceneSearchBatchProducer.class);
+    var pool = spy(Executors.fixedSizeThreadPool("partition-drain", 1, new SimpleMeterRegistry()));
+    var caller = java.util.concurrent.Executors.newSingleThreadExecutor();
+    Mockito.doAnswer(
+            invocation -> {
+              invocation.callRealMethod();
+              awaitPartitionLatch(workerEntered);
+              return null;
+            })
+        .when(pool)
+        .execute(any());
+    Mockito.when(firstReader.query(any(), any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              workerEntered.countDown();
+              awaitPartitionLatch(release);
+              return new SearchProducerAndMetaResults(producer, MetaResults.EMPTY);
+            });
+    Mockito.when(secondReader.query(any(), any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              callerFinished.countDown();
+              Thread.currentThread().interrupt();
+              throw new IOException("interrupted caller partition");
+            });
+    var reader =
+        new MultiLuceneSearchIndexReader(
+            List.of(firstReader, secondReader), drillSidewaysEnabledRegistry(), Optional.of(pool));
+    var strategy = BatchSizeStrategySelector.forQuery(QUERY_DEFINITION, QueryCursorOptions.empty());
+    try {
+      var operation =
+          caller.submit(
+              () ->
+                  reader.query(
+                      QUERY_DEFINITION,
+                      QueryCursorOptions.empty(),
+                      strategy,
+                      QueryOptimizationFlags.DEFAULT_OPTIONS));
+      awaitPartitionLatch(callerFinished);
+
+      Assert.assertThrows(TimeoutException.class, () -> operation.get(100, TimeUnit.MILLISECONDS));
+      verify(producer, never()).close();
+      release.countDown();
+      var thrown =
+          Assert.assertThrows(ExecutionException.class, () -> operation.get(5, TimeUnit.SECONDS));
+
+      // Lucene's debug assertion detects its unfinished future when assertions are enabled.
+      Truth.assertThat(thrown.getCause().getClass())
+          .isAnyOf(ThreadInterruptedException.class, AssertionError.class);
+      verify(producer).close();
+    } finally {
+      release.countDown();
+      caller.shutdownNow();
+      pool.shutdownNow();
+    }
+  }
+
+  private static void awaitPartitionLatch(CountDownLatch latch) throws InterruptedException {
+    assertTrue(latch.await(5, TimeUnit.SECONDS));
   }
 
   // ============================================================================

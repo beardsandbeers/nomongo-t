@@ -24,6 +24,10 @@ import com.xgen.mongot.index.lucene.LuceneIndexFactory;
 import com.xgen.mongot.index.lucene.LuceneIndexMappingExporter;
 import com.xgen.mongot.index.lucene.config.LuceneConfig;
 import com.xgen.mongot.index.lucene.directory.EnvironmentVariantPerfConfig;
+import com.xgen.mongot.index.query.InvalidQueryException;
+import com.xgen.mongot.index.query.SearchQuery;
+import com.xgen.mongot.index.query.SearchQueryParseOptions;
+import com.xgen.mongot.index.query.aggregation.SearchAggregationBootstrap;
 import com.xgen.mongot.index.status.IndexStatus;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.lifecycle.DefaultLifecycleManager;
@@ -87,6 +91,13 @@ public final class StandaloneRuntime implements Closeable {
 
   /** Opens the index metadata and composes the Lucene lifecycle without a source database. */
   public StandaloneRuntime(StandaloneConfig config) throws Exception {
+    this(config, FeatureFlags.communityDefaults(), DynamicFeatureFlagRegistry.communityDefault());
+  }
+
+  /** Composes readers and query parsing with the same supplied feature configuration. */
+  public StandaloneRuntime(
+      StandaloneConfig config, FeatureFlags flags, DynamicFeatureFlagRegistry dynamicFlags)
+      throws Exception {
     this.config = config;
     this.externalReconcile = Optional.empty();
     if (Files.exists(config.dataPath().resolve("coexistence.json"))) {
@@ -118,8 +129,7 @@ public final class StandaloneRuntime implements Closeable {
       this.liveIndexes = new DefaultIndexCatalog();
       this.initializedIndexes = new InitializedIndexCatalog();
       var initialized = this.initializedIndexes;
-      var flags = FeatureFlags.communityDefaults();
-      var dynamicFlags = DynamicFeatureFlagRegistry.communityDefault();
+      SearchAggregationBootstrap.installRegistryIfEnabled(flags);
       var diskMonitor = new StandaloneDiskMonitor(config.dataPath());
       this.resources.addFirst(diskMonitor::stop);
       diskMonitor.start(Duration.ofSeconds(1));
@@ -276,6 +286,14 @@ public final class StandaloneRuntime implements Closeable {
 
   public StandaloneConfig config() {
     return this.config;
+  }
+
+  public void validateSearchQuery(SearchQuery query) throws InvalidQueryException {
+    this.configManager.validateSearchQuery(query);
+  }
+
+  public SearchQueryParseOptions searchQueryParseOptions() {
+    return this.configManager.getSearchQueryParseOptions();
   }
 
   public LocalIndexCatalog catalog() {

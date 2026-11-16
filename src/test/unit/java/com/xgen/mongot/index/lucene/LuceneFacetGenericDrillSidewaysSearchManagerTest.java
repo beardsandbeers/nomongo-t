@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedDocValuesField;
@@ -116,6 +117,33 @@ public class LuceneFacetGenericDrillSidewaysSearchManagerTest {
     this.indexWriter.close();
     this.directory.close();
     this.searcherReference.close();
+  }
+
+  @Test
+  public void initialSearch_saturatedPool_completesAllFacets() throws Exception {
+    this.facetQueries.put(FACET_1, this.mockLuceneDrillSideways);
+    this.facetQueries.put(FACET_2, this.mockLuceneDrillSideways);
+    var executor =
+        Executors.singleThreadScheduledExecutor("nested-facets", new SimpleMeterRegistry());
+    try {
+      var manager =
+          new LuceneFacetGenericDrillSidewaysSearchManager(
+              this.testQuery,
+              this.facetQueries,
+              Optional.empty(),
+              Optional.empty(),
+              Optional.of(executor));
+
+      var result =
+          executor
+              .submit(() -> manager.initialSearch(this.searcherReference, 10))
+              .get(5, TimeUnit.SECONDS);
+
+      assertThat(result.facetResults)
+          .containsExactly(FACET_1, this.mockResult, FACET_2, this.mockResult);
+    } finally {
+      executor.shutdownNow();
+    }
   }
 
   @DataPoints

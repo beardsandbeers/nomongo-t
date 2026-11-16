@@ -104,6 +104,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -118,6 +119,24 @@ import org.mockito.InOrder;
 import org.mockito.Mockito;
 
 public class DefaultConfigManagerTest {
+  @Test
+  public void getSearchQueryParseOptions_managerMonitorHeld_doesNotBlock() throws Exception {
+    var flags = FeatureFlags.withDefaults().enable(Feature.SEARCH_AGGREGATION).build();
+    var mocks = DefaultConfigManagerMocks.create(flags);
+
+    try (var executor = Executors.newSingleThreadExecutor()) {
+      // Config updates and replication lifecycle work can hold this monitor for slow I/O.
+      synchronized (mocks.configManager) {
+        var options =
+            executor
+                .submit(mocks.configManager::getSearchQueryParseOptions)
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(options.searchAggregationEnabled()).isTrue();
+      }
+    }
+  }
+
   /**
    * The journal is read fail-fast until quarantineUnparseableIndex is turned on, so that enabling
    * the flag is the only thing that changes startup behaviour for a malformed definition.

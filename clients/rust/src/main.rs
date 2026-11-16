@@ -50,6 +50,7 @@ async fn dispatch(client: &mut Client, line: &str) -> Result<Value, Box<dyn std:
         "GetIndexFieldStats" => invoke!(get_index_field_stats),
         "GetStatus" => invoke!(get_status),
         "Search" => invoke!(search),
+        "SearchMeta" => invoke!(search_meta),
         "VectorSearch" => invoke!(vector_search),
         "GetMore" => invoke!(get_more),
         "KillCursor" => invoke!(kill_cursor),

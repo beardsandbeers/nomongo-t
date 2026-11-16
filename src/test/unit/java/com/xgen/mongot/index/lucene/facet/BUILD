@@ -14,6 +14,7 @@ java_test_suite(
     tags = ["unit"],
     deps = [
         "//src/main/java/com/xgen/mongot/index/lucene/facet",
+        "//src/main/java/com/xgen/mongot/util",
         "//src/main/java/com/xgen/testing",
         "@maven//:com_google_errorprone_error_prone_annotations",
         "@maven//:com_google_guava_guava_testlib",

@@ -23,6 +23,7 @@ METHODS = {
     "ListIndexes": ("list_indexes", api.ListIndexesRequest),
     "GetStatus": ("get_status", api.GetStatusRequest),
     "Search": ("search", api.QueryRequest),
+    "SearchMeta": ("search_meta", api.SearchMetaRequest),
     "VectorSearch": ("vector_search", api.QueryRequest),
     "GetMore": ("get_more", api.GetMoreRequest),
     "KillCursor": ("kill_cursor", api.KillCursorRequest),

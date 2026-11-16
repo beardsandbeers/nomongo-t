@@ -66,3 +66,42 @@ cursor cleanup and join dependency checks. See [query tracing](../clients/README
 The former standalone source store and document-management workflows are intentionally removed.
 The push-only protocol breaks compatibility with the collection-backed 0.2.x API; see the
 [operating guide](standalone-mongot.md) for configuration and migration by reingestion.
+
+## Metadata-only search
+
+`QueryService.SearchMeta` accepts the unchanged BSON body of a `$searchMeta` stage and returns
+its count/facet metadata without a hit batch or public cursor. `Search` continues to return hits
+and metadata together. Operator-only requests use the coupled default `lowerBound` count;
+facets without an operator match all documents.
+
+```python
+response = client.search_meta(api.SearchMetaRequest(
+    query_bson=encode_bson({
+        "index": "articles",
+        "facet": {"facets": {
+            "brands": {"type": "string", "path": "brand", "numBuckets": 10},
+        }},
+        "count": {"type": "total"},
+    }),
+))
+print(decode_bson(response.metadata_bson))
+```
+
+The `index` option selects an instance-wide index name and defaults to `default`. Optional
+`index_id` and `generation_id` fields fence that selection; they do not override the query's
+index name. A mismatched fence returns `FAILED_PRECONDITION`. An unfenced missing index uses
+the coupled empty-index metadata (`count.total: 0`). Ordinary zero-match queries retain their
+requested count label and facet shape.
+
+The RPC uses the same parser and feature settings as coupled search, including aggregation
+metrics, 10k facet bucket limits, and embedded scoped sort. Partition results merge before final
+bucket limits are applied. BSON metadata retains date keys and 64-bit counts. Mapping validation,
+such as embedded stored-source requirements for `returnScope`, still applies.
+
+`explain_verbosity` uses the existing engine explain document. Planner-only explain omits
+`metadata_bson`; execution levels include metadata. Check protobuf field presence before decoding
+optional metadata. The call obeys query authorization, admission limits, deadlines, and the
+configured combined response-byte limit. It never retains a cursor, including on failure.
+
+Client methods are `search_meta` in Python/Rust and `searchMeta` in Java/TypeScript. Older servers
+return `UNIMPLEMENTED`; clients do not silently fall back to fetching hits.

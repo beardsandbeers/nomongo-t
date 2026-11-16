@@ -106,6 +106,10 @@ public final class StandaloneClient implements AutoCloseable {
     return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).search(request);
   }
 
+  public SearchMetaResponse searchMeta(SearchMetaRequest request) {
+    return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).searchMeta(request);
+  }
+
   public QueryResponse vectorSearch(QueryRequest request) {
     return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).vectorSearch(request);
   }

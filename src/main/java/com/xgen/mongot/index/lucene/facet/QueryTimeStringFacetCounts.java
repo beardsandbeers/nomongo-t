@@ -1,5 +1,6 @@
 package com.xgen.mongot.index.lucene.facet;
 
+import com.xgen.mongot.util.QueryCancellation;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -38,6 +39,7 @@ import org.apache.lucene.util.BytesRef;
  * segment with no sorted-set values for the field contributes nothing.
  */
 public final class QueryTimeStringFacetCounts extends Facets {
+  private final Runnable cancellationCheck = QueryCancellation.capture();
 
   private final String dim;
   private final String readField;
@@ -62,6 +64,7 @@ public final class QueryTimeStringFacetCounts extends Facets {
 
   private void count(FacetsCollector hits) throws IOException {
     for (MatchingDocs matchingDocs : hits.getMatchingDocs()) {
+      this.cancellationCheck.run();
       countOneSegment(matchingDocs);
     }
   }
@@ -87,17 +90,22 @@ public final class QueryTimeStringFacetCounts extends Facets {
     IntIntHashMap segCounts = new IntIntHashMap();
     if (singleValues != null) {
       for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+        this.cancellationCheck.run();
         segCounts.addTo(singleValues.ordValue(), 1);
       }
     } else {
       for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+        this.cancellationCheck.run();
         for (int i = 0; i < multiValues.docValueCount(); i++) {
+          this.cancellationCheck.run();
           segCounts.addTo((int) multiValues.nextOrd(), 1);
         }
       }
     }
 
     for (IntCursor cursor : segCounts.keys()) {
+      this.cancellationCheck.run();
+
       int segOrd = cursor.value;
       int count = segCounts.get(segOrd);
       if (count == 0) {
@@ -124,6 +132,7 @@ public final class QueryTimeStringFacetCounts extends Facets {
     int resultCount = Math.min(topN, sorted.size());
     LabelAndValue[] labelValues = new LabelAndValue[resultCount];
     for (int i = 0; i < resultCount; i++) {
+      this.cancellationCheck.run();
       Map.Entry<BytesRef, Long> entry = sorted.get(i);
       labelValues[i] = new LabelAndValue(entry.getKey().utf8ToString(), entry.getValue());
     }
@@ -140,6 +149,7 @@ public final class QueryTimeStringFacetCounts extends Facets {
 
     LabelAndValue[] labelValues = new LabelAndValue[sorted.size()];
     for (int i = 0; i < sorted.size(); i++) {
+      this.cancellationCheck.run();
       Map.Entry<BytesRef, Long> entry = sorted.get(i);
       labelValues[i] = new LabelAndValue(entry.getKey().utf8ToString(), entry.getValue());
     }

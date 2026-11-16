@@ -14,6 +14,7 @@ import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.util.CheckedExceptionUtils;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -36,6 +37,7 @@ import org.apache.lucene.search.IndexSearcher;
 public class MongotDrillSideways extends DrillSideways {
   private static final FluentLogger FLOGGER = FluentLogger.forEnclosingClass();
 
+  private final Optional<WorkSharingExecutor> workSharingExecutor;
   private final FacetCollector collector;
   private final LuceneFacetContext facetContext;
   private final Optional<FieldPath> returnScope;
@@ -51,9 +53,30 @@ public class MongotDrillSideways extends DrillSideways {
       Optional<SortedSetDocValuesReaderState> maybeFacetsState,
       Optional<TokenFacetsStateCache> maybeTokenFacetsStateCache,
       Optional<NamedExecutorService> optimizedDrillSidewaysExecutor) {
+    this(
+        searcher,
+        config,
+        collector,
+        facetContext,
+        returnScope,
+        maybeFacetsState,
+        maybeTokenFacetsStateCache,
+        optimizedDrillSidewaysExecutor.map(WorkSharingExecutor::new).orElse(null));
+  }
+
+  private MongotDrillSideways(
+      IndexSearcher searcher,
+      FacetsConfig config,
+      FacetCollector collector,
+      LuceneFacetContext facetContext,
+      Optional<FieldPath> returnScope,
+      Optional<SortedSetDocValuesReaderState> maybeFacetsState,
+      Optional<TokenFacetsStateCache> maybeTokenFacetsStateCache,
+      @Nullable WorkSharingExecutor workSharingExecutor) {
     /* Passing taxoReader and state as null here as they are used only in buildFacetsResult(),
     which has been overridden here */
-    super(searcher, config, null, null, optimizedDrillSidewaysExecutor.orElse(null));
+    super(searcher, config, null, null, workSharingExecutor);
+    this.workSharingExecutor = Optional.ofNullable(workSharingExecutor);
     this.collector = collector;
     this.facetContext = facetContext;
     this.returnScope = returnScope;
@@ -199,7 +222,7 @@ public class MongotDrillSideways extends DrillSideways {
   public <R> ConcurrentDrillSidewaysResult<R> searchSafe(
       DrillDownQuery query, CollectorManager<?, R> hitCollectorManager)
       throws IOException, InvalidQueryException {
-    try {
+    try (var unused = this.workSharingExecutor.map(WorkSharingExecutor::openScope).orElse(null)) {
       return super.search(query, hitCollectorManager);
     } catch (RuntimeException e) {
       CheckedExceptionUtils.propagateCheckedIfType(e, InvalidQueryException.class);

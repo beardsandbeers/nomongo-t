@@ -57,6 +57,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import org.apache.lucene.util.BytesRef;
 import org.bson.BsonDocument;
 import org.junit.Test;
 import org.mockito.Mockito;
@@ -319,12 +320,14 @@ public class OperatorRewriteEngineTest {
         new com.xgen.mongot.index.query.operators.JoinOperator(
             Optional.of("foreign"), fp, fp, dummyChild);
     m.put(com.xgen.mongot.index.query.operators.JoinOperator.class, join);
+    var joinKeys = new JoinKeySet.Builder(ignored -> {});
+    joinKeys.add(new BytesRef("v"));
     m.put(
         com.xgen.mongot.index.query.operators.MaterializedJoinOperator.class,
         new com.xgen.mongot.index.query.operators.MaterializedJoinOperator(
             join,
             new JoinField(JoinField.Type.TOKEN, StockNormalizerName.NONE),
-            new JoinKeySet.Builder(ignored -> {}).build(),
+            joinKeys.build(),
             false,
             1000));
     m.put(

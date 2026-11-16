@@ -16,13 +16,18 @@ import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.concurrent.Executors;
 import com.xgen.testing.mongot.index.query.collectors.FacetCollectorBuilder;
 import com.xgen.testing.mongot.index.query.operators.OperatorBuilder;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.facet.DrillDownQuery;
 import org.apache.lucene.facet.FacetResult;
 import org.apache.lucene.facet.Facets;
 import org.apache.lucene.facet.FacetsCollector;
@@ -30,8 +35,14 @@ import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.facet.MultiFacets;
 import org.apache.lucene.facet.range.LongRange;
 import org.apache.lucene.facet.sortedset.SortedSetDocValuesReaderState;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.TopScoreDocCollectorManager;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.bson.BsonDateTime;
 import org.bson.BsonDouble;
 import org.bson.BsonValue;
@@ -84,6 +95,63 @@ public class MongotDrillSidewaysTest {
             Optional.of(this.facetsStateCache),
             Optional.of(this.tokenFacetsStateCache),
             Optional.empty());
+  }
+
+  @Test
+  public void searchSafe_saturatedPool_completesAndCanBeReused() throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig())) {
+      writer.addDocument(new Document());
+      writer.commit();
+      try (var reader = DirectoryReader.open(directory)) {
+        var executor =
+            Executors.singleThreadScheduledExecutor("nested-drill", new SimpleMeterRegistry());
+        try {
+          var config = new FacetsConfig();
+          var drillSideways =
+              new MongotDrillSideways(
+                  new IndexSearcher(reader),
+                  config,
+                  this.collector,
+                  this.facetContext,
+                  Optional.empty(),
+                  Optional.empty(),
+                  Optional.empty(),
+                  Optional.of(executor)) {
+                @Override
+                protected Facets buildFacetsResult(
+                    FacetsCollector ignored, FacetsCollector[] sideways, String[] dims) {
+                  // Exercise Lucene's parallel searches; facet-count construction is covered below.
+                  assertEquals(2, sideways.length);
+                  return new MultiFacets(Map.of());
+                }
+              };
+          var query = new DrillDownQuery(config, new MatchAllDocsQuery());
+          query.add("first", new MatchAllDocsQuery());
+          query.add("second", new MatchAllDocsQuery());
+
+          var first =
+              executor
+                  .submit(
+                      () ->
+                          drillSideways.searchSafe(
+                              query, new TopScoreDocCollectorManager(10, Integer.MAX_VALUE)))
+                  .get(5, TimeUnit.SECONDS);
+          var second =
+              executor
+                  .submit(
+                      () ->
+                          drillSideways.searchSafe(
+                              query, new TopScoreDocCollectorManager(10, Integer.MAX_VALUE)))
+                  .get(5, TimeUnit.SECONDS);
+
+          assertEquals(1, first.collectorResult.totalHits.value());
+          assertEquals(1, second.collectorResult.totalHits.value());
+        } finally {
+          executor.shutdownNow();
+        }
+      }
+    }
   }
 
   @Test

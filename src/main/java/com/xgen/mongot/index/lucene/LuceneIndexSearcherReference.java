@@ -13,6 +13,7 @@ import com.xgen.mongot.index.lucene.searcher.ConcurrentIndexSearcher;
 import com.xgen.mongot.index.lucene.searcher.LuceneIndexSearcher;
 import com.xgen.mongot.index.lucene.searcher.LuceneSearcherManager;
 import com.xgen.mongot.util.CloseablePhantomCleaner;
+import com.xgen.mongot.util.concurrent.DrainingExecutor;
 import io.opentelemetry.context.Context;
 import java.io.Closeable;
 import java.io.IOException;
@@ -47,18 +48,24 @@ public class LuceneIndexSearcherReference implements Closeable {
    */
   private record Cleaning(
       WeakReference<ReferenceManager<LuceneIndexSearcher>> searcherManager,
-      LuceneIndexSearcher indexSearcher)
+      LuceneIndexSearcher indexSearcher,
+      Optional<DrainingExecutor> tasks)
       implements CloseablePhantomCleaner.NoRefCloseable {
 
     Cleaning(
-        ReferenceManager<LuceneIndexSearcher> searcherManager, LuceneIndexSearcher indexSearcher) {
-      this(new WeakReference<>(searcherManager), indexSearcher);
+        ReferenceManager<LuceneIndexSearcher> searcherManager,
+        LuceneIndexSearcher indexSearcher,
+        Optional<DrainingExecutor> tasks) {
+      this(new WeakReference<>(searcherManager), indexSearcher, tasks);
     }
 
     private static final FluentLogger FLOGGER = FluentLogger.forEnclosingClass();
 
     @Override
     public void close() throws IOException {
+      // Lucene may return on interruption while an inner segment task is still running.
+      // Both explicit and phantom cleanup must drain before releasing the reader.
+      this.tasks.ifPresent(DrainingExecutor::close);
       Optional<ReferenceManager<LuceneIndexSearcher>> maybeManager =
           Optional.ofNullable(this.searcherManager.get());
       if (maybeManager.isPresent()) {
@@ -83,7 +90,8 @@ public class LuceneIndexSearcherReference implements Closeable {
       ReferenceManager<LuceneIndexSearcher> searcherManager,
       LuceneIndexSearcher indexSearcher,
       FeatureFlags featureFlags,
-      IndexMetricsUpdater.QueryingMetricsUpdater metricsUpdater) {
+      IndexMetricsUpdater.QueryingMetricsUpdater metricsUpdater,
+      Optional<DrainingExecutor> tasks) {
 
     this.indexSearcher = indexSearcher;
 
@@ -93,8 +101,11 @@ public class LuceneIndexSearcherReference implements Closeable {
                 this,
                 new CloseablePhantomCleaner.CleanerThreadAction(
                     metricsUpdater.getPhantomSearcherCleanupCounter(),
-                    new Cleaning(searcherManager, indexSearcher)))
-            : () -> releaseSearcher(searcherManager, indexSearcher);
+                    new Cleaning(searcherManager, indexSearcher, tasks)))
+            : () -> {
+              tasks.ifPresent(DrainingExecutor::close);
+              releaseSearcher(searcherManager, indexSearcher);
+            };
   }
 
   public static LuceneIndexSearcherReference create(
@@ -123,7 +134,7 @@ public class LuceneIndexSearcherReference implements Closeable {
                                 MetadataFeatureExplainer.class, MetadataFeatureExplainer::new)))
             .orElseGet(() -> LuceneIndexSearcher.create(initialSearcher));
     return new LuceneIndexSearcherReference(
-        searcherManager, searcher, featureFlags, metricsUpdater);
+        searcherManager, searcher, featureFlags, metricsUpdater, Optional.empty());
   }
 
   public static LuceneIndexSearcherReference create(
@@ -133,6 +144,7 @@ public class LuceneIndexSearcherReference implements Closeable {
       FeatureFlags featureFlags)
       throws IOException {
     var initialSearcher = searcherManager.acquire();
+    var tasks = new DrainingExecutor(executor);
     var searcher =
         Explain.getQueryInfo()
             .map(
@@ -151,12 +163,11 @@ public class LuceneIndexSearcherReference implements Closeable {
                                 CollectorTimingFeatureExplainer::new),
                             info.getFeatureExplainer(
                                 MetadataFeatureExplainer.class, MetadataFeatureExplainer::new),
-                            Context.current().wrap(Explain.maybeWrap(executor))))
+                            Context.current().wrap(Explain.maybeWrap(tasks))))
             .orElseGet(
-                () ->
-                    new ConcurrentIndexSearcher(initialSearcher, Context.current().wrap(executor)));
+                () -> new ConcurrentIndexSearcher(initialSearcher, Context.current().wrap(tasks)));
     return new LuceneIndexSearcherReference(
-        searcherManager, searcher, featureFlags, metricsUpdater);
+        searcherManager, searcher, featureFlags, metricsUpdater, Optional.of(tasks));
   }
 
   public LuceneIndexSearcher getIndexSearcher() {

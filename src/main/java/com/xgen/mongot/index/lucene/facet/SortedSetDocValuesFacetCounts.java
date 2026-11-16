@@ -80,6 +80,7 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
       @Var int totalHits = 0;
       @Var int totalDocs = 0;
       for (FacetsCollector.MatchingDocs matchingDocs : hits) {
+        this.cancellationCheck.run();
         totalHits += matchingDocs.totalHits();
         totalDocs += matchingDocs.context().reader().maxDoc();
       }
@@ -182,11 +183,14 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
       // is very straight-forward:
       if (singleValues != null) {
         for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          this.cancellationCheck.run();
           increment(singleValues.ordValue());
         }
       } else {
         for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          this.cancellationCheck.run();
           for (int i = 0; i < multiValues.docValueCount(); i++) {
+            this.cancellationCheck.run();
             int term = (int) multiValues.nextOrd();
             increment(term);
           }
@@ -203,11 +207,14 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
         // Remap every ord to global ord as we iterate:
         if (singleValues != null) {
           for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            this.cancellationCheck.run();
             increment((int) ordMap.get(singleValues.ordValue()));
           }
         } else {
           for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            this.cancellationCheck.run();
             for (int i = 0; i < multiValues.docValueCount(); i++) {
+              this.cancellationCheck.run();
               int term = (int) multiValues.nextOrd();
               increment((int) ordMap.get(term));
             }
@@ -221,11 +228,14 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
         int[] segCounts = new int[segmentCardinality];
         if (singleValues != null) {
           for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            this.cancellationCheck.run();
             segCounts[singleValues.ordValue()]++;
           }
         } else {
           for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+            this.cancellationCheck.run();
             for (int i = 0; i < multiValues.docValueCount(); i++) {
+              this.cancellationCheck.run();
               int term = (int) multiValues.nextOrd();
               segCounts[term]++;
             }
@@ -234,6 +244,7 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
 
         // Then, migrate to global ords:
         for (int ord = 0; ord < segmentCardinality; ord++) {
+          this.cancellationCheck.run();
           int count = segCounts[ord];
           if (count != 0) {
             increment((int) ordMap.get(ord), count);
@@ -257,6 +268,8 @@ public class SortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFac
     IndexReader reader = this.state.getReader();
 
     for (MatchingDocs hits : matchingDocs) {
+      this.cancellationCheck.run();
+
       if (ReaderUtil.getTopLevelContext(hits.context()).reader() != reader) {
         throw new IllegalStateException(
             "the SortedSetDocValuesReaderState provided to this class "

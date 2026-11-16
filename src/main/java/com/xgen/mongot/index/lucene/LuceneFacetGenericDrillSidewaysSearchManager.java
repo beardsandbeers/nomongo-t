@@ -5,6 +5,7 @@ import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.sort.SequenceToken;
 import com.xgen.mongot.util.CheckedExceptionUtils;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
@@ -107,30 +108,31 @@ class LuceneFacetGenericDrillSidewaysSearchManager
 
     Map<String, DrillSidewaysResult> facetDrillSidewaysResults = new ConcurrentHashMap<>();
 
-    List<Future<Void>> drillSidewaysFacetExecutionResults =
-        this.facetToDrillSidewaysFacetQueries.entrySet().stream()
-            .map(
-                (Function<Map.Entry<String, LuceneDrillSideways>, Future<Void>>)
-                    entry ->
-                        this.drillSidewaysConcurrentFacetExecutor
-                            .get()
-                            .submit(
-                                () -> {
-                                  executeDrillSidewaysAndAddResult(
-                                      searchCollectorManager, entry, facetDrillSidewaysResults);
-                                  return null;
-                                }))
-            .toList();
+    var executor = new WorkSharingExecutor(this.drillSidewaysConcurrentFacetExecutor.orElseThrow());
+    try (var unused = executor.openScope()) {
+      List<Future<Void>> drillSidewaysFacetExecutionResults =
+          this.facetToDrillSidewaysFacetQueries.entrySet().stream()
+              .map(
+                  (Function<Map.Entry<String, LuceneDrillSideways>, Future<Void>>)
+                      entry ->
+                          executor.submit(
+                              () -> {
+                                executeDrillSidewaysAndAddResult(
+                                    searchCollectorManager, entry, facetDrillSidewaysResults);
+                                return null;
+                              }))
+              .toList();
 
-    for (Future<Void> result : drillSidewaysFacetExecutionResults) {
-      try {
-        result.get();
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new CompletionException(e);
-      } catch (ExecutionException e) {
-        CheckedExceptionUtils.propagateUnwrappedIfTypeElseRuntime(
-            e, InvalidQueryException.class, IOException.class);
+      for (Future<Void> result : drillSidewaysFacetExecutionResults) {
+        try {
+          result.get();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new CompletionException(e);
+        } catch (ExecutionException e) {
+          CheckedExceptionUtils.propagateUnwrappedIfTypeElseRuntime(
+              e, InvalidQueryException.class, IOException.class);
+        }
       }
     }
     return facetDrillSidewaysResults;

@@ -37,6 +37,10 @@ class NullIndexCursorManager implements IndexCursorManager {
       CursorQuery cursorQuery,
       QueryCursorOptions queryCursorOptions,
       QueryOptimizationFlags queryOptimizationFlags) {
+    return createEmptyCursor(namespace);
+  }
+
+  SearchCursorInfo createEmptyCursor(String namespace) {
     var cursorInfo = this.cursorFactory.getEmptyCursor(namespace);
     // We do need to keep track of the cursor here, so we can respond to
     // getNextBatch in a consistent way.

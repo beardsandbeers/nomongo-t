@@ -7,6 +7,8 @@ mongot_java_unit_test_suite(
         "//src/main/java/com/xgen/mongot/catalog",
         "//src/main/java/com/xgen/mongot/cursor",
         "//src/main/java/com/xgen/mongot/cursor/batch",
+        "//src/main/java/com/xgen/mongot/featureflag",
+        "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/analyzer/definition",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/information",

@@ -30,6 +30,7 @@ import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.CollectionUtils;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import com.xgen.mongot.util.timers.InvocationCountingTimer;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -699,11 +700,14 @@ class LuceneMetaResultsBuilder {
     try (var unused =
         new InvocationCountingTimer.AutocloseableOptional<>(
             facetTimings.map(t -> t.split(ExplainTimings.Type.GENERATE_FACET_COUNTS)))) {
-      counts =
-          concurrentQuery && this.concurrentSearchExecutor.isPresent()
-              ? new ConcurrentSortedSetDocValuesFacetCounts(
-                  facetsState, collector, this.concurrentSearchExecutor.get())
-              : new SortedSetDocValuesFacetCounts(facetsState, collector);
+      if (concurrentQuery && this.concurrentSearchExecutor.isPresent()) {
+        var executor = new WorkSharingExecutor(this.concurrentSearchExecutor.get());
+        try (var scope = executor.openScope()) {
+          counts = new ConcurrentSortedSetDocValuesFacetCounts(facetsState, collector, executor);
+        }
+      } else {
+        counts = new SortedSetDocValuesFacetCounts(facetsState, collector);
+      }
     }
 
     for (var entry : stringFacetToDefinition.entrySet()) {

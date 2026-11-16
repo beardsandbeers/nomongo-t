@@ -1,12 +1,15 @@
 package com.xgen.mongot.index.lucene.facet;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
+import com.xgen.mongot.util.QueryCancellation;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.SortedSetDocValuesField;
@@ -33,6 +36,69 @@ public class QueryTimeStringFacetCountsTest {
 
   private static final String GROUP_FIELD = "group";
   private static final String TOKEN_FIELD = "foo";
+
+  @Test
+  public void forTokenField_cancelledCounting_stopsAndRestoresScope() throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig())) {
+      addTokenDoc(writer, "hit", "a");
+      writer.commit();
+      try (IndexReader reader = DirectoryReader.open(directory)) {
+        var collector = collect(reader, "hit");
+        var cancelled = new IllegalStateException("query cancelled");
+
+        try (var scope =
+            QueryCancellation.openScope(
+                () -> {
+                  throw cancelled;
+                })) {
+          assertThat(
+                  assertThrows(
+                      IllegalStateException.class,
+                      () -> QueryTimeStringFacetCounts.forTokenField(TOKEN_FIELD, collector)))
+              .isSameInstanceAs(cancelled);
+        }
+
+        assertThat(
+                QueryTimeStringFacetCounts.forTokenField(TOKEN_FIELD, collector)
+                    .getAllChildren(TOKEN_FIELD)
+                    .value
+                    .longValue())
+            .isEqualTo(1);
+      }
+    }
+  }
+
+  @Test
+  public void readerStateCounts_cancelledConcurrentCounting_stopsWorkerTasks() throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig());
+        var executor = Executors.newFixedThreadPool(2)) {
+      addTokenDoc(writer, "hit", "a");
+      writer.commit();
+      try (IndexReader reader = DirectoryReader.open(directory)) {
+        var collector = collect(reader, "hit");
+        var state = TokenSsdvFacetState.create(reader, TOKEN_FIELD, Optional.empty()).orElseThrow();
+
+        try (var scope =
+            QueryCancellation.openScope(
+                () -> {
+                  throw new IllegalStateException("query cancelled");
+                })) {
+          assertThrows(
+              Exception.class,
+              () -> new ConcurrentSortedSetDocValuesFacetCounts(state, collector, executor));
+        }
+
+        assertThat(
+                new SortedSetDocValuesFacetCounts(state, collector)
+                    .getAllChildren(TOKEN_FIELD)
+                    .value
+                    .longValue())
+            .isEqualTo(1);
+      }
+    }
+  }
 
   @Test
   public void forTokenField_exactHits_returnsTopChildrenInCountOrder() throws Exception {
@@ -264,6 +330,51 @@ public class QueryTimeStringFacetCountsTest {
               ConcurrentQueryTimeStringFacetCounts.forTokenField(TOKEN_FIELD, collector, executor);
           assertSameFacetResult(
               sequential.getAllChildren(TOKEN_FIELD), concurrent.getAllChildren(TOKEN_FIELD));
+        } finally {
+          executor.shutdownNow();
+        }
+      }
+    }
+  }
+
+  @Test
+  public void concurrentCounts_saturatedPool_matchesSequentialAcrossSegments() throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      addTokenDoc(writer, "hit", "m");
+      addTokenDoc(writer, "hit", "z");
+      writer.commit();
+      addTokenDoc(writer, "hit", "a");
+      addTokenDoc(writer, "hit", "m");
+      writer.commit();
+      try (IndexReader reader = DirectoryReader.open(directory)) {
+        assertThat(reader.leaves()).hasSize(2);
+        var collector = collect(reader, "hit");
+        var state = TokenSsdvFacetState.create(reader, TOKEN_FIELD, Optional.empty()).orElseThrow();
+        var expected =
+            new SortedSetDocValuesFacetCounts(state, collector).getAllChildren(TOKEN_FIELD);
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+          var result =
+              executor
+                  .submit(
+                      () ->
+                          List.of(
+                              ConcurrentQueryTimeStringFacetCounts.forTokenField(
+                                      TOKEN_FIELD, collector, executor)
+                                  .getAllChildren(TOKEN_FIELD),
+                              new ConcurrentSortedSetDocValuesFacetCounts(
+                                      state, collector, executor)
+                                  .getAllChildren(TOKEN_FIELD),
+                              new ConcurrentSortedSetDocValuesFacetCounts(state, null, executor)
+                                  .getAllChildren(TOKEN_FIELD)))
+                  .get(5, TimeUnit.SECONDS);
+
+          assertSameFacetResult(expected, result.get(0));
+          assertSameFacetResult(expected, result.get(1));
+          assertSameFacetResult(expected, result.get(2));
         } finally {
           executor.shutdownNow();
         }

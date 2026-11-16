@@ -1,5 +1,7 @@
 package com.xgen.mongot.index.lucene.facet;
 
+import com.xgen.mongot.util.FutureUtils;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -45,7 +47,7 @@ import org.jetbrains.annotations.Nullable;
  */
 public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDocValuesFacetCounts {
 
-  final ExecutorService exec;
+  final WorkSharingExecutor exec;
   final AtomicIntegerArray counts;
 
   /**
@@ -56,13 +58,15 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
       SortedSetDocValuesReaderState state, FacetsCollector hits, ExecutorService exec)
       throws IOException, InterruptedException {
     super(state);
-    this.exec = exec;
+    this.exec = new WorkSharingExecutor(exec);
     this.counts = new AtomicIntegerArray(state.getSize());
-    if (hits == null) {
-      // browse only
-      countAll();
-    } else {
-      count(hits.getMatchingDocs());
+    try (var unused = this.exec.openScope()) {
+      if (hits == null) {
+        // browse only
+        countAll();
+      } else {
+        count(hits.getMatchingDocs());
+      }
     }
   }
 
@@ -141,6 +145,7 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = singleValues.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = singleValues.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                     (int) ordMap.get(singleValues.ordValue()));
               }
@@ -148,6 +153,7 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = it.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = it.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                     (int) ordMap.get(singleValues.ordValue()));
               }
@@ -157,7 +163,9 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = multiValues.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = multiValues.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 for (int i = 0; i < multiValues.docValueCount(); i++) {
+                  ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                   int term = (int) multiValues.nextOrd();
                   ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                       (int) ordMap.get(term));
@@ -167,7 +175,9 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = it.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = it.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 for (int i = 0; i < multiValues.docValueCount(); i++) {
+                  ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                   int term = (int) multiValues.nextOrd();
                   ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                       (int) ordMap.get(term));
@@ -184,12 +194,14 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = singleValues.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = singleValues.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 segCounts[singleValues.ordValue()]++;
               }
             } else {
               for (int doc = it.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = it.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 segCounts[singleValues.ordValue()]++;
               }
             }
@@ -198,7 +210,9 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = multiValues.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = multiValues.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 for (int i = 0; i < multiValues.docValueCount(); i++) {
+                  ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                   int term = (int) multiValues.nextOrd();
                   segCounts[term]++;
                 }
@@ -207,7 +221,9 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               for (int doc = it.nextDoc();
                   doc != DocIdSetIterator.NO_MORE_DOCS;
                   doc = it.nextDoc()) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 for (int i = 0; i < multiValues.docValueCount(); i++) {
+                  ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                   int term = (int) multiValues.nextOrd();
                   segCounts[term]++;
                 }
@@ -217,6 +233,7 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
 
           // Then, migrate to global ords:
           for (int ord = 0; ord < numSegOrds; ord++) {
+            ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
             int count = segCounts[ord];
             if (count != 0) {
               ConcurrentSortedSetDocValuesFacetCounts.this.counts.addAndGet(
@@ -232,11 +249,13 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
             for (int doc = singleValues.nextDoc();
                 doc != DocIdSetIterator.NO_MORE_DOCS;
                 doc = singleValues.nextDoc()) {
+              ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
               ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                   singleValues.ordValue());
             }
           } else {
             for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+              ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
               ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(
                   singleValues.ordValue());
             }
@@ -246,14 +265,18 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
             for (int doc = multiValues.nextDoc();
                 doc != DocIdSetIterator.NO_MORE_DOCS;
                 doc = multiValues.nextDoc()) {
+              ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
               for (int i = 0; i < multiValues.docValueCount(); i++) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 int term = (int) multiValues.nextOrd();
                 ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(term);
               }
             }
           } else {
             for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+              ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
               for (int i = 0; i < multiValues.docValueCount(); i++) {
+                ConcurrentSortedSetDocValuesFacetCounts.this.cancellationCheck.run();
                 int term = (int) multiValues.nextOrd();
                 ConcurrentSortedSetDocValuesFacetCounts.this.counts.incrementAndGet(term);
               }
@@ -296,14 +319,11 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
               new CountOneSegment(hits.context().reader(), hits, ordinalMap, hits.context().ord)));
     }
 
-    for (Future<Void> result : results) {
-      try {
-        result.get();
-      } catch (ExecutionException ee) {
-        // Theoretically cause can be null; guard against that.
-        Throwable cause = ee.getCause();
-        throw IOUtils.rethrowAlways(cause != null ? cause : ee);
-      }
+    try {
+      FutureUtils.awaitAll(results);
+    } catch (ExecutionException ee) {
+      Throwable cause = ee.getCause();
+      throw IOUtils.rethrowAlways(cause != null ? cause : ee);
     }
   }
 
@@ -324,14 +344,11 @@ public class ConcurrentSortedSetDocValuesFacetCounts extends AbstractSortedSetDo
           this.exec.submit(new CountOneSegment(context.reader(), null, ordinalMap, context.ord)));
     }
 
-    for (Future<Void> result : results) {
-      try {
-        result.get();
-      } catch (ExecutionException ee) {
-        // Theoretically cause can be null; guard against that.
-        Throwable cause = ee.getCause();
-        throw IOUtils.rethrowAlways(cause != null ? cause : ee);
-      }
+    try {
+      FutureUtils.awaitAll(results);
+    } catch (ExecutionException ee) {
+      Throwable cause = ee.getCause();
+      throw IOUtils.rethrowAlways(cause != null ? cause : ee);
     }
   }
 }

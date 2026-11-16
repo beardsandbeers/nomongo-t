@@ -14,6 +14,7 @@ import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.util.Bytes;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.testing.mongot.cursor.batch.BatchCursorOptionsBuilder;
 import com.xgen.testing.mongot.index.query.collectors.CollectorBuilder;
 import com.xgen.testing.mongot.index.query.collectors.FacetDefinitionBuilder;
@@ -25,6 +26,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.CancellationException;
 import org.bson.BsonArray;
 import org.bson.BsonInt32;
 import org.bson.BsonInt64;
@@ -55,6 +57,28 @@ public class FacetMergingBatchProducerTest {
   }
 
   private static final FacetCollector FACET_COLLECTOR = getFacetCollector();
+
+  @Test
+  public void close_cancelledQuery_closesAllPartitionProducers() throws Exception {
+    var first = createSingleProducer1();
+    var second = createSingleProducer2();
+    var producer = FacetMergingBatchProducer.create(List.of(first, second));
+
+    try (var cancellation =
+        QueryCancellation.openScope(
+            () -> {
+              throw new CancellationException("query cancelled");
+            })) {
+      producer.close();
+    }
+
+    Assert.assertThrows(
+        IllegalStateException.class,
+        () -> first.getNextBatch(CursorConfig.DEFAULT_BSON_SIZE_SOFT_LIMIT));
+    Assert.assertThrows(
+        IllegalStateException.class,
+        () -> second.getNextBatch(CursorConfig.DEFAULT_BSON_SIZE_SOFT_LIMIT));
+  }
 
   @Test
   public void testWrappingSingleProducerYieldsIdenticalResults() throws Exception {

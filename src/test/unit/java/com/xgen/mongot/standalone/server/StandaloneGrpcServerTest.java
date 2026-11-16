@@ -4,6 +4,11 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.featureflag.Feature;
+import com.xgen.mongot.featureflag.FeatureFlags;
+import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
+import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
+import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
 import com.xgen.mongot.index.lucene.vector.Similarity;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
@@ -28,6 +33,7 @@ import com.xgen.mongot.standalone.grpc.KillCursorRequest;
 import com.xgen.mongot.standalone.grpc.ListIndexesRequest;
 import com.xgen.mongot.standalone.grpc.QueryRequest;
 import com.xgen.mongot.standalone.grpc.QueryServiceGrpc;
+import com.xgen.mongot.standalone.grpc.SearchMetaRequest;
 import com.xgen.mongot.standalone.grpc.StatsCollectionState;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
@@ -54,6 +60,671 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void searchMeta_unchangedDefaultIndexBody_returnsDefaultCountWithoutCursor()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+
+      var response = f.queries.searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}"));
+
+      assertThat(response.hasMetadataBson()).isTrue();
+      assertThat(metadata(response))
+          .isEqualTo(BsonDocument.parse("{count:{lowerBound:{$numberLong:'2'}}}"));
+      assertThat(response.getGenerationId()).isNotEmpty();
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_facetsAcrossPartitions_matchesSearchMetadataAndReleasesCursor()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "meta",
+              "{numPartitions:2,mappings:{dynamic:false,"
+                  + "fields:{brand:{type:'token'},price:{type:'number'}}}}");
+      f.upsert(id, "{_id:'a',brand:'Acme',price:2}");
+      f.upsert(id, "{_id:'b',brand:'Acme',price:3}");
+      f.upsert(id, "{_id:'c',brand:'Brew',price:4}");
+      String body =
+          "{index:'meta',facet:{facets:{brands:{type:'string',"
+              + "path:'brand',numBuckets:1},prices:{type:'number',"
+              + "path:'price',boundaries:[0,3,10]}}},count:{type:'total'}}";
+      var expected =
+          f.queries.search(
+              QueryRequest.newBuilder().setIndexId(id).setQueryBson(bson(body)).build());
+
+      var response = f.queries.searchMeta(metaRequest(body));
+
+      assertThat(metadata(response))
+          .isEqualTo(new RawBsonDocument(expected.getMetadataBson().toByteArray()));
+      assertThat(metadata(response).getDocument("count").getInt64("total").getValue()).isEqualTo(3);
+      assertThat(
+              metadata(response)
+                  .getDocument("facet")
+                  .getDocument("brands")
+                  .getArray("buckets")
+                  .getFirst()
+                  .asDocument()
+                  .getInt64("count")
+                  .getValue())
+          .isEqualTo(2);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_sortedAggregationAcrossPartitions_preservesFirstLastAndSum()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("meta", "{numPartitions:2,mappings:{dynamic:true}}");
+      f.upsert(id, "{_id:'a',price:2}");
+      f.upsert(id, "{_id:'b',price:3}");
+      f.upsert(id, "{_id:'c',price:4}");
+      String body =
+          "{index:'meta',sort:{price:-1},"
+              + "facet:{facets:{prices:{type:'number',path:'price',"
+              + "boundaries:[0,10],aggregations:{total:{type:'sum',"
+              + "path:'price'},first:{type:'first',path:'price'},"
+              + "last:{type:'last',path:'price'}}}}}}";
+
+      var response = f.queries.searchMeta(metaRequest(body));
+
+      var bucket =
+          metadata(response)
+              .getDocument("facet")
+              .getDocument("prices")
+              .getArray("buckets")
+              .getFirst()
+              .asDocument();
+      assertThat(bucket.getNumber("total").doubleValue()).isEqualTo(9);
+      assertThat(bucket.getNumber("first").doubleValue()).isEqualTo(4);
+      assertThat(bucket.getNumber("last").doubleValue()).isEqualTo(2);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_missingIndex_usesCoupledEmptyIndexMetadata() throws Exception {
+    try (var f = new Fixture(data())) {
+      var response = f.queries.searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}"));
+
+      assertThat(metadata(response))
+          .isEqualTo(BsonDocument.parse("{count:{total:{$numberLong:'0'}}}"));
+      assertThat(response.getGenerationId()).isEmpty();
+    }
+  }
+
+  @Test
+  public void searchMeta_missingIndexQueryPlanner_returnsExplainWithoutMetadata() throws Exception {
+    try (var f = new Fixture(data())) {
+      var response =
+          f.queries.searchMeta(
+              metaRequest("{index:'absent',text:{path:'title',query:'coffee'}}").toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+
+      assertThat(response.getExplainBson()).isNotEmpty();
+      var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+      assertThat(explain.getDocument("metadata").getString("indexName").getValue())
+          .isEqualTo("absent");
+      assertThat(response.hasMetadataBson()).isFalse();
+      assertThat(response.getGenerationId()).isEmpty();
+    }
+  }
+
+  @Test
+  public void searchMeta_missingIndexExecutionStats_returnsEmptyMetadataAndExplain()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      var response =
+          f.queries.searchMeta(
+              metaRequest("{text:{path:'title',query:'coffee'}}").toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(response.getExplainBson()).isNotEmpty();
+      var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+      assertThat(explain.getDocument("metadata").getString("indexName").getValue())
+          .isEqualTo("default");
+      assertThat(metadata(response))
+          .isEqualTo(BsonDocument.parse("{count:{total:{$numberLong:'0'}}}"));
+      assertThat(response.getGenerationId()).isEmpty();
+    }
+  }
+
+  @Test
+  public void searchMeta_zeroMatches_returnsZeroWithRequestedCountType() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'tea'}");
+
+      var response = f.queries.searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}"));
+
+      assertThat(metadata(response))
+          .isEqualTo(BsonDocument.parse("{count:{lowerBound:{$numberLong:'0'}}}"));
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_invalidQueryOnMissingIndex_validatesBeforeLookup() throws Exception {
+    try (var f = new Fixture(data())) {
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      metaRequest(
+                          "{index:'absent',text:{path:'title',query:'coffee'},unknown:true}")));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+    }
+  }
+
+  @Test
+  public void searchMeta_identityAndGenerationFences_areEnforced() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      String other = f.create("other");
+      var request = metaRequest("{text:{path:'title',query:'coffee'}}");
+      var success = f.queries.searchMeta(request.toBuilder().setIndexId(id).build());
+
+      var identityError =
+          assertThrows(
+              StatusRuntimeException.class,
+              () -> f.queries.searchMeta(request.toBuilder().setIndexId(other).build()));
+      var generationError =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      request.toBuilder().setGenerationId(other + "-f1-u0-a0").build()));
+      var malformed =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      request.toBuilder().setGenerationId("bad-generation").build()));
+      var fenced =
+          f.queries.searchMeta(
+              request.toBuilder().setGenerationId(success.getGenerationId()).build());
+
+      assertThat(identityError.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(generationError.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(malformed.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(fenced.getGenerationId()).isEqualTo(success.getGenerationId());
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_missingFencedIndex_failsPrecondition() throws Exception {
+    try (var f = new Fixture(data())) {
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      metaRequest("{text:{path:'title',query:'coffee'}}").toBuilder()
+                          .setIndexId("000000000000000000000001")
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+    }
+  }
+
+  @Test
+  public void searchMeta_queryPlanner_returnsExplainWithoutMetadata() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest("{text:{path:'title',query:'coffee'}}").toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+
+      assertThat(response.hasMetadataBson()).isFalse();
+      assertThat(
+              new RawBsonDocument(response.getExplainBson().toByteArray())
+                  .getDocument("query")
+                  .getString("type")
+                  .getValue())
+          .isEqualTo("ConstantScoreQuery");
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_executionStats_returnsMetadataAndExplain() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest("{text:{path:'title',query:'coffee'}}").toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(metadata(response).getDocument("count").getInt64("lowerBound").getValue())
+          .isEqualTo(1);
+      assertThat(response.getExplainBson()).isNotEmpty();
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_liveDynamicFlags_respectsChangesWithoutRestart() throws Exception {
+    var flags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            flags)) {
+      String id = f.create("default", "{mappings:{dynamic:false,fields:{brand:{type:'token'}}}}");
+      f.upsert(id, "{_id:'a',brand:'Acme'}");
+      var request =
+          metaRequest("{facet:{facets:{brands:{type:'string',path:'brand',numBuckets:2000}}}}");
+      var disabled =
+          assertThrows(StatusRuntimeException.class, () -> f.queries.searchMeta(request));
+
+      flags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.ENABLE_10K_BUCKET_LIMIT)));
+      var response = f.queries.searchMeta(request);
+      flags.updateDynamicFeatureFlags(List.of());
+      var reset = assertThrows(StatusRuntimeException.class, () -> f.queries.searchMeta(request));
+
+      assertThat(disabled.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(reset.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(metadata(response).getDocument("facet").getDocument("brands").getArray("buckets"))
+          .hasSize(1);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_aggregationDisabled_rejectsMetricSyntax() throws Exception {
+    var flags = FeatureFlags.withDefaults().disable(Feature.SEARCH_AGGREGATION).build();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            flags,
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.create("default");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setQueryBson(aggregationRequest(id).getQueryBson())
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_retainedCursorCapacityFull_stillSucceeds() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var field = StandaloneGrpcServer.class.getDeclaredField("queries");
+      field.setAccessible(true);
+      var capacityField = StandaloneQueryService.class.getDeclaredField("capacity");
+      capacityField.setAccessible(true);
+      var capacity = (java.util.concurrent.Semaphore) capacityField.get(field.get(f.server));
+      assertThat(capacity.drainPermits()).isEqualTo(1024);
+
+      var response = f.queries.searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}"));
+
+      assertThat(metadata(response).getDocument("count").getInt64("lowerBound").getValue())
+          .isEqualTo(1);
+      assertThat(capacity.availablePermits()).isEqualTo(0);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_combinedResponseLimit_rejectsEnvelopeOverflowAndReleasesCursor()
+      throws Exception {
+    int responseSize;
+    try (var f = new Fixture(data())) {
+      f.create("default");
+      responseSize =
+          f.queries
+              .searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}"))
+              .getSerializedSize();
+    }
+    var base = StandaloneConfig.development(data(), 0);
+    var config =
+        new StandaloneConfig(
+            base.dataPath(),
+            base.address(),
+            new StandaloneConfig.Limits(32, 100, 1000, responseSize - 1),
+            base.maxInFlightRequests(),
+            base.maxInFlightBytes(),
+            base.minFreeDiskBytes(),
+            base.commitInterval(),
+            base.refreshInterval(),
+            base.maxRpcDuration(),
+            base.tls(),
+            base.principals());
+    try (var f = new Fixture(config)) {
+      String id = f.create("default");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () -> f.queries.searchMeta(metaRequest("{text:{path:'title',query:'coffee'}}")));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+      assertThat(
+              f.queries
+                  .searchMeta(metaRequest("{index:'absent',text:{path:'title',query:'coffee'}}"))
+                  .hasMetadataBson())
+          .isTrue();
+    }
+  }
+
+  @Test
+  public void searchMeta_returnScopeWithoutReturnStoredSourceOption_usesMetadataOnlyValidation()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "default",
+              "{mappings:{dynamic:false,"
+                  + "fields:{variants:{type:'embeddedDocuments',dynamic:true,"
+                  + "storedSource:true}}}}");
+      f.upsert(id, "{_id:'a',variants:[{price:2},{price:3}]}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest(
+                  "{exists:{path:'variants.price'},"
+                      + "returnScope:{path:'variants'},count:{type:'total'}}"));
+
+      assertThat(metadata(response).getDocument("count").getInt64("total").getValue()).isEqualTo(2);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_optionalHitFeatures_areAcceptedWithoutStoredSource() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest(
+                  "{text:{path:'title',query:'coffee'},"
+                      + "highlight:{path:'title'},scoreDetails:true,sort:{title:1},"
+                      + "returnStoredSource:false}"));
+
+      assertThat(metadata(response).getDocument("count").getInt64("lowerBound").getValue())
+          .isEqualTo(1);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_unknownExplainAndMalformedBson_areInvalidArguments() throws Exception {
+    try (var f = new Fixture(data())) {
+      var badExplain =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      metaRequest("{text:{path:'title',query:'coffee'}}").toBuilder()
+                          .setExplainVerbosityValue(99)
+                          .build()));
+      var badBson =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setQueryBson(ByteString.copyFromUtf8("bad bson"))
+                          .build()));
+
+      assertThat(badExplain.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(badBson.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+    }
+  }
+
+  @Test
+  public void searchMeta_dateFacets_preserveBsonDateKeys() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default", "{mappings:{dynamic:false,fields:{created:{type:'date'}}}}");
+      f.upsert(id, "{_id:'a',created:{$date:'2025-06-01T00:00:00Z'}}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest(
+                  "{facet:{facets:{dates:{type:'date',path:'created',"
+                      + "boundaries:[{$date:'2025-01-01T00:00:00Z'},"
+                      + "{$date:'2026-01-01T00:00:00Z'}]}}}}"));
+
+      var bucket =
+          metadata(response)
+              .getDocument("facet")
+              .getDocument("dates")
+              .getArray("buckets")
+              .getFirst()
+              .asDocument();
+      assertThat(bucket.get("_id").isDateTime()).isTrue();
+      assertThat(bucket.getDateTime("_id").getValue())
+          .isEqualTo(java.time.Instant.parse("2025-01-01T00:00:00Z").toEpochMilli());
+      assertThat(bucket.getInt64("count").getValue()).isEqualTo(1);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_legacySortAndCountThreshold_doNotLimitFacetPopulation() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("default", "{mappings:{dynamic:false,fields:{brand:{type:'token'}}}}");
+      f.upsert(id, "{_id:'a',brand:'Acme'}");
+      f.upsert(id, "{_id:'b',brand:'Acme'}");
+      f.upsert(id, "{_id:'c',brand:'Acme'}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest(
+                  "{facet:{facets:{brands:{type:'string',path:'brand'}}},"
+                      + "sort:{missing:1},count:{type:'lowerBound',threshold:1}}"));
+
+      assertThat(metadata(response).getDocument("count").getInt64("lowerBound").getValue())
+          .isEqualTo(3);
+      assertThat(
+              metadata(response)
+                  .getDocument("facet")
+                  .getDocument("brands")
+                  .getArray("buckets")
+                  .getFirst()
+                  .asDocument()
+                  .getInt64("count")
+                  .getValue())
+          .isEqualTo(3);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  private static SearchMetaRequest metaRequest(String body) {
+    return SearchMetaRequest.newBuilder().setQueryBson(bson(body)).build();
+  }
+
+  private static BsonDocument metadata(
+      com.xgen.mongot.standalone.grpc.SearchMetaResponse response) {
+    return new RawBsonDocument(response.getMetadataBson().toByteArray());
+  }
+
+  @Test
+  public void search_defaultAggregationConfiguration_returnsFacetMetrics() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("aggregation");
+      f.upsert(id, "{_id:'a',price:2}");
+      f.upsert(id, "{_id:'b',price:3}");
+
+      var response = f.queries.search(aggregationRequest(id));
+
+      var bucket =
+          new RawBsonDocument(response.getMetadataBson().toByteArray())
+              .getDocument("facet")
+              .getDocument("prices")
+              .getArray("buckets")
+              .getFirst()
+              .asDocument();
+      assertThat(bucket.getNumber("total").doubleValue()).isEqualTo(5.0);
+      assertThat(response.getCursorId()).isEqualTo(0);
+    }
+  }
+
+  @Test
+  public void search_aggregationDisabled_rejectsFacetMetrics() throws Exception {
+    var flags = FeatureFlags.withDefaults().disable(Feature.SEARCH_AGGREGATION).build();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            flags,
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.create("aggregation-disabled");
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class, () -> f.queries.search(aggregationRequest(id)));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error).hasMessageThat().contains("aggregations");
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void search_bucketLimitFlagChanges_updatesParsingWithoutRestart() throws Exception {
+    var dynamicFlags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            dynamicFlags)) {
+      String id =
+          f.create("large-facet", "{mappings:{dynamic:false,fields:{brand:{type:'token'}}}}");
+      f.upsert(id, "{_id:'a',brand:'Acme'}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(
+                  bson("{facet:{facets:{brands:{type:'string',path:'brand',numBuckets:2000}}}}"))
+              .build();
+
+      var disabled = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+      assertThat(disabled.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+
+      dynamicFlags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.ENABLE_10K_BUCKET_LIMIT)));
+      var response = f.queries.search(request);
+      var buckets =
+          new RawBsonDocument(response.getMetadataBson().toByteArray())
+              .getDocument("facet")
+              .getDocument("brands")
+              .getArray("buckets");
+      assertThat(buckets).hasSize(1);
+      assertThat(buckets.get(0).asDocument().getString("_id").getValue()).isEqualTo("Acme");
+      assertThat(buckets.get(0).asDocument().getInt64("count").getValue()).isEqualTo(1);
+
+      dynamicFlags.updateDynamicFeatureFlags(List.of());
+      var reset = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+      assertThat(reset.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void search_scopedSortFlagChanges_updatesParsingAndExecution() throws Exception {
+    var dynamicFlags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            dynamicFlags)) {
+      String id =
+          f.create(
+              "scoped-sort",
+              "{mappings:{dynamic:false,fields:{title:{type:'string'},"
+                  + "variants:{type:'embeddedDocuments',dynamic:true}}}}");
+      f.upsert(
+          id, "{_id:'a',title:'coffee',variants:[{price:1,inStock:false},{price:9,inStock:true}]}");
+      f.upsert(id, "{_id:'b',title:'coffee',variants:[{price:4,inStock:true}]}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(
+                  bson(
+                      """
+                      {text:{path:'title',query:'coffee'},sort:{'variants.price':{
+                        order:1,embeddedDocument:{path:'variants',
+                          operator:{equals:{path:'variants.inStock',value:true}}}}}}
+                      """))
+              .build();
+
+      var disabled = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+      assertThat(disabled.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+
+      dynamicFlags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.ENABLE_EMBEDDED_SCOPED_SORT)));
+      var response = f.queries.search(request);
+      var results = new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results");
+      assertThat(results).hasSize(2);
+      assertThat(results.get(0).asDocument().getString("_id").getValue()).isEqualTo("b");
+      assertThat(results.get(1).asDocument().getString("_id").getValue()).isEqualTo("a");
+
+      dynamicFlags.updateDynamicFeatureFlags(List.of());
+      var reset = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+      assertThat(reset.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  private static QueryRequest aggregationRequest(String id) {
+    return QueryRequest.newBuilder()
+        .setIndexId(id)
+        .setQueryBson(
+            bson(
+                """
+                {facet:{facets:{prices:{type:'number',path:'price',boundaries:[0,10],
+                  aggregations:{total:{type:'sum',path:'price'}}}}}}
+                """))
+        .build();
+  }
+
+  private static DynamicFeatureFlagConfig enabledFlag(DynamicFeatureFlags flag) {
+    return new DynamicFeatureFlagConfig(
+        flag.getName(),
+        DynamicFeatureFlagConfig.Phase.ENABLED,
+        List.of(),
+        List.of(),
+        100,
+        DynamicFeatureFlagConfig.Scope.MONGOT_CLUSTER);
+  }
 
   @Test
   public void search_queryPlanner_returnsPlanWithoutHitsOrCursor() throws Exception {
@@ -171,10 +842,12 @@ public class StandaloneGrpcServerTest {
 
       assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
       assertThat(f.hasOpenCursors(id)).isFalse();
+      f.awaitRpcDelivery();
       var ordinary = f.queries.search(request.toBuilder().clearExplainVerbosity().build());
       assertThat(ordinary.getExplainBson()).isEmpty();
       assertThat(new RawBsonDocument(ordinary.getBatchBson().toByteArray()).getArray("results"))
           .hasSize(1);
+      f.awaitRpcDelivery();
       f.queries.killCursor(
           KillCursorRequest.newBuilder().setCursorId(ordinary.getCursorId()).build());
     }
@@ -661,6 +1334,29 @@ public class StandaloneGrpcServerTest {
               .withInterceptors(
                   io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(
                       bearer("restricted-token-012345678901234567890123456789")));
+
+      var metaWriter =
+          QueryServiceGrpc.newBlockingStub(f.channel)
+              .withInterceptors(
+                  io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(
+                      bearer("writer-token-012345678901234567890123456789")));
+      var metaRestricted =
+          QueryServiceGrpc.newBlockingStub(f.channel)
+              .withInterceptors(
+                  io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(
+                      bearer("restricted-token-012345678901234567890123456789")));
+      var metaRequest = metaRequest("{index:'delete-auth',text:{path:'title',query:'coffee'}}");
+      assertThat(
+              assertThrows(StatusRuntimeException.class, () -> metaWriter.searchMeta(metaRequest))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.PERMISSION_DENIED);
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class, () -> metaRestricted.searchMeta(metaRequest))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.PERMISSION_DENIED);
 
       var missingRole =
           assertThrows(StatusRuntimeException.class, () -> writerStub.deleteByQuery(request));
@@ -1876,7 +2572,20 @@ public class StandaloneGrpcServerTest {
     }
 
     private Fixture(StandaloneConfig config, io.grpc.Metadata headers) throws Exception {
-      this.runtime = new StandaloneRuntime(config);
+      this(
+          config,
+          headers,
+          FeatureFlags.communityDefaults(),
+          DynamicFeatureFlagRegistry.communityDefault());
+    }
+
+    private Fixture(
+        StandaloneConfig config,
+        io.grpc.Metadata headers,
+        FeatureFlags flags,
+        DynamicFeatureFlagRegistry dynamicFlags)
+        throws Exception {
+      this.runtime = new StandaloneRuntime(config, flags, dynamicFlags);
       this.server = new StandaloneGrpcServer(this.runtime).start();
       // Method timeouts start afresh for every RPC; a deadline stored on a stub is absolute.
       this.channel =
@@ -1918,6 +2627,7 @@ public class StandaloneGrpcServerTest {
     private IndexDescription ready(String id, long revision) throws Exception {
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
       while (System.nanoTime() < deadline) {
+        awaitRpcDelivery();
         var index = this.catalog.getIndex(GetIndexRequest.newBuilder().setIndexId(id).build());
         if (index.getLifecycleState().equals("READY") && index.getActiveRevision() == revision) {
           return index;
@@ -1929,7 +2639,8 @@ public class StandaloneGrpcServerTest {
               + this.catalog.getIndex(GetIndexRequest.newBuilder().setIndexId(id).build()));
     }
 
-    private void upsert(String id, String json) {
+    private void upsert(String id, String json) throws Exception {
+      awaitRpcDelivery();
       assertThat(
               this.docs
                   .upsert(
@@ -1940,6 +2651,25 @@ public class StandaloneGrpcServerTest {
                           .build())
                   .getIndexedCount())
           .isEqualTo(1);
+      awaitRpcDelivery();
+    }
+
+    /**
+     * Completion can reach the client just before the dispatcher's delivery finally releases
+     * admission.
+     */
+    private void awaitRpcDelivery() throws Exception {
+      if (this.runtime.config().maxInFlightRequests() != 1) {
+        return;
+      }
+      var dispatcherField = StandaloneGrpcServer.class.getDeclaredField("dispatcher");
+      dispatcherField.setAccessible(true);
+      var permitsField = RpcDispatcher.class.getDeclaredField("requests");
+      permitsField.setAccessible(true);
+      var permits =
+          (java.util.concurrent.Semaphore) permitsField.get(dispatcherField.get(this.server));
+      assertThat(permits.tryAcquire(5, TimeUnit.SECONDS)).isTrue();
+      permits.release();
     }
 
     private void upsertMany(String id, int count, java.util.function.IntFunction<String> document) {

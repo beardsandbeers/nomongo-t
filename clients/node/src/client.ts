@@ -1,3 +1,5 @@
+import type { SearchMetaRequest } from './generated/mongot/standalone/v1/SearchMetaRequest';
+import type { SearchMetaResponse__Output } from './generated/mongot/standalone/v1/SearchMetaResponse';
 import type { DeleteByQueryRequest } from './generated/mongot/standalone/v1/DeleteByQueryRequest';
 import type { DeleteByQueryResponse__Output } from './generated/mongot/standalone/v1/DeleteByQueryResponse';
 import type { UpsertRequest } from './generated/mongot/standalone/v1/UpsertRequest';
@@ -94,6 +96,9 @@ export class StandaloneClient {
   }
   search(request: QueryRequest): Promise<QueryResponse__Output> {
     return this.call((metadata, options, callback) => this.queries.search(request, metadata, options, callback));
+  }
+  searchMeta(request: SearchMetaRequest): Promise<SearchMetaResponse__Output> {
+    return this.call((metadata, options, callback) => this.queries.searchMeta(request, metadata, options, callback));
   }
   vectorSearch(request: QueryRequest): Promise<QueryResponse__Output> {
     return this.call((metadata, options, callback) => this.queries.vectorSearch(request, metadata, options, callback));

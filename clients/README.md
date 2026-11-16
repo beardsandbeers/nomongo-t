@@ -349,3 +349,13 @@ roles are required. New matching documents inserted after a reader was pinned ma
 normally; the operation does not chase concurrent inserts or rescan automatically. A later pass
 is optional. Scan/write failures and cancellation can leave partial deletions. Counts represent
 selected and processed IDs, rather than confirmed removals under concurrent writes.
+
+## Metadata-only queries
+
+Use `client.search_meta(api.SearchMetaRequest(query_bson=encode_bson(stage_body)))` in Python,
+`search_meta` in Rust, or `searchMeta` in Java/TypeScript. Pass the same stage body as coupled
+`$searchMeta`, including its `index` name (default `default`). Optional `index_id` and
+`generation_id` are identity fences. The response contains optional `metadata_bson`, the
+executed generation, and optional explain BSON; it has no hit batch or cursor. Planner-only
+explain omits metadata. See the [RPC guide](../docs/standalone-mongot-grpc-guide.md#metadata-only-search)
+for a facet example. This additive RPC requires a server built with SearchMeta support.

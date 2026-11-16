@@ -596,6 +596,25 @@ def exercise(client):
         not all_results(client, search(client, other, "coffee")), "Writes leaked into another index"
     )
     checks.append("direct text writes, cursor pagination, BSON preservation, index isolation")
+    meta = client.call(
+        "SearchMeta",
+        {
+            "indexId": text["indexId"],
+            "queryBson": encoded(
+                {
+                    "index": text["name"],
+                    "text": {"path": "title", "query": "coffee"},
+                    "count": {"type": "total"},
+                }
+            ),
+        },
+    )
+    check(
+        decoded(meta["metadataBson"]) == {"count": {"total": Int64(3)}},
+        "SearchMeta returned the wrong count",
+    )
+    check(meta["generationId"] == text["generationId"], "SearchMeta used the wrong generation")
+    checks.append("metadata-only search with unchanged stage syntax and identity fence")
     exercise_delete_by_query(client, other)
     checks.append("delete-by-query preview, visible deletion, and preservation of nonmatches")
     verify_explain(
@@ -777,6 +796,22 @@ def exercise(client):
         "cross-index and self joins, array keys, exclusion, counts, stable paging, "
         "foreign updates, dependency drop/recreation"
     )
+    meta = client.call(
+        "SearchMeta",
+        {
+            "queryBson": encoded(
+                {
+                    "index": "__search_meta_missing__",
+                    "text": {"path": "title", "query": "coffee"},
+                }
+            )
+        },
+    )
+    check(
+        decoded(meta["metadataBson"]) == {"count": {"total": Int64(0)}},
+        "SearchMeta did not preserve the coupled missing-index metadata",
+    )
+
     check(client.called == RPC_NAMES, f"Missing RPC coverage: {RPC_NAMES - client.called}")
     checks.append("vector writes and queries; index drop; every RPC")
     return {

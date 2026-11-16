@@ -36,6 +36,7 @@ import com.xgen.mongot.standalone.grpc.KillCursorRequest;
 import com.xgen.mongot.standalone.grpc.QueryRequest;
 import com.xgen.mongot.standalone.grpc.QueryResponse;
 import com.xgen.mongot.standalone.grpc.QueryServiceGrpc;
+import com.xgen.mongot.standalone.grpc.SearchMetaRequest;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
@@ -90,6 +91,53 @@ public class StandaloneJoinsTest {
       "[{type:'token'},{type:'objectId'}," + INTEGER_FIELD + "]";
 
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void searchMeta_partitionedJoin_returnsCountAndExplainAndReleasesDependencies()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'f1',key:'one',office:'Berlin'}");
+      f.upsert(foreign, "{_id:'f2',key:'one',office:'Berlin'}");
+      f.upsert(local, "{_id:'a',parent:'one'}");
+      f.upsert(local, "{_id:'b',parent:'two'}");
+      var body = BsonDocument.parse(JOIN).append("index", new org.bson.BsonString("local"));
+
+      var response =
+          f.queries.searchMeta(
+              SearchMetaRequest.newBuilder()
+                  .setQueryBson(ByteString.copyFrom(StandaloneDefinitionValidator.encode(body)))
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(
+              new RawBsonDocument(response.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getInt64("total")
+                  .getValue())
+          .isEqualTo(1);
+      assertThat(response.getGenerationId()).isNotEmpty();
+      var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+      var preparation = explain.getDocument("joins").getDocument("preparation");
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(1);
+      assertThat(preparation.getArray("sources")).hasSize(1);
+      assertThat(
+              preparation
+                  .getArray("sources")
+                  .getFirst()
+                  .asDocument()
+                  .getString("foreignIndexId")
+                  .getValue())
+          .isEqualTo(foreign);
+      assertThat(explain.getArray("indexPartitionExplain")).hasSize(2);
+      assertLocalJoinPlan(
+          explain.getArray("indexPartitionExplain").get(0).asDocument(), "termInSet", 1);
+      assertLocalJoinPlan(
+          explain.getArray("indexPartitionExplain").get(1).asDocument(), "termInSet", 1);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
 
   @Test
   public void search_mixedIdsAndReferences_matchesSameTypesAndPreservesTypedDeletes()
@@ -392,12 +440,16 @@ public class StandaloneJoinsTest {
   }
 
   private static void assertLocalPlan(BsonDocument explain, String strategy, int keyCount) {
+    assertThat(explain.containsKey("collectors")).isTrue();
+    assertLocalJoinPlan(explain, strategy, keyCount);
+  }
+
+  private static void assertLocalJoinPlan(BsonDocument explain, String strategy, int keyCount) {
     assertThat(explain.getDocument("luceneQuery").getString("analyzed").getValue())
         .contains("parent");
     assertThat(explain.getDocument("luceneQuery").getString("rewritten").getValue())
         .contains("parent");
     assertThat(explain.containsKey("query")).isTrue();
-    assertThat(explain.containsKey("collectors")).isTrue();
     assertThat(explain.get("query").toString()).contains("parent");
     assertThat(explain.get("query").toString()).doesNotContain("office");
     var joins = explain.getDocument("joins");

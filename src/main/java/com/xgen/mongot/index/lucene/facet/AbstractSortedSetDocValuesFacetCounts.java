@@ -18,6 +18,7 @@
 package com.xgen.mongot.index.lucene.facet;
 
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.util.QueryCancellation;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,6 +45,7 @@ abstract class AbstractSortedSetDocValuesFacetCounts extends Facets {
   final SortedSetDocValuesReaderState state;
   final SortedSetDocValues dv;
   final String field;
+  final Runnable cancellationCheck = QueryCancellation.capture();
 
   AbstractSortedSetDocValuesFacetCounts(SortedSetDocValuesReaderState state) throws IOException {
     this.field = state.getField();
@@ -65,6 +67,7 @@ abstract class AbstractSortedSetDocValuesFacetCounts extends Facets {
     @Var int totalDocCount = 0;
     PrimitiveIterator.OfInt ordIterator = getOrdIterator();
     while (ordIterator.hasNext()) {
+      this.cancellationCheck.run();
       int ord = ordIterator.nextInt();
       int count = getCount(ord);
       totalDocCount += count;
@@ -93,6 +96,7 @@ abstract class AbstractSortedSetDocValuesFacetCounts extends Facets {
     LabelAndValue[] labelValues = new LabelAndValue[resultCount];
     if (q != null) {
       for (int i = labelValues.length - 1; i >= 0; i--) {
+        this.cancellationCheck.run();
         TopOrdAndIntQueue.OrdAndInt ordAndInt = (TopOrdAndIntQueue.OrdAndInt) q.pop();
         BytesRef term = this.dv.lookupOrd(ordAndInt.ord);
         labelValues[i] = new LabelAndValue(term.utf8ToString(), ordAndInt.value);
@@ -111,6 +115,8 @@ abstract class AbstractSortedSetDocValuesFacetCounts extends Facets {
     PrimitiveIterator.OfInt ordIterator = getOrdIterator();
 
     while (ordIterator.hasNext()) {
+      this.cancellationCheck.run();
+
       int ord = ordIterator.nextInt();
       int count = getCount(ord);
       totalDocCount += count;

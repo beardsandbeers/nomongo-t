@@ -3,6 +3,7 @@ load("//bazel/java:test.bzl", "java_test_suite")
 java_test_suite(
     name = "concurrent",
     srcs = [
+        "DrainingExecutorTest.java",
         "ExecutorsTest.java",
         "FileLockGuardTest.java",
         "LiveThreadIdsRegistryTest.java",
@@ -11,9 +12,11 @@ java_test_suite(
         "OneShotSingleThreadExecutorTest.java",
         "PrioritizedTaskTest.java",
         "RecurringTimerTest.java",
+        "WorkSharingExecutorTest.java",
     ],
     tags = ["unit"],
     deps = [
+        "//src/main/java/com/xgen/mongot/util",
         "//src/main/java/com/xgen/mongot/util/concurrent",
         "//src/main/java/com/xgen/testing",
         "@maven//:com_google_errorprone_error_prone_annotations",

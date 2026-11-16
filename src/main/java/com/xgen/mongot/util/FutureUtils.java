@@ -1,5 +1,6 @@
 package com.xgen.mongot.util;
 
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.util.functionalinterfaces.CheckedRunnable;
 import com.xgen.mongot.util.functionalinterfaces.CheckedSupplier;
@@ -13,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BiFunction;
@@ -21,6 +23,33 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 public class FutureUtils {
+
+  /** Drain every worker before releasing shared reader resources, preserving the first failure. */
+  public static void awaitAll(List<? extends Future<?>> futures)
+      throws ExecutionException, InterruptedException {
+    @Var Optional<ExecutionException> failure = Optional.empty();
+    for (var future : futures) {
+      try {
+        Uninterruptibles.getUninterruptibly(future);
+      } catch (ExecutionException | CancellationException caught) {
+        var e =
+            caught instanceof ExecutionException execution
+                ? execution
+                : new ExecutionException(caught);
+        if (failure.isEmpty()) {
+          failure = Optional.of(e);
+        } else {
+          failure.get().addSuppressed(e);
+        }
+      }
+    }
+    if (failure.isPresent()) {
+      throw failure.get();
+    }
+    if (Thread.currentThread().isInterrupted()) {
+      throw new InterruptedException("Interrupted while waiting for query workers to drain");
+    }
+  }
 
   public static final CompletableFuture<Void> COMPLETED_FUTURE =
       CompletableFuture.completedFuture(null);

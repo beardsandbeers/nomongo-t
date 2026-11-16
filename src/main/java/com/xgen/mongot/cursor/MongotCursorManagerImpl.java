@@ -190,6 +190,17 @@ public class MongotCursorManagerImpl implements MongotCursorManager {
     }
   }
 
+  /** Creates a direct empty cursor after a transport has resolved a missing index. */
+  public SearchCursorInfo newEmptyCursor(String namespace) {
+    try (var ignored = LockGuard.with(this.sharedLock)) {
+      ensureOpen("newEmptyCursor");
+      var cursor = this.nullIndexManager.createEmptyCursor(namespace);
+      this.directCursorIds.add(cursor.cursorId);
+      this.cursorToIndex.put(cursor.cursorId, this.nullIndexManager);
+      return cursor;
+    }
+  }
+
   /** Creates a cursor pinned to a specific live generation, failing if a swap/drop changed it. */
   public SearchCursorInfo newCursor(
       GenerationId generationId,

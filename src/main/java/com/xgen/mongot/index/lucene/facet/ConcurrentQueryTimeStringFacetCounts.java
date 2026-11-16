@@ -1,5 +1,8 @@
 package com.xgen.mongot.index.lucene.facet;
 
+import com.xgen.mongot.util.FutureUtils;
+import com.xgen.mongot.util.QueryCancellation;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -36,6 +39,7 @@ import org.apache.lucene.util.IOUtils;
  * separate merge step.
  */
 public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
+  private final Runnable cancellationCheck = QueryCancellation.capture();
 
   private final String dim;
   private final String readField;
@@ -46,7 +50,10 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
       throws IOException, InterruptedException {
     this.dim = dim;
     this.readField = readField;
-    count(hits, executor);
+    var workSharingExecutor = new WorkSharingExecutor(executor);
+    try (var unused = workSharingExecutor.openScope()) {
+      count(hits, workSharingExecutor);
+    }
   }
 
   /**
@@ -68,13 +75,11 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
     for (MatchingDocs matchingDocs : hits.getMatchingDocs()) {
       futures.add(executor.submit(new CountOneSegment(matchingDocs)));
     }
-    for (Future<Void> future : futures) {
-      try {
-        future.get();
-      } catch (ExecutionException executionException) {
-        Throwable cause = executionException.getCause();
-        throw IOUtils.rethrowAlways(cause != null ? cause : executionException);
-      }
+    try {
+      FutureUtils.awaitAll(futures);
+    } catch (ExecutionException e) {
+      Throwable cause = e.getCause();
+      throw IOUtils.rethrowAlways(cause != null ? cause : e);
     }
   }
 
@@ -106,17 +111,22 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
       IntIntHashMap segCounts = new IntIntHashMap();
       if (singleValues != null) {
         for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
           segCounts.addTo(singleValues.ordValue(), 1);
         }
       } else {
         for (int doc = it.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = it.nextDoc()) {
+          ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
           for (int i = 0; i < multiValues.docValueCount(); i++) {
+            ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
             segCounts.addTo((int) multiValues.nextOrd(), 1);
           }
         }
       }
 
       for (IntCursor cursor : segCounts.keys()) {
+        ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
+
         int segOrd = cursor.value;
         int count = segCounts.get(segOrd);
         if (count == 0) {
@@ -142,6 +152,7 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
     int resultCount = Math.min(topN, sorted.size());
     LabelAndValue[] labelValues = new LabelAndValue[resultCount];
     for (int i = 0; i < resultCount; i++) {
+      ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
       Map.Entry<BytesRef, Integer> entry = sorted.get(i);
       labelValues[i] = new LabelAndValue(entry.getKey().utf8ToString(), entry.getValue());
     }
@@ -157,6 +168,7 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
 
     LabelAndValue[] labelValues = new LabelAndValue[labels.size()];
     for (int i = 0; i < labels.size(); i++) {
+      ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
       BytesRef label = labels.get(i);
       labelValues[i] = new LabelAndValue(label.utf8ToString(), this.termCounts.get(label).get());
     }
@@ -182,6 +194,7 @@ public final class ConcurrentQueryTimeStringFacetCounts extends Facets {
   private List<Map.Entry<BytesRef, Integer>> snapshotSortedByCount() {
     List<Map.Entry<BytesRef, Integer>> sorted = new ArrayList<>(this.termCounts.size());
     for (Map.Entry<BytesRef, AtomicInteger> entry : this.termCounts.entrySet()) {
+      ConcurrentQueryTimeStringFacetCounts.this.cancellationCheck.run();
       sorted.add(Map.entry(entry.getKey(), entry.getValue().get()));
     }
     // Tie-break by Lucene ordinal order (unsigned UTF-8), not Java String order.

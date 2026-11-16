@@ -22,6 +22,8 @@ import com.xgen.mongot.standalone.grpc.KillCursorResponse;
 import com.xgen.mongot.standalone.grpc.QueryRequest;
 import com.xgen.mongot.standalone.grpc.QueryResponse;
 import com.xgen.mongot.standalone.grpc.QueryServiceGrpc;
+import com.xgen.mongot.standalone.grpc.SearchMetaRequest;
+import com.xgen.mongot.standalone.grpc.SearchMetaResponse;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import com.xgen.mongot.util.Bytes;
 import io.grpc.Context;
@@ -75,6 +77,14 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   public void search(QueryRequest request, StreamObserver<QueryResponse> observer) {
     this.dispatcher.unary(
         request.getSerializedSize(), observer, () -> query(request, false), this::abandoned);
+  }
+
+  @Override
+  public void searchMeta(SearchMetaRequest request, StreamObserver<SearchMetaResponse> observer) {
+    this.dispatcher.unary(
+        request.getSerializedSize(),
+        observer,
+        () -> new StandaloneSearchMeta(this.runtime, this.joinPlanner).execute(request));
   }
 
   @Override
@@ -167,7 +177,11 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                 new MaterializedVectorSearchQuery(parsed, input),
                 QueryExecutionContext.withDeadline(deadline));
       } else {
-        var parsed = SearchQuery.fromBson(expression);
+        var parsed =
+            SearchQuery.fromBson(
+                expression,
+                QueryOptimizationFlags.DEFAULT_OPTIONS,
+                this.runtime.searchQueryParseOptions());
         if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(parsed))) {
           joinPlan = this.joinPlanner.prepare(parsed, generation.getGenerationId());
           query = new CursorQuery.Search(joinPlan.query(), Optional.of(joinPlan.snapshot()));
@@ -396,7 +410,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     return requested == 0 ? 100 : requested;
   }
 
-  private static Optional<Explain.Verbosity> explainVerbosity(ExplainVerbosity verbosity) {
+  static Optional<Explain.Verbosity> explainVerbosity(ExplainVerbosity verbosity) {
     return switch (verbosity) {
       case EXPLAIN_VERBOSITY_UNSPECIFIED -> Optional.empty();
       case EXPLAIN_VERBOSITY_QUERY_PLANNER -> Optional.of(Explain.Verbosity.QUERY_PLANNER);
@@ -410,7 +424,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     };
   }
 
-  private static RuntimeException queryError(Exception e) {
+  static RuntimeException queryError(Exception e) {
     if (e instanceof io.grpc.StatusRuntimeException status) {
       return status;
     }
@@ -424,6 +438,8 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     }
     if (e instanceof com.xgen.mongot.util.bson.parser.BsonParseException
         || e instanceof com.xgen.mongot.index.query.InvalidQueryException
+        || e instanceof com.xgen.mongot.util.regex.RegexLimitExceededException
+        || e instanceof org.bson.BsonInvalidOperationException
         || e instanceof IllegalArgumentException) {
       return Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException();
     }

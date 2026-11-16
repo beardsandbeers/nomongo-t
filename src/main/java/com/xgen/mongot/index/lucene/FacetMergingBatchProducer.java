@@ -15,6 +15,7 @@ import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.mongot.util.bson.BsonArrayBuilder;
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -107,10 +108,12 @@ public class FacetMergingBatchProducer implements BatchProducer {
     Table<String, BsonValue, Long> facetTable = HashBasedTable.create();
     @Var long mergedTotalHits = 0;
     for (int i = 0; i < batchProducers.size(); i++) {
+      QueryCancellation.check();
       try (var indexPartitionResourceManager = Explain.maybeEnterIndexPartitionQueryContext(i)) {
         mergedTotalHits += batchProducers.get(i).getTotalHits();
         List<IntermediateFacetBucket> buckets = batchProducers.get(i).getAllBucketResults();
         for (var bucket : buckets) {
+          QueryCancellation.check();
           // Tag is the facet name.
           if (facetTable.contains(bucket.tag(), bucket.bucket())) {
             facetTable.put(
@@ -133,6 +136,7 @@ public class FacetMergingBatchProducer implements BatchProducer {
     ArrayDeque<IntermediateFacetBucket> mergedFacetBuckets = new ArrayDeque<>();
     // We output the facetName in the same order of inputs.
     for (String facetName : facetTable.rowKeySet()) {
+      QueryCancellation.check();
       FacetDefinition facetDefinition = facetNameToDefinition.get(facetName);
       if (facetDefinition == null) {
         throw new IllegalStateException(
@@ -191,6 +195,7 @@ public class FacetMergingBatchProducer implements BatchProducer {
 
     ArrayDeque<IntermediateFacetBucket> facetBucketValue = this.facetBuckets.get();
     while (!facetBucketValue.isEmpty()) {
+      QueryCancellation.check();
       if (builder.append(facetBucketValue.getFirst().toRawBson())) {
         facetBucketValue.removeFirst();
       } else {
@@ -214,6 +219,7 @@ public class FacetMergingBatchProducer implements BatchProducer {
         this.batchProducers.get(0).getFacetCollector().facetDefinitions();
     Map<String, FacetInfo> facetNameToInfo = new HashMap<>();
     for (String facetName : facetNameToDefinition.keySet()) {
+      QueryCancellation.check();
       FacetDefinition facetDefinition = facetNameToDefinition.get(facetName);
       if (facetDefinition == null) {
         throw new IllegalStateException(

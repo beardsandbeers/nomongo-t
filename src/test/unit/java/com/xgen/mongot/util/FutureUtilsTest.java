@@ -1,5 +1,6 @@
 package com.xgen.mongot.util;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertEquals;
 
 import com.google.common.collect.ImmutableMap;
@@ -24,6 +25,42 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class FutureUtilsTest {
+
+  @Test
+  public void awaitAll_failedWorker_waitsForRemainingWorkersBeforeThrowing() throws Exception {
+    var failure = new IllegalStateException("failed worker");
+    var observed = new java.util.concurrent.atomic.AtomicBoolean();
+    var remaining =
+        new java.util.concurrent.FutureTask<Void>(
+            () -> {
+              observed.set(true);
+              return null;
+            });
+    // The second worker starts only when get() is reached. This proves that a preceding failure
+    // cannot short-circuit the drain and let reader resources close before the other worker.
+    var drainAware =
+        new java.util.concurrent.FutureTask<Void>(
+            () -> {
+              remaining.run();
+              remaining.get();
+              return null;
+            }) {
+          @Override
+          public Void get() throws InterruptedException, ExecutionException {
+            run();
+            return super.get();
+          }
+        };
+
+    var error =
+        Assert.assertThrows(
+            ExecutionException.class,
+            () ->
+                FutureUtils.awaitAll(List.of(CompletableFuture.failedFuture(failure), drainAware)));
+
+    assertThat(error).hasCauseThat().isSameInstanceAs(failure);
+    assertThat(observed.get()).isTrue();
+  }
 
   @Test
   public void testSwallowedFutureNoCallbackSuccessfulSource() {

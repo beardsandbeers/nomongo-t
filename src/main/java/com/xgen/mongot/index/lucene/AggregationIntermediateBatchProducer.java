@@ -15,6 +15,7 @@ import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.util.BsonUtils;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.mongot.util.bson.BsonArrayBuilder;
 import java.io.IOException;
 import java.util.List;
@@ -141,6 +142,7 @@ final class AggregationIntermediateBatchProducer implements BatchProducer {
       AggregationResultBuilder resultBuilder = producers.get(0).aggregationResult.toBuilder();
       @Var long totalHits = 0;
       for (AggregationIntermediateBatchProducer producer : producers) {
+        QueryCancellation.check();
         totalHits += producer.totalHits;
         resultBuilder.add(producer.aggregationResult);
       }
@@ -206,6 +208,7 @@ final class AggregationIntermediateBatchProducer implements BatchProducer {
 
     BsonArray docs = getIntermediateDocs();
     while (this.nextDocIndex < docs.size()) {
+      QueryCancellation.check();
       RawBsonDocument doc = toRawBsonDocument(docs.get(this.nextDocIndex));
       if (resultsBuilder.append(doc)) {
         this.nextDocIndex++;

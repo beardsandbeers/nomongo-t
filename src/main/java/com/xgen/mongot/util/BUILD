@@ -36,6 +36,7 @@ java_library(
         "NotImplementedException.java",
         "NumericUtils.java",
         "Optionals.java",
+        "QueryCancellation.java",
         "RepeatableActionFailureException.java",
         "Runtime.java",
         "SanitizedBytes.java",

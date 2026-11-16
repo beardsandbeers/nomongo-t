@@ -65,7 +65,7 @@ public final class ApiIngestionManager implements ReplicationManager {
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
   }
 
-  /** Pins a generation while writes, commits or statistics use its reader/writer resources. */
+  /** Pins a generation while writes, queries or statistics use its reader/writer resources. */
   public final class IndexLease implements AutoCloseable {
     private final GenerationId generation;
     private final IndexState state;
@@ -109,6 +109,11 @@ public final class ApiIngestionManager implements ReplicationManager {
   }
 
   public synchronized IndexLease acquireStatisticsLease(GenerationId generation) {
+    return acquireQueryLease(generation);
+  }
+
+  /** Prevents generation resources from retiring until query readers have drained. */
+  public synchronized IndexLease acquireQueryLease(GenerationId generation) {
     if (!isGenerationReady(generation)) {
       throw Status.UNAVAILABLE.withDescription("Index is not ready").asRuntimeException();
     }

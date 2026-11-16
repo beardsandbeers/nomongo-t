@@ -19,7 +19,9 @@ import com.xgen.mongot.index.query.collectors.AggregationCollector;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.QueryCancellation;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
+import com.xgen.mongot.util.concurrent.WorkSharingExecutor;
 import com.xgen.mongot.util.timers.InvocationCountingTimer;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -108,7 +110,7 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
                 facetsCollector,
                 topDocs.totalHits.value(),
                 returnScopePath,
-                concurrentSearchExecutor));
+                collectorQuery.concurrent() ? concurrentSearchExecutor : Optional.empty()));
 
         bucketProducers.addAll(
             getScopedStringBucketProducers(
@@ -325,11 +327,14 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
     try (var unused =
         new InvocationCountingTimer.AutocloseableOptional<>(
             facetTimings.map(t -> t.split(ExplainTimings.Type.GENERATE_FACET_COUNTS)))) {
-      counts =
-          concurrentSearchExecutor.isPresent()
-              ? new ConcurrentSortedSetDocValuesFacetCounts(
-                  facetsState, collector, concurrentSearchExecutor.get())
-              : new SortedSetDocValuesFacetCounts(facetsState, collector);
+      if (concurrentSearchExecutor.isPresent()) {
+        var executor = new WorkSharingExecutor(concurrentSearchExecutor.get());
+        try (var scope = executor.openScope()) {
+          counts = new ConcurrentSortedSetDocValuesFacetCounts(facetsState, collector, executor);
+        }
+      } else {
+        counts = new SortedSetDocValuesFacetCounts(facetsState, collector);
+      }
     }
 
     for (var entry : definitions.entrySet()) {
@@ -379,6 +384,7 @@ public class LuceneFacetCollectorMetaBatchProducerFactory {
     var tokenFacetsStateCache = searcher.getTokenFacetsStateCache().get();
 
     for (var entry : facetDefinitions.entrySet()) {
+      QueryCancellation.check();
       var lucenePath =
           FieldName.TypeField.TOKEN.getLuceneFieldName(
               FieldPath.parse(entry.getValue().path()), returnScope);

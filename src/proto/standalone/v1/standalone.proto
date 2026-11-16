@@ -23,6 +23,7 @@ service DocumentService {
 service OperationsService { rpc GetStatus(GetStatusRequest) returns (ServiceStatus); }
 service QueryService {
   rpc Search(QueryRequest) returns (QueryResponse);
+  rpc SearchMeta(SearchMetaRequest) returns (SearchMetaResponse);
   rpc VectorSearch(QueryRequest) returns (QueryResponse);
   rpc GetMore(GetMoreRequest) returns (QueryResponse);
   rpc KillCursor(KillCursorRequest) returns (KillCursorResponse);
@@ -238,6 +239,20 @@ message QueryResponse {
   // Empty unless explain was requested. Complete BSON document in the engine's explain format.
   // Execution statistics accumulate across Search/VectorSearch and subsequent GetMore batches.
   bytes explain_bson = 5;
+}
+// query_bson is the unchanged $searchMeta stage body. Its index option selects the index
+// by name (default: "default"). IDs are optional identity/generation fences, not selectors.
+message SearchMetaRequest {
+  string index_id = 1;
+  bytes query_bson = 2;
+  string generation_id = 3;
+  ExplainVerbosity explain_verbosity = 4;
+}
+message SearchMetaResponse {
+  // Complete coupled metadata document; absent for planner-only explain.
+  optional bytes metadata_bson = 1;
+  string generation_id = 2;
+  bytes explain_bson = 3;
 }
 message GetMoreRequest { uint64 cursor_id = 1; uint32 batch_size = 2; }
 message KillCursorRequest { uint64 cursor_id = 1; }

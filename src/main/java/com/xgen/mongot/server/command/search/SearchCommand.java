@@ -22,6 +22,7 @@ import com.xgen.mongot.cursor.serialization.MongotIntermediateCursorBatch;
 import com.xgen.mongot.embedding.providers.EmbeddingServiceManager;
 import com.xgen.mongot.featureflag.Feature;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
+import com.xgen.mongot.featureflag.dynamic.SearchQueryFeaturePolicy;
 import com.xgen.mongot.index.DynamicFeatureFlagsMetricsRecorder;
 import com.xgen.mongot.index.IndexGeneration;
 import com.xgen.mongot.index.IndexUnavailableException;
@@ -42,7 +43,6 @@ import com.xgen.mongot.index.query.Query;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.SearchQueryParseOptions;
-import com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria;
 import com.xgen.mongot.index.query.operators.VectorSearchCriteria;
 import com.xgen.mongot.index.query.operators.VectorSearchOperator;
 import com.xgen.mongot.index.query.operators.VectorSearchQueryInput;
@@ -157,19 +157,9 @@ public class SearchCommand implements Command {
               .optimizationFlags()
               .map(OptimizationFlagsDefinition::toQueryOptimizationFlags)
               .orElse(QueryOptimizationFlags.DEFAULT_OPTIONS);
-      boolean allow10k =
-          this.metadata
-              .dynamicFeatureFlagRegistry()
-              .evaluateClusterInvariant(DynamicFeatureFlags.ENABLE_10K_BUCKET_LIMIT);
-      boolean searchAggregationEnabled =
-          this.metadata.featureFlags().isEnabled(Feature.SEARCH_AGGREGATION);
-      boolean embeddedScopedSortEnabled =
-          this.metadata
-              .dynamicFeatureFlagRegistry()
-              .evaluateClusterInvariant(DynamicFeatureFlags.ENABLE_EMBEDDED_SCOPED_SORT);
       SearchQueryParseOptions parseOptions =
-          new SearchQueryParseOptions(
-              allow10k, searchAggregationEnabled, embeddedScopedSortEnabled);
+          SearchQueryFeaturePolicy.parseOptions(
+              this.metadata.featureFlags(), this.metadata.dynamicFeatureFlagRegistry());
       @Var
       SearchQuery queryDefinition =
           SearchQuery.fromBson(
@@ -365,26 +355,8 @@ public class SearchCommand implements Command {
       SearchQuery queryDefinition, QueryCursorOptions queryCursorOptions)
       throws InvalidQueryException {
 
-    if (!(queryDefinition instanceof OperatorQuery operatorQuery)) {
-      return;
-    }
-
-    if (operatorQuery.operator() instanceof VectorSearchOperator
-        && queryCursorOptions.requireSequenceTokens()) {
-      throw new InvalidQueryException(
-          "Pagination is not supported with the 'vectorSearch' operator. "
-              + "Use $skip and $limit stages instead.");
-    }
-
-    // Mirror the $vectorSearch command: an omitted numCandidates (auto mode) is only allowed when
-    // the AUTO_NUM_CANDIDATES flag is enabled. Otherwise reject it as before, since nothing
-    // resolves the auto value on the flag-off path.
-    if (operatorQuery.operator() instanceof VectorSearchOperator vectorSearchOperator
-        && vectorSearchOperator.criteria() instanceof ApproximateVectorSearchCriteria approx
-        && approx.isAutoNumCandidates()
-        && !this.metadata.featureFlags().isEnabled(Feature.AUTO_NUM_CANDIDATES)) {
-      throw new InvalidQueryException("numCandidates is required for approximate vector search");
-    }
+    SearchQueryFeaturePolicy.validateQuery(
+        queryDefinition, queryCursorOptions.requireSequenceTokens(), this.metadata.featureFlags());
   }
 
   private BsonDocument getBatch(

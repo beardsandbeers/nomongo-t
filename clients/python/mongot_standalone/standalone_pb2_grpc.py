@@ -709,6 +709,12 @@ class QueryServiceStub:
             response_deserializer=standalone__pb2.QueryResponse.FromString,
             _registered_method=True,
         )
+        self.SearchMeta = channel.unary_unary(
+            "/mongot.standalone.v1.QueryService/SearchMeta",
+            request_serializer=standalone__pb2.SearchMetaRequest.SerializeToString,
+            response_deserializer=standalone__pb2.SearchMetaResponse.FromString,
+            _registered_method=True,
+        )
         self.VectorSearch = channel.unary_unary(
             "/mongot.standalone.v1.QueryService/VectorSearch",
             request_serializer=standalone__pb2.QueryRequest.SerializeToString,
@@ -733,6 +739,12 @@ class QueryServiceServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Search(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def SearchMeta(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
@@ -763,6 +775,11 @@ def add_QueryServiceServicer_to_server(servicer, server):
             servicer.Search,
             request_deserializer=standalone__pb2.QueryRequest.FromString,
             response_serializer=standalone__pb2.QueryResponse.SerializeToString,
+        ),
+        "SearchMeta": grpc.unary_unary_rpc_method_handler(
+            servicer.SearchMeta,
+            request_deserializer=standalone__pb2.SearchMetaRequest.FromString,
+            response_serializer=standalone__pb2.SearchMetaResponse.SerializeToString,
         ),
         "VectorSearch": grpc.unary_unary_rpc_method_handler(
             servicer.VectorSearch,
@@ -810,6 +827,36 @@ class QueryService:
             "/mongot.standalone.v1.QueryService/Search",
             standalone__pb2.QueryRequest.SerializeToString,
             standalone__pb2.QueryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def SearchMeta(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/mongot.standalone.v1.QueryService/SearchMeta",
+            standalone__pb2.SearchMetaRequest.SerializeToString,
+            standalone__pb2.SearchMetaResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -24,6 +24,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/lucene/util",
         "//src/main/java/com/xgen/mongot/index/query",
         "//src/main/java/com/xgen/mongot/util",
+        "//src/main/java/com/xgen/mongot/util/concurrent",
         "@maven//:com_github_ben_manes_caffeine_caffeine",
         "@maven//:com_google_errorprone_error_prone_annotations",
         "@maven//:com_google_guava_guava",

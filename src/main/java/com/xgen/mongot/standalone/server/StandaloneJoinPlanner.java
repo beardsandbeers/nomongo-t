@@ -24,6 +24,7 @@ import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.index.query.operators.VectorSearchOperator;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.standalone.grpc.IndexType;
+import com.xgen.mongot.standalone.ingestion.ApiIngestionManager.IndexLease;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import io.grpc.Context;
 import io.grpc.Status;
@@ -324,6 +325,7 @@ final class StandaloneJoinPlanner {
     private final int localQueryCopies;
     private final Map<String, GenerationId> dependencies = new LinkedHashMap<>();
     private final Map<String, QuerySnapshot> snapshots = new LinkedHashMap<>();
+    private final List<IndexLease> leases = new ArrayList<>();
     @Nullable private QuerySnapshot localSnapshot;
     private SearchQuery query;
     private long bytes;
@@ -403,6 +405,7 @@ final class StandaloneJoinPlanner {
             .withDescription("Requested generation is no longer live")
             .asRuntimeException();
       }
+      this.leases.add(StandaloneJoinPlanner.this.runtime.ingestion().acquireQueryLease(generation));
       this.dependencies.put(id, generation);
       this.snapshots.put(
           id,
@@ -451,6 +454,8 @@ final class StandaloneJoinPlanner {
         } finally {
           StandaloneJoinPlanner.this.retainedBytes.addAndGet(-this.bytes);
           this.snapshots.clear();
+          this.leases.forEach(IndexLease::close);
+          this.leases.clear();
         }
       }
     }

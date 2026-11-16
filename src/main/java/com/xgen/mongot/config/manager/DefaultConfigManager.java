@@ -23,6 +23,7 @@ import com.xgen.mongot.cursor.MongotCursorManager;
 import com.xgen.mongot.featureflag.Feature;
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
+import com.xgen.mongot.featureflag.dynamic.SearchQueryFeaturePolicy;
 import com.xgen.mongot.index.IndexFactory;
 import com.xgen.mongot.index.IndexGeneration;
 import com.xgen.mongot.index.IndexInformation;
@@ -35,6 +36,9 @@ import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.definition.IndexDefinitionGenerationProducer;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.definition.VectorIndexDefinition;
+import com.xgen.mongot.index.query.InvalidQueryException;
+import com.xgen.mongot.index.query.SearchQuery;
+import com.xgen.mongot.index.query.SearchQueryParseOptions;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.lifecycle.LifecycleManager;
@@ -70,8 +74,8 @@ import org.slf4j.LoggerFactory;
  * DefaultConfigManager implements a ConfigManager that owns the lifecycle of Indexes, and manages
  * their replication and cursors.
  *
- * <p>Methods here need to be synchronized because {@link DefaultConfigManager#close()} might be
- * called from a shutdown hook thread.
+ * <p>Methods accessing mutable config state need to be synchronized because {@link
+ * DefaultConfigManager#close()} might be called from a shutdown hook thread.
  *
  * <p>This is the only writer of the members of {@link ConfigState}, which are not thread safe.
  */
@@ -114,6 +118,9 @@ public class DefaultConfigManager implements ConfigManager {
 
   final FeatureFlags featureFlags;
 
+  // Retain the thread-safe registry so query parsing does not need the config lifecycle monitor.
+  private final DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry;
+
   @GuardedBy("this")
   private boolean closed;
 
@@ -151,9 +158,21 @@ public class DefaultConfigManager implements ConfigManager {
             new AtomicBoolean(),
             initialized -> initialized.get() ? 1 : 0);
     this.featureFlags = featureFlags;
+    this.dynamicFeatureFlagRegistry = configState.dynamicFeatureFlagRegistry;
     this.replicationStatusChangeTimestamp = Instant.now();
 
     updateIndexInfos();
+  }
+
+  /** Validate transport-independent query options against the engine's feature configuration. */
+  public void validateSearchQuery(SearchQuery query) throws InvalidQueryException {
+    SearchQueryFeaturePolicy.validateQuery(query, false, this.featureFlags);
+  }
+
+  /** Read the readers' live feature configuration without waiting for config lifecycle work. */
+  public SearchQueryParseOptions getSearchQueryParseOptions() {
+    return SearchQueryFeaturePolicy.parseOptions(
+        this.featureFlags, this.dynamicFeatureFlagRegistry);
   }
 
   /**

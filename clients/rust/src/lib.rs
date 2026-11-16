@@ -232,6 +232,19 @@ impl Client {
             .map_err(normalize_status)?
             .into_inner())
     }
+    pub async fn search_meta(
+        &mut self,
+        message: SearchMetaRequest,
+    ) -> Result<SearchMetaResponse, Status> {
+        let mut request = Request::new(message);
+        request.set_timeout(self.timeout);
+        Ok(self
+            .queries
+            .search_meta(request)
+            .await
+            .map_err(normalize_status)?
+            .into_inner())
+    }
     pub async fn vector_search(&mut self, message: QueryRequest) -> Result<QueryResponse, Status> {
         let mut request = Request::new(message);
         request.set_timeout(self.timeout);

@@ -28,6 +28,7 @@ import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.concurrent.DrainingExecutor;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import com.xgen.mongot.util.regex.RegexInterruptedException;
 import com.xgen.mongot.util.regex.RegexLimitExceededException;
@@ -47,6 +48,7 @@ import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.IOUtils;
+import org.apache.lucene.util.ThreadInterruptedException;
 import org.bson.BsonArray;
 
 /**
@@ -58,7 +60,7 @@ import org.bson.BsonArray;
 public class MultiLuceneSearchIndexReader implements SearchIndexReader {
   private final List<LuceneSearchIndexReader> readers;
   private final boolean shouldCollectMultiPartitionEmptyBatchProducer;
-  private final Optional<TaskExecutor> taskExecutor;
+  private final Optional<NamedExecutorService> concurrentSearchExecutor;
 
   MultiLuceneSearchIndexReader(
       List<LuceneSearchIndexReader> readers,
@@ -72,7 +74,7 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
         readers.size() >= 2,
         "There must be >= 2 underlying readers to construct MultiLuceneSearchIndexReader.");
     this.readers = readers;
-    this.taskExecutor = concurrentSearchExecutor.map(TaskExecutor::new);
+    this.concurrentSearchExecutor = concurrentSearchExecutor;
   }
 
   @Override
@@ -210,18 +212,24 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     SearchProducerAndMetaProducer result =
         intermediateQueryWithSnapshots(
             query, queryCursorOptions, batchSizeStrategy, queryOptimizationFlags, snapshots);
-    MetaResults metaResults =
-        switch (result.metaBatchProducer) {
-          case FacetMergingBatchProducer facetMergingBatchProducer ->
-              facetMergingBatchProducer.getMetaResultsAndClose(query.count().type());
-          case AggregationIntermediateBatchProducer aggregationBatchProducer ->
-              aggregationBatchProducer.getMetaResultsAndClose(query.count().type());
-          default ->
-              throw new IllegalStateException(
-                  "metaProducer from intermediateQuery() must be a FacetMergingBatchProducer or"
-                      + " an AggregationIntermediateBatchProducer.");
-        };
-    return new SearchProducerAndMetaResults(result.searchBatchProducer, metaResults);
+    try {
+      MetaResults metaResults =
+          switch (result.metaBatchProducer) {
+            case FacetMergingBatchProducer facetMergingBatchProducer ->
+                facetMergingBatchProducer.getMetaResultsAndClose(query.count().type());
+            case AggregationIntermediateBatchProducer aggregationBatchProducer ->
+                aggregationBatchProducer.getMetaResultsAndClose(query.count().type());
+            default ->
+                throw new IllegalStateException(
+                    "metaProducer from intermediateQuery() must be a FacetMergingBatchProducer or"
+                        + " an AggregationIntermediateBatchProducer.");
+          };
+      return new SearchProducerAndMetaResults(result.searchBatchProducer, metaResults);
+    } catch (RuntimeException | Error e) {
+      // Ownership has left the snapshots, but no cursor owns these producers until we return.
+      IOUtils.closeWhileHandlingException(result.searchBatchProducer, result.metaBatchProducer);
+      throw e;
+    }
   }
 
   @Override
@@ -270,6 +278,32 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
                   aggregationBatchProducers,
                   snapshots),
           snapshots.isPresent());
+      var searchMergingBatchProducer =
+          searchBatchProducers.isEmpty()
+              ? new EmptySearchBatchProducer()
+              : new SearchMergingBatchProducer(searchBatchProducers);
+      BatchProducer searchBatchProducer =
+          (this.shouldCollectMultiPartitionEmptyBatchProducer || snapshots.isPresent())
+              ? wrapWithAdditionalClosers(searchMergingBatchProducer, extraBatchProducersToClose)
+              : searchMergingBatchProducer;
+      BatchProducer mergedMetaProducer;
+      if (!facetBatchProducers.isEmpty()) {
+        mergedMetaProducer = FacetMergingBatchProducer.create(facetBatchProducers);
+      } else if (!aggregationBatchProducers.isEmpty()) {
+        // Sequential fold after the concurrent per-partition fan-out above has joined: the merge
+        // (like AggregationResultBuilder) is not thread-safe, so partitions must not fold directly.
+        mergedMetaProducer =
+            AggregationIntermediateBatchProducer.merge(
+                aggregationBatchProducers,
+                this.readers.get(0).getSearchAggregationMetricsReporter());
+      } else if (!countBatchProducers.isEmpty()) {
+        mergedMetaProducer = new CountMergingBatchProducer(countBatchProducers);
+      } else {
+        return Check.unreachable(
+            "Either facetBatchProducers, aggregationBatchProducers or countBatchProducers must be"
+                + " non-empty");
+      }
+      return new SearchProducerAndMetaProducer(searchBatchProducer, mergedMetaProducer);
     } catch (IOException
         | InvalidQueryException
         | InterruptedException
@@ -282,31 +316,6 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
       IOUtils.closeWhileHandlingException(aggregationBatchProducers);
       throw e;
     }
-    var searchMergingBatchProducer =
-        searchBatchProducers.isEmpty()
-            ? new EmptySearchBatchProducer()
-            : new SearchMergingBatchProducer(searchBatchProducers);
-    BatchProducer searchBatchProducer =
-        (this.shouldCollectMultiPartitionEmptyBatchProducer || snapshots.isPresent())
-            ? wrapWithAdditionalClosers(searchMergingBatchProducer, extraBatchProducersToClose)
-            : searchMergingBatchProducer;
-    BatchProducer mergedMetaProducer;
-    if (!facetBatchProducers.isEmpty()) {
-      mergedMetaProducer = FacetMergingBatchProducer.create(facetBatchProducers);
-    } else if (!aggregationBatchProducers.isEmpty()) {
-      // Sequential fold after the concurrent per-partition fan-out above has joined: the merge
-      // (like AggregationResultBuilder) is not thread-safe, so partitions must not fold directly.
-      mergedMetaProducer =
-          AggregationIntermediateBatchProducer.merge(
-              aggregationBatchProducers, this.readers.get(0).getSearchAggregationMetricsReporter());
-    } else if (!countBatchProducers.isEmpty()) {
-      mergedMetaProducer = new CountMergingBatchProducer(countBatchProducers);
-    } else {
-      return Check.unreachable(
-          "Either facetBatchProducers, aggregationBatchProducers or countBatchProducers must be"
-              + " non-empty");
-    }
-    return new SearchProducerAndMetaProducer(searchBatchProducer, mergedMetaProducer);
   }
 
   @Override
@@ -565,7 +574,7 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
   private void executeOnAllPartitions(
       Query query, PartitionExecutor partitionExecutor, boolean pinned)
       throws IOException, InvalidQueryException, InterruptedException {
-    if (query.concurrent() && this.taskExecutor.isPresent()) {
+    if (query.concurrent() && this.concurrentSearchExecutor.isPresent()) {
       Context parentContext = Context.current();
       Queue<Exception> exceptions = new ConcurrentLinkedQueue<>();
       List<Callable<Void>> tasks =
@@ -581,7 +590,12 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
                         return null;
                       })
               .toList();
-      this.taskExecutor.get().invokeAll(tasks);
+      try (var taskGroup = new DrainingExecutor(this.concurrentSearchExecutor.get())) {
+        new TaskExecutor(taskGroup).invokeAll(tasks);
+      } catch (ThreadInterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw e;
+      }
       if (!exceptions.isEmpty()) {
         Exception first = exceptions.poll();
         while (!exceptions.isEmpty()) {

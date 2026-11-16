@@ -657,6 +657,39 @@ class QueryResponse(_message.Message):
         explain_bson: _Optional[bytes] = ...,
     ) -> None: ...
 
+class SearchMetaRequest(_message.Message):
+    __slots__ = ("index_id", "query_bson", "generation_id", "explain_verbosity")
+    INDEX_ID_FIELD_NUMBER: _ClassVar[int]
+    QUERY_BSON_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPLAIN_VERBOSITY_FIELD_NUMBER: _ClassVar[int]
+    index_id: str
+    query_bson: bytes
+    generation_id: str
+    explain_verbosity: ExplainVerbosity
+    def __init__(
+        self,
+        index_id: _Optional[str] = ...,
+        query_bson: _Optional[bytes] = ...,
+        generation_id: _Optional[str] = ...,
+        explain_verbosity: _Optional[_Union[ExplainVerbosity, str]] = ...,
+    ) -> None: ...
+
+class SearchMetaResponse(_message.Message):
+    __slots__ = ("metadata_bson", "generation_id", "explain_bson")
+    METADATA_BSON_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    EXPLAIN_BSON_FIELD_NUMBER: _ClassVar[int]
+    metadata_bson: bytes
+    generation_id: str
+    explain_bson: bytes
+    def __init__(
+        self,
+        metadata_bson: _Optional[bytes] = ...,
+        generation_id: _Optional[str] = ...,
+        explain_bson: _Optional[bytes] = ...,
+    ) -> None: ...
+
 class GetMoreRequest(_message.Message):
     __slots__ = ("cursor_id", "batch_size")
     CURSOR_ID_FIELD_NUMBER: _ClassVar[int]

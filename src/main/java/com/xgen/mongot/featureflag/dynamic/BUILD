@@ -6,10 +6,12 @@ java_library(
         "DynamicFeatureFlagConfig.java",
         "DynamicFeatureFlagRegistry.java",
         "DynamicFeatureFlags.java",
+        "SearchQueryFeaturePolicy.java",
     ],
     visibility = ["//visibility:public"],
     exports = ["@maven//:org_mongodb_bson"],
     deps = [
+        "//src/main/java/com/xgen/mongot/featureflag",
         "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/explainers",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/information",
