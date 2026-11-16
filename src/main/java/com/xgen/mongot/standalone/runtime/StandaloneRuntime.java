@@ -327,12 +327,12 @@ public final class StandaloneRuntime implements Closeable {
             .orElseThrow(
                 () ->
                     Status.UNAVAILABLE
-                        .withDescription("Join index is not query-ready")
+                        .withDescription("Query index is not query-ready")
                         .asRuntimeException());
     var initialized = this.initializedIndexes.getIndex(live.getGenerationId());
     if (initialized.isEmpty() || !(initialized.get() instanceof InitializedSearchIndex search)) {
       throw Status.INVALID_ARGUMENT
-          .withDescription("Joins require search indexes")
+          .withDescription("Query snapshots require search indexes")
           .asRuntimeException();
     }
     return search.getReader().acquireQuerySnapshot(concurrent);
