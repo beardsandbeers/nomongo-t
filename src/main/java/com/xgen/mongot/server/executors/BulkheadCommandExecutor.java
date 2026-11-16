@@ -236,13 +236,36 @@ public class BulkheadCommandExecutor implements Closeable {
    *     queue is full, or if the executor has been shut down
    */
   public CompletableFuture<BsonDocument> execute(Command command, BooleanSupplier isCancelled) {
+    var context = io.grpc.Context.current();
+    Runnable check =
+        () -> {
+          if (context.isCancelled()
+              || isCancelled.getAsBoolean()
+              || Thread.currentThread().isInterrupted()) {
+            throw new java.util.concurrent.CancellationException("Search request cancelled");
+          }
+          if (context.getDeadline() != null && context.getDeadline().isExpired()) {
+            throw new java.util.concurrent.CancellationException("Search deadline exceeded");
+          }
+        };
+    Supplier<BsonDocument> invocation =
+        () ->
+            com.xgen.mongot.extensions.join.JoinExecutionContext.run(
+                check,
+                () ->
+                    context.getDeadline() == null
+                        ? Long.MAX_VALUE
+                        : context
+                            .getDeadline()
+                            .timeRemaining(java.util.concurrent.TimeUnit.NANOSECONDS),
+                command::run);
     return switch (command.getExecutionPolicy()) {
       case ASYNC -> {
         if (!command.maybeLoadShed()) {
           yield submitOrCrashOnThreadCreationOom(
               () ->
                   CompletableFuture.supplyAsync(
-                      command::run, this.guaranteedBlockingCommandExecutor));
+                      invocation, this.guaranteedBlockingCommandExecutor));
         }
         recordWouldHaveRejectedIfNeeded();
         yield submitOrCrashOnThreadCreationOom(
@@ -259,13 +282,13 @@ public class BulkheadCommandExecutor implements Closeable {
                                 + command.name()
                                 + "' skipped: stream was cancelled before execution");
                       }
-                      return command.run();
+                      return invocation.get();
                     },
                     this.regularBlockingCommandExecutor));
       }
       case SYNC -> {
         try {
-          yield CompletableFuture.completedFuture(command.run());
+          yield CompletableFuture.completedFuture(invocation.get());
         } catch (Throwable t) {
           yield CompletableFuture.failedFuture(t);
         }

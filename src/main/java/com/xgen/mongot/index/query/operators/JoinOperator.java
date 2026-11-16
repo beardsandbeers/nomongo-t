@@ -9,22 +9,13 @@ import com.xgen.mongot.util.bson.parser.Field;
 import java.util.Optional;
 import org.bson.BsonValue;
 
-/** An existence join whose foreign predicate is resolved by standalone query planning. */
+/** An existence join whose foreign predicate is resolved by shared query planning. */
 public record JoinOperator(
-    Optional<String> from, FieldPath localField, FieldPath foreignField, Operator operator)
+    Optional<JoinSource> from, FieldPath localField, FieldPath foreignField, Operator operator)
     implements Operator {
   static class Fields {
-    static final Field.Optional<String> FROM =
-        Field.builder("from")
-            .stringField()
-            .validate(
-                value ->
-                    value.isBlank() || value.length() > 256 || value.indexOf('\0') >= 0
-                        ? Optional.of(
-                            "must be an index name containing 1 to 256 characters without NUL")
-                        : Optional.empty())
-            .optional()
-            .noDefault();
+    static final Field.Optional<JoinSource> FROM =
+        Field.builder("from").classField(JoinSource::fromBson).optional().noDefault();
     static final Field.Required<String> LOCAL_FIELD =
         Field.builder("localField").stringField().mustNotBeEmpty().required();
     static final Field.Required<String> FOREIGN_FIELD =

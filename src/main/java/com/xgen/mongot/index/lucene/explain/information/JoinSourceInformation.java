@@ -8,11 +8,12 @@ import com.xgen.mongot.util.bson.parser.DocumentParser;
 import com.xgen.mongot.util.bson.parser.Field;
 import java.util.Optional;
 import org.bson.BsonDocument;
+import org.bson.BsonValue;
 
 /** One prepared join equality domain. Work units include checks, segments, documents and values. */
 public record JoinSourceInformation(
     int id,
-    Optional<String> from,
+    Optional<BsonValue> from,
     String foreignIndexId,
     String foreignGeneration,
     boolean selfJoin,
@@ -29,8 +30,8 @@ public record JoinSourceInformation(
     implements DocumentEncodable {
   private static class Fields {
     static final Field.Required<Integer> ID = Field.builder("id").intField().required();
-    static final Field.Optional<String> FROM =
-        Field.builder("from").stringField().optional().noDefault();
+    static final Field.Optional<BsonValue> FROM =
+        Field.builder("from").unparsedValueField().optional().noDefault();
     static final Field.Required<String> FOREIGN_INDEX_ID =
         Field.builder("foreignIndexId").stringField().required();
     static final Field.Required<String> FOREIGN_GENERATION =

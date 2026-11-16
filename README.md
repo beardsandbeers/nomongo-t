@@ -38,6 +38,7 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 | Standalone indexes | Run without MongoDB. Create independent named indexes and write BSON directly through gRPC `Upsert` and `Delete`. Each index owns its content and lifecycle. |
 | Delete by query | `DeleteByQuery` exhausts matching roots in pinned readers, with parallel segment collection, native bulk deletes, dry runs, and no client-supplied document limit. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
 | Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. See [join examples](#join-searches-across-indexes). |
+| Coupled joins through MongoDB | Source builds support inline joins in `$search` and `$searchMeta` over replicated indexes in the same database and non-sharded mongot deployment. See [syntax, limits, and the authorization caveat](docs/coupled-joins.md). |
 | Public gRPC API and four clients | Manage indexes, ingest documents, search, and page results from Python, Rust, Java, and TypeScript, with TLS and bearer tokens restricted by role and index. See the [client guide](clients/README.md). |
 | Concurrent gRPC ingestion | Apply batches concurrently to the same or different indexes. Writes default to `INDEXED`; background reader refresh and commits default to one second. Request `VISIBLE` or `COMMITTED` when needed. See [write behavior](#write-behavior-and-persistence). |
 | Dynamic mapping export | `GetIndexMappings` combines configured fields and observed dynamic types into reusable static mappings. See the [mapping example](clients/README.md#export-a-dynamic-mapping). |
@@ -47,9 +48,12 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 | Join execution diagnostics | Explain inline joins with foreign-key preparation timings, key and memory budgets, per-partition strategy choices, sampled estimates, and probe-to-postings fallback counters. Counters accumulate across cursor batches. See [join explain](docs/join-design-guide.md#join-explain). |
 
 MongoDB supports aggregation joins through `$lookup`. This fork's `join` runs inside a mongot
-search expression over standalone indexes and returns matching local documents. It does not
-attach foreign documents. The upstream MongoDB-backed entry point remains in the source;
-the standalone instructions below cover the direct gRPC deployment.
+search expression and returns matching local documents without attaching foreign documents.
+Standalone queries use `from: "index_name"`. Source builds also support coupled queries through
+mongod with `from: {collection: "accounts", index: "default"}`; `index` defaults to `"default"`.
+**Coupled joins do not enforce the caller's permissions on the foreign collection.** See the
+[coupled join guide](docs/coupled-joins.md) and [authorization follow-up](https://github.com/beardsandbeers/nomongo-t/issues/3).
+The standalone instructions below cover the direct gRPC deployment.
 
 Both ingestion paths can run in one process. Startup follows the configuration: without
 `syncSource`, mongot runs standalone; with `syncSource.replicaSet`, it starts MongoDB replication
@@ -305,8 +309,9 @@ with Client(
     # ['c1']
 ```
 
-`from` is an exact, case-sensitive index name. Omit it for a self-join, for example employees
-whose manager works in Berlin, with `managerKey`, `employeeKey`, and `office` mapped as tokens:
+In the standalone API, `from` is an exact, case-sensitive index name. Omit it for a self-join,
+for example employees whose manager works in Berlin, with `managerKey`, `employeeKey`, and
+`office` mapped as tokens:
 
 ```json
 {
@@ -537,5 +542,6 @@ not needed. For client development, install `./clients/python` instead of the Py
 - [Server configuration, write semantics, and backpressure](docs/standalone-mongot.md)
 - [Architecture](docs/standalone-mongot-grpc-guide.md)
 - [Join syntax, mappings, and execution](docs/join-design-guide.md)
+- [Coupled joins through MongoDB and authorization caveat](docs/coupled-joins.md)
 - [Docker images](https://hub.docker.com/r/mybyte/nomongo-t) and [Python packages](https://pypi.org/project/mongot-standalone-client/)
 - [Release downloads (0.9.0)](https://github.com/beardsandbeers/nomongo-t/releases/tag/standalone-v0.9.0)

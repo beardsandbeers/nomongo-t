@@ -704,7 +704,7 @@ public class LuceneSearchQueryFactoryDistributor {
     try {
       return switch (operator) {
         case JoinOperator ignored ->
-            throw new InvalidQueryException("join requires standalone query planning");
+            throw new InvalidQueryException("join requires query planning");
         case MaterializedJoinOperator joinOperator -> JoinQueryFactory.fromJoin(joinOperator);
         case AllDocumentsOperator allDocumentsOperator ->
             this.allDocsQueryFactory.fromAllDocuments(singleQueryContext);

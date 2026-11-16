@@ -267,7 +267,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     synchronized (lease) {
       try (var unused =
           Explain.setup(this.runtime.cursors().getExplainQueryState(request.getCursorId()))) {
-        lease.joinPlan.ifPresent(plan -> plan.activate(Context.current()));
+        var context = Context.current();
+        lease.joinPlan.ifPresent(
+            plan -> plan.activate(() -> StandaloneJoinPlanner.checkCancellation(context)));
         var batch =
             this.runtime
                 .cursors()

@@ -322,6 +322,44 @@ public class BulkheadCommandExecutorTest {
     };
   }
 
+  @Test
+  public void execute_regularPool_carriesCancellationAfterDispatch() throws Exception {
+    var cancelled = new AtomicBoolean();
+    var check =
+        this.executor.execute(
+            asyncCommand(
+                () -> {
+                  var captured = com.xgen.mongot.extensions.join.JoinExecutionContext.capture();
+                  cancelled.set(true);
+                  assertThrows(java.util.concurrent.CancellationException.class, captured::run);
+                  assertThrows(
+                      java.util.concurrent.CancellationException.class,
+                      com.xgen.mongot.util.QueryCancellation::check);
+                }),
+            cancelled::get);
+
+    check.get(5, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void execute_guaranteedPool_carriesCancellationAfterDispatch() throws Exception {
+    var cancelled = new AtomicBoolean();
+    var check =
+        this.executor.execute(
+            nonLoadSheddableAsyncCommand(
+                () -> {
+                  var captured = com.xgen.mongot.extensions.join.JoinExecutionContext.capture();
+                  cancelled.set(true);
+                  assertThrows(java.util.concurrent.CancellationException.class, captured::run);
+                  assertThrows(
+                      java.util.concurrent.CancellationException.class,
+                      com.xgen.mongot.util.QueryCancellation::check);
+                }),
+            cancelled::get);
+
+    check.get(5, TimeUnit.SECONDS);
+  }
+
   private Command asyncCommand(Runnable action) {
     return new Command() {
       @Override

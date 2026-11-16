@@ -23,6 +23,7 @@ java_library(
     deps = [
         "//src/main/java/com/xgen/mongot/cursor",
         "//src/main/java/com/xgen/mongot/cursor/batch",
+        "//src/main/java/com/xgen/mongot/extensions/join",
         "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/explainers",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/information",
@@ -36,6 +37,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/standalone:bson",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "//src/main/java/com/xgen/mongot/standalone/config",
+        "//src/main/java/com/xgen/mongot/standalone/ingestion",
         "//src/main/java/com/xgen/mongot/standalone/metrics",
         "//src/main/java/com/xgen/mongot/standalone/runtime",
         "//src/main/java/com/xgen/mongot/util",

@@ -67,6 +67,11 @@ class CursorFactory {
           InvalidQueryException,
           InterruptedException,
           ReaderClosedException {
+    if (cursorQuery instanceof CursorQuery.Search search
+        && search.expectedGeneration().isPresent()
+        && !search.expectedGeneration().get().equals(index.getGenerationId())) {
+      throw new IndexUnavailableException("Join dependency generation changed during preparation");
+    }
     index.throwIfUnavailableForQuerying();
 
     // Check to see if the index is in a state that it should return an empty cursor.
@@ -102,7 +107,7 @@ class CursorFactory {
       BatchProducer batchProducer;
       MetaResults metaResults;
       switch (cursorQuery) {
-        case CursorQuery.Search(var query, var snapshot) -> {
+        case CursorQuery.Search(var query, var snapshot, var expectedGeneration) -> {
           var r =
               snapshot.isPresent()
                   ? snapshot

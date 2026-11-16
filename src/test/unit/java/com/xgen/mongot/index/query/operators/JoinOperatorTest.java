@@ -24,7 +24,7 @@ public class JoinOperatorTest {
 
     var roundTrip = parse(operator.toBson().toJson());
 
-    assertThat(operator.from()).hasValue("accounts");
+    assertThat(operator.from()).hasValue(new JoinSource.StandaloneIndex("accounts"));
     assertThat(operator.localField()).isEqualTo(FieldPath.parse("account.key"));
     assertThat(operator.foreignField()).isEqualTo(FieldPath.parse("key"));
     assertThat(operator.operator()).isInstanceOf(EqualsOperator.class);
@@ -100,6 +100,46 @@ public class JoinOperatorTest {
     assertThrows(
         BsonParseException.class,
         () -> parse(JOIN.replace("operator:{equals:", "operator:{index:'accounts',equals:")));
+  }
+
+  @Test
+  public void fromBson_collectionSource_defaultsIndexAndRoundTrips() throws Exception {
+    var operator =
+        (JoinOperator) parse(JOIN.replace("from:'accounts'", "from:{collection:'accounts'}"));
+
+    assertThat(operator.from()).hasValue(new JoinSource.CollectionIndex("accounts", "default"));
+    assertThat(parse(operator.toBson().toJson())).isEqualTo(operator);
+  }
+
+  @Test
+  public void fromBson_collectionSource_preservesCustomIndex() throws Exception {
+    var operator =
+        (JoinOperator)
+            parse(JOIN.replace("from:'accounts'", "from:{collection:'accounts',index:'active'}"));
+
+    assertThat(operator.from()).hasValue(new JoinSource.CollectionIndex("accounts", "active"));
+    assertThat(parse(operator.toBson().toJson())).isEqualTo(operator);
+  }
+
+  @Test
+  public void fromBson_nullIndex_rejectsRatherThanDefaulting() {
+    assertThrows(
+        BsonParseException.class,
+        () -> parse(JOIN.replace("from:'accounts'", "from:{collection:'accounts',index:null}")));
+  }
+
+  @Test
+  public void fromBson_blankCollection_rejects() {
+    assertThrows(
+        BsonParseException.class,
+        () -> parse(JOIN.replace("from:'accounts'", "from:{collection:' '}")));
+  }
+
+  @Test
+  public void fromBson_crossDatabaseSource_rejects() {
+    assertThrows(
+        BsonParseException.class,
+        () -> parse(JOIN.replace("from:'accounts'", "from:{collection:'accounts',db:'other'}")));
   }
 
   private static Operator parse(String json) throws BsonParseException {

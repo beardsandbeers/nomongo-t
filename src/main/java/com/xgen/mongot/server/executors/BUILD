@@ -16,6 +16,7 @@ java_library(
         "@maven//:org_mongodb_bson",
     ],
     deps = [
+        "//src/main/java/com/xgen/mongot/extensions/join",
         "//src/main/java/com/xgen/mongot/featureflag",
         "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/metrics",
@@ -23,6 +24,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/server/util",
         "//src/main/java/com/xgen/mongot/util",
         "//src/main/java/com/xgen/mongot/util/concurrent",
+        "@io_grpc_grpc_java//api",
         "@maven//:com_google_guava_guava",
         "@maven//:io_micrometer_micrometer_core",
         "@maven//:io_netty_netty_transport",
