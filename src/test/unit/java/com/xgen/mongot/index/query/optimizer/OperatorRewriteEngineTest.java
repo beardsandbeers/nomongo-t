@@ -22,6 +22,7 @@ import com.xgen.mongot.index.query.operators.GeoWithinOperator;
 import com.xgen.mongot.index.query.operators.InOperator;
 import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.index.query.operators.JoinSource;
 import com.xgen.mongot.index.query.operators.KnnBetaOperator;
 import com.xgen.mongot.index.query.operators.MoreLikeThisOperator;
 import com.xgen.mongot.index.query.operators.NearOperator;
@@ -318,7 +319,7 @@ public class OperatorRewriteEngineTest {
         new InOperator(score, List.of(fp), List.of(new StringValue("v")), Optional.empty()));
     var join =
         new com.xgen.mongot.index.query.operators.JoinOperator(
-            Optional.of("foreign"), fp, fp, dummyChild);
+            Optional.of(new JoinSource.StandaloneIndex("foreign")), fp, fp, dummyChild);
     m.put(com.xgen.mongot.index.query.operators.JoinOperator.class, join);
     var joinKeys = new JoinKeySet.Builder(ignored -> {});
     joinKeys.add(new BytesRef("v"));
