@@ -101,8 +101,20 @@ def check_drift(catalog_path):
     with open(catalog_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
+    if not isinstance(data, dict):
+        print("ERROR: release catalog must be a YAML mapping", file=sys.stderr)
+        return False
+
     workflow_types = data.get("spec", {}).get("releaseConfig", {}).get("WorkflowTypes", [])
     by_workflow = {wf["Name"]: _tasks_by_name(wf.get("Tasks", [])) for wf in workflow_types}
+
+    absent_workflows = {"NonPatchRelease", "PatchRelease"} - by_workflow.keys()
+    if absent_workflows:
+        print(
+            "ERROR: release catalog is missing workflows: " + ", ".join(sorted(absent_workflows)),
+            file=sys.stderr,
+        )
+        return False
 
     non_patch = by_workflow.get("NonPatchRelease", {})
     patch = by_workflow.get("PatchRelease", {})

@@ -506,6 +506,67 @@ References: [adaptive query](../src/main/java/com/xgen/mongot/index/lucene/query
 [Lucene reader](../src/main/java/com/xgen/mongot/index/lucene/LuceneSearchIndexReader.java),
 and [partitioned reader](../src/main/java/com/xgen/mongot/index/lucene/MultiLuceneSearchIndexReader.java).
 
+### Join explain
+
+Set `explain_verbosity` on the standalone `Search` request, outside `query_bson`, as described
+in the [client guide](../clients/README.md#explain-and-trace-queries). Inline joins add a `joins`
+section to the existing explain output. Preparation appears once at the top level; local execution
+appears inside each `indexPartitionExplain` entry, or at the top level for a single-partition index.
+
+`joins.preparation` describes the foreign membership collected before local search:
+
+| Field | Meaning |
+| --- | --- |
+| `localPartitions`, `keyCount`, `keyBytes` | Local partition count and totals of distinct keys and their encoded bytes, summed across join equality domains. |
+| `reservedBytes`, `limits` | Conservative cursor-lifetime admission estimate and the existing key, per-query memory, concurrent memory and foreign-work limits. Reserved bytes are not measured JVM heap usage. |
+| `timing`, `dependencySetup` | Total preparation and the included authorization, dependency resolution and snapshot-acquisition phase, in `millisElapsed`. |
+| `foreignWorkUnits` | Existing admission-work checks. These include timeout checks, segment visits, document visits and value visits; this is not a document count. |
+| `sources[]` | One record per prepared equality domain, with a stable query-local `id`, optional `from`, resolved foreign index/generation, `selfJoin`, field names, `keyType`, normalizer, foreign partition count, key counts/bytes and memory estimate. `collection` times that domain's foreign collection; `foreignWorkUnits` records its work. |
+
+Mixed token, ObjectId and integer mappings produce separate source records. Key bytes are the
+owned native key payload, while reservations also account conservatively for supporting structures
+and local query copies. Self-joins retain their existing snapshot semantics. Foreign collection
+does not enter the local scorer tree or local collector statistics.
+
+`joins.execution[]` links back to those source records through `id`. It includes the internal local
+field, equality type, key count, exhaustive/count-threshold hints, `strategy` and `selectionReason`:
+
+| Strategy | Meaning |
+| --- | --- |
+| `empty` | Foreign selection produced no keys (`noForeignKeys`). |
+| `termInSet` | A small binary key set uses Lucene's direct term-set path (`smallKeySet`). Its normal query-tree timings remain available; no custom segment counters are recorded. |
+| `adaptive` | Binary membership chooses between DocValues probing and postings using sampled costs (`sampledCost`). |
+| `numeric` | Integer membership chooses points or DocValues using point cost and the lead iterator's cost (`pointCostVsLeadCost`). This path does not switch mid-scan. |
+
+At execution verbosity, `segments[]` reuses one record for each pinned local segment ordinal:
+
+- `estimates` contains the binary path's Lucene documents-with-field, sampled postings, values per document
+  and sampled-key count, or the numeric path's point cost. These are planning estimates, not actual
+  hits. `minLeadCost` and `maxLeadCost` record the lead-cost range across scorer creations;
+  `Long.MAX_VALUE` is Lucene's unbounded lead-cost hint.
+- `strategyCounts` counts initial scorer choices: `docValuesProbe`, `postings`, and `points`.
+- `probeBudget` is the binary path's per-scorer break-even estimate. `counters` accumulates `probes`,
+  `probeMatches`, `valuesExamined`, `dictionaryLookups` and `fallbacks`. Dictionary lookups apply to
+  binary membership's ordinal cache; they are zero for numeric probing.
+  Probe matches count membership confirmations, including repeated count/facet work, not returned rows.
+- A binary probe that switches to postings increments `fallbacks` and reports
+  `fallbackReason: "probeBudgetExceeded"`. This transition preserves exact membership. Initial
+  strategy counts and fallback counts measure different events.
+- `costEstimation` and `indexSetup` time cost estimation and postings/point scorer construction.
+  Numeric `weightSetup` additionally measures numeric key conversion and point-query weight setup.
+
+Each timing reports `millisElapsed` and an invocation count. Preparation timings are wall time;
+dependency setup and foreign collection are included within total preparation. Segment timings are
+summed across their invocations and may overlap across parallel segments. They also overlap the
+existing query-tree context timings, so adding these sections together does not give request latency.
+These counters do not measure every internal postings/BKD visit.
+
+`queryPlanner` reports identities, keys, limits and strategy metadata, while omitting timing and
+execution-counter fields. Planning still materializes foreign membership. Execution snapshots are
+cumulative across cursor batches, including count/facet work and work already prefetched; do not sum successive snapshots.
+Segment records do not grow with the number of `GetMore` calls. Queries without joins omit this
+section. Existing explain-response limits and cursor cleanup apply.
+
 ## 7. Consistency, permissions, and resource bounds
 
 ### Snapshots and cursors

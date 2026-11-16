@@ -52,6 +52,15 @@ class CheckDriftTest(unittest.TestCase):
     def _check(self, non_patch_tasks, patch_tasks):
         return drift_check.check_drift(self._write(_catalog(non_patch_tasks, patch_tasks)))
 
+    def test_empty_catalog_fails(self):
+        self.assertFalse(drift_check.check_drift(self._write(None)))
+        self.assertFalse(drift_check.check_drift(self._write({})))
+
+    def test_missing_workflow_fails_even_without_tasks(self):
+        catalog = _catalog([], [])
+        catalog["spec"]["releaseConfig"]["WorkflowTypes"].pop()
+        self.assertFalse(drift_check.check_drift(self._write(catalog)))
+
     # --- policy invariants ---------------------------------------------------
 
     def test_policy_shape(self):

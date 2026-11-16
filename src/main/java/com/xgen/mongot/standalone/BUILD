@@ -1,3 +1,6 @@
+# The BSON utility and legacy entry point are separate to avoid a server/bootstrap cycle.
+# gazelle:ignore
+
 load("@rules_java//java:defs.bzl", "java_binary")
 load("//bazel/java:package.bzl", "java_library")
 

@@ -1,10 +1,16 @@
 package com.xgen.mongot.index.lucene.query;
 
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer.Segment;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer.Strategy;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.util.timers.InvocationCountingTimer;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedSetDocValues;
@@ -43,12 +49,33 @@ public final class AdaptiveJoinQuery extends Query {
   private final JoinKeySet keys;
   private final boolean exhaustive;
   private final int countThreshold;
+  private final Optional<JoinFeatureExplainer.Execution> explain;
 
   public AdaptiveJoinQuery(String field, JoinKeySet keys, boolean exhaustive, int countThreshold) {
+    this(field, keys, exhaustive, countThreshold, Optional.empty());
+  }
+
+  public AdaptiveJoinQuery(
+      String field,
+      JoinKeySet keys,
+      boolean exhaustive,
+      int countThreshold,
+      Optional<JoinFeatureExplainer.Execution> explain) {
     this.field = field;
     this.keys = keys;
     this.exhaustive = exhaustive;
     this.countThreshold = countThreshold;
+    this.explain = explain;
+    explain.ifPresent(
+        trace -> {
+          if (keys.size() == 0) {
+            trace.strategy("empty", "noForeignKeys");
+          } else if (keys.size() <= MAX_TERM_SAMPLES) {
+            trace.strategy("termInSet", "smallKeySet");
+          } else {
+            trace.strategy("adaptive", "sampledCost");
+          }
+        });
   }
 
   @Override
@@ -146,27 +173,56 @@ public final class AdaptiveJoinQuery extends Query {
       @Override
       @Nullable
       public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
-        Terms terms = context.reader().terms(AdaptiveJoinQuery.this.field);
-        if (AdaptiveJoinQuery.this.keys.size() == 0 || terms == null) {
-          return null;
+        var segment =
+            AdaptiveJoinQuery.this.explain.flatMap(
+                trace -> trace.segment(context.ord, context.reader().maxDoc()));
+        Statistics statistics;
+        try (var ignored =
+            new InvocationCountingTimer.AutocloseableOptional<>(
+                segment.map(Segment::timeCostEstimation))) {
+          Terms terms = context.reader().terms(AdaptiveJoinQuery.this.field);
+          if (AdaptiveJoinQuery.this.keys.size() == 0 || terms == null) {
+            segment.ifPresent(
+                trace -> trace.estimates(Map.of("documentsWithField", 0d), Optional.empty()));
+            return null;
+          }
+          statistics = statistics(terms, context.reader().maxDoc(), searcher);
+          segment.ifPresent(
+              trace ->
+                  trace.estimates(
+                      Map.of(
+                          "documentsWithField",
+                          (double) statistics.documents(),
+                          "postings",
+                          statistics.postings(),
+                          "valuesPerDocument",
+                          statistics.valuesPerDocument(),
+                          "sampledKeys",
+                          (double) Math.min(MAX_TERM_SAMPLES, AdaptiveJoinQuery.this.keys.size())),
+                      Optional.of(probeBudget(statistics))));
         }
-        var statistics = statistics(terms, context.reader().maxDoc(), searcher);
         if (statistics.documents() == 0 || statistics.postings() == 0) {
           return null;
         }
         return new ScorerSupplier() {
           private Scorer postingsScorer() throws IOException {
-            var supplier = postingsWeight().scorerSupplier(context);
-            return supplier == null
-                ? new ConstantScoreScorer(score(), scoreMode, DocIdSetIterator.empty())
-                : supplier.get(Long.MAX_VALUE);
+            try (var ignored =
+                new InvocationCountingTimer.AutocloseableOptional<>(
+                    segment.map(Segment::timeIndexSetup))) {
+              var supplier = postingsWeight().scorerSupplier(context);
+              return supplier == null
+                  ? new ConstantScoreScorer(score(), scoreMode, DocIdSetIterator.empty())
+                  : supplier.get(Long.MAX_VALUE);
+            }
           }
 
           @Override
           public Scorer get(long leadCost) throws IOException {
             if (!useProbe(statistics, leadCost)) {
+              segment.ifPresent(trace -> trace.scorer(Strategy.POSTINGS, leadCost));
               return postingsScorer();
             }
+            segment.ifPresent(trace -> trace.scorer(Strategy.DOC_VALUES, leadCost));
             SortedSetDocValues values =
                 DocValues.getSortedSet(context.reader(), AdaptiveJoinQuery.this.field);
             long budget = probeBudget(statistics);
@@ -195,6 +251,7 @@ public final class AdaptiveJoinQuery extends Query {
                               ? scorer.iterator()
                               : TwoPhaseIterator.asDocIdSetIterator(scorer.twoPhaseIterator());
                       this.usingPostings = true;
+                      segment.ifPresent(Segment::fallback);
                     }
                     return this.iterator.advance(target);
                   }
@@ -215,6 +272,7 @@ public final class AdaptiveJoinQuery extends Query {
                     if (probeIterator.usingPostings) {
                       return true;
                     }
+                    segment.ifPresent(Segment::probe);
                     if ((probeIterator.probes++ & 255) == 0) {
                       checkCancellation(searcher);
                     }
@@ -223,8 +281,10 @@ public final class AdaptiveJoinQuery extends Query {
                         checkCancellation(searcher);
                       }
                       long ordinal = values.nextOrd();
+                      segment.ifPresent(Segment::valueExamined);
                       int slot = (int) ordinal & (ORDINAL_CACHE_SIZE - 1);
                       if (this.membership[slot] == 0 || this.ordinals[slot] != ordinal) {
+                        segment.ifPresent(Segment::dictionaryLookup);
                         this.ordinals[slot] = ordinal;
                         this.membership[slot] =
                             (byte)
@@ -233,6 +293,7 @@ public final class AdaptiveJoinQuery extends Query {
                                     : 2);
                       }
                       if (this.membership[slot] == 1) {
+                        segment.ifPresent(Segment::probeMatch);
                         return true;
                       }
                     }

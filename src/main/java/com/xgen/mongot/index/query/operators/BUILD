@@ -68,6 +68,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/util",
         "//src/main/java/com/xgen/mongot/util/bson",
         "//src/main/java/com/xgen/mongot/util/bson/parser",
+        "@maven//:org_apache_lucene_lucene_core",
         "@maven//:org_mongodb_bson",
     ],
     deps = [

@@ -7,6 +7,7 @@ py_library(
         ["*.py"],
         exclude = [
             "check_catalog_workflow_drift.py",
+            "test_catalog_workflow_drift.py",
             "test_check_catalog_workflow_drift.py",
         ],
     ),
@@ -27,10 +28,15 @@ py_test(
 
 py_test(
     name = "catalog_workflow_drift_test",
-    srcs = ["check_catalog_workflow_drift.py"],
-    args = ["$(location //:catalog-info.yaml)"],
-    data = ["//:catalog-info.yaml"],
-    main = "check_catalog_workflow_drift.py",
+    srcs = [
+        "check_catalog_workflow_drift.py",
+        "test_catalog_workflow_drift.py",
+    ],
+    # The optional filegroup may be empty, which cannot be expanded with $(locations).
+    # Tests run from the workspace runfiles root, where the catalog is copied when present.
+    args = ["catalog-info.yaml"],
+    data = ["//:release_catalog"],
+    main = "test_catalog_workflow_drift.py",
     tags = ["lint"],
     deps = [requirement("PyYAML")],
 )

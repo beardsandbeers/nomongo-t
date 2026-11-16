@@ -1,6 +1,6 @@
 const variants = require('./variants.json');
 
-// Bundled schemas (with all $ref pointers resolved) are imported via a build-time generated map
+// Self-contained schemas (with external $ref pointers resolved) use a build-time generated map
 // (scripts/bundle.js writes output/schemas.generated.js with one static require per variant), so
 // getSchema works in browser/bundler builds without runtime fs/path access, and the map stays in
 // sync with the variant files automatically.

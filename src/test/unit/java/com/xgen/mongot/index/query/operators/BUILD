@@ -32,7 +32,7 @@ mongot_java_unit_test_suite(
             "JoinKeySetTest.java",
         ],
     ),
-    deps = _TEST_DEPS,
+    deps = _TEST_DEPS,  # keep: shared with the separate custom test suite
 )
 
 java_test_suite(
@@ -74,5 +74,5 @@ java_test_suite(
     ],
     data = ["//src/test/unit/resources/index/query/operators:srcs"],
     tags = ["unit"],
-    deps = _TEST_DEPS,
+    deps = _TEST_DEPS,  # keep: shared with the separate custom test suite
 )

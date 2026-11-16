@@ -3,5 +3,6 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "metrics",
     srcs = ["StandaloneMetrics.java"],
+    visibility = ["//visibility:public"],
     deps = ["@maven//:io_micrometer_micrometer_core"],
 )

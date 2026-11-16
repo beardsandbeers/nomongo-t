@@ -1,3 +1,5 @@
+# gazelle:resolve java com.xgen.mongot.index.statistics //src/main/java/com/xgen/mongot/index/statistics:snapshot
+
 load("//bazel/java:package.bzl", "java_library")
 
 java_library(

@@ -9,6 +9,16 @@ exports_files([
     "scripts/standalone/client.py",
 ])
 
+# Internal release metadata is optional in public source exports. Validate it whenever present.
+filegroup(
+    name = "release_catalog",
+    srcs = glob(
+        ["catalog-info.yaml"],
+        allow_empty = True,
+    ),
+    visibility = ["//scripts/tools:__pkg__"],
+)
+
 java_binary_stamped_manifest(
     name = "mongot_community",
     classpath_resources = ["//conf/mongot/production:conf"],
@@ -157,6 +167,9 @@ alias(
 
 # gazelle:resolve java com.xgen.mongot.proto.bson //src/proto/bson:types_java_proto
 # gazelle:resolve java com.xgen.mongot.searchenvoy.grpc //src/proto/searchenvoy:searchenvoy_java_proto
+# gazelle:resolve java com.xgen.mongot.standalone.grpc //src/proto/standalone/v1:standalone_java
+# gazelle:resolve java com.xgen.mongot.standalone //src/main/java/com/xgen/mongot/standalone:bson
+# gazelle:resolve java com.xgen.mongot.index.statistics //src/main/java/com/xgen/mongot/index/statistics
 # gazelle:resolve java com.xgen.atlas.index.vectorlite //src/main/java/com/xgen/atlas/index/vectorlite
 
 # Wrappers for contrib_jvm rules.
@@ -171,6 +184,16 @@ alias(
 # TODO: remove ignores and exclusions to fully adopt gazelle.
 # gazelle:ignore
 # gazelle:exclude .cache
+# The Java client uses Maven, and the container control helper is compiled by its Docker build.
+# gazelle:exclude clients/java
+# gazelle:exclude deploy/standalone
+# These tests are owned by mongot_java_unit_test_suite; Gazelle's java_test_suite duplicates them.
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/standalone
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/index/statistics
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/index/lucene/query/AdaptiveJoinQueryTest.java
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/index/lucene/query/custom/NumericJoinQueryTest.java
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/index/query/operators/JoinOperatorTest.java
+# gazelle:exclude src/test/unit/java/com/xgen/mongot/index/query/operators/JoinKeySetTest.java
 # gazelle:exclude src/main/java/com/xgen/availability
 # gazelle:exclude src/main/java/com/xgen/perf
 # gazelle:exclude src/proto/searchenvoy

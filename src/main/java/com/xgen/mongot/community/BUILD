@@ -25,5 +25,5 @@ java_binary(
     name = "MongotCommunity",
     main_class = "com.xgen.mongot.bootstrap.Mongot",
     visibility = ["//visibility:public"],
-    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],
+    runtime_deps = ["//src/main/java/com/xgen/mongot/bootstrap"],  # keep: legacy launcher forwards to the shared bootstrap
 )

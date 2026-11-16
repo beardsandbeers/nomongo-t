@@ -1,0 +1,307 @@
+[
+  {
+    "name": "dynamic search",
+    "indexType": "search",
+    "definition": {
+      "mappings": {
+        "dynamic": true
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "nested mapping references",
+    "indexType": "search",
+    "definition": {
+      "mappings": {
+        "dynamic": false,
+        "fields": {
+          "nested": {
+            "type": "document",
+            "fields": {
+              "title": {
+                "type": "string"
+              }
+            }
+          },
+          "tag": {
+            "type": "token"
+          }
+        }
+      }
+    },
+    "valid": true
+  },
+  {
+    "name": "invalid mapped type",
+    "indexType": "search",
+    "definition": {
+      "mappings": {
+        "fields": {
+          "title": {
+            "type": "notAType"
+          }
+        }
+      }
+    },
+    "valid": false
+  },
+  {
+    "name": "invalid partition count",
+    "indexType": "search",
+    "definition": {
+      "mappings": {
+        "dynamic": true
+      },
+      "numPartitions": 3
+    },
+    "valid": false
+  },
+  {
+    "name": "sorted-index base mapping",
+    "indexType": "search",
+    "definition": {
+      "mappings": {
+        "dynamic": true
+      }
+    },
+    "valid": true,
+    "flags": ["sortedIndex"]
+  },
+  {
+    "name": "vector plus filter",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "cosine"
+        },
+        {
+          "type": "filter",
+          "path": "tag"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "empty vector fields",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": []
+    },
+    "valid": false
+  },
+  {
+    "name": "only filter fields",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "filter",
+          "path": "tag"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "zero dimensions",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 0,
+          "similarity": "cosine"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "too many dimensions",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 8193,
+          "similarity": "cosine"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "unknown similarity",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "notASimilarity"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "unknown vector property",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "cosine"
+        }
+      ],
+      "unknown": true
+    },
+    "valid": false
+  },
+  {
+    "name": "autoEmbed needs flag",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "autoEmbed",
+          "path": "title",
+          "model": "voyage-4",
+          "modality": "text"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "autoEmbed public preview with filter",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "autoEmbed",
+          "path": "title",
+          "model": "voyage-4",
+          "modality": "text"
+        },
+        {
+          "type": "filter",
+          "path": "tag"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["autoEmbeddingPublicPreview"]
+  },
+  {
+    "name": "autoEmbed public preview unknown model",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "autoEmbed",
+          "path": "title",
+          "model": "unknown",
+          "modality": "text"
+        }
+      ]
+    },
+    "valid": false,
+    "flags": ["autoEmbeddingPublicPreview"]
+  },
+  {
+    "name": "public preview takes precedence over private preview",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "autoEmbed",
+          "path": "title",
+          "model": "voyage-4",
+          "modality": "text"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["autoEmbeddingPrivatePreview", "autoEmbeddingPublicPreview"]
+  },
+  {
+    "name": "vectorX and public preview with filter",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "autoEmbed",
+          "path": "title",
+          "model": "voyage-4",
+          "modality": "text"
+        },
+        {
+          "type": "filter",
+          "path": "tag"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["vectorXPrivatePreview", "autoEmbeddingPublicPreview"]
+  },
+  {
+    "name": "vector remains supported with vectorXPrivatePreview",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "cosine"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["vectorXPrivatePreview"]
+  },
+  {
+    "name": "vector remains supported with autoEmbeddingPrivatePreview",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "cosine"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["autoEmbeddingPrivatePreview"]
+  },
+  {
+    "name": "vector remains supported with vectorXPrivatePreview,autoEmbeddingPrivatePreview",
+    "indexType": "vectorSearch",
+    "definition": {
+      "fields": [
+        {
+          "type": "vector",
+          "path": "embedding",
+          "numDimensions": 3,
+          "similarity": "cosine"
+        }
+      ]
+    },
+    "valid": true,
+    "flags": ["vectorXPrivatePreview", "autoEmbeddingPrivatePreview"]
+  }
+]

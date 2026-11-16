@@ -1,9 +1,15 @@
 package com.xgen.mongot.index.lucene.query.custom;
 
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer.Segment;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer.Strategy;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.util.timers.InvocationCountingTimer;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.ExitableDirectoryReader;
@@ -31,10 +37,22 @@ import org.jetbrains.annotations.Nullable;
 public final class NumericJoinQuery extends Query {
   private final String field;
   private final JoinKeySet keys;
+  private final Optional<JoinFeatureExplainer.Execution> explain;
 
   public NumericJoinQuery(String field, JoinKeySet keys) {
+    this(field, keys, Optional.empty());
+  }
+
+  public NumericJoinQuery(
+      String field, JoinKeySet keys, Optional<JoinFeatureExplainer.Execution> explain) {
     this.field = field;
     this.keys = keys;
+    this.explain = explain;
+    explain.ifPresent(
+        trace ->
+            trace.strategy(
+                keys.size() == 0 ? "empty" : "numeric",
+                keys.size() == 0 ? "noForeignKeys" : "pointCostVsLeadCost"));
   }
 
   public String getField() {
@@ -62,41 +80,61 @@ public final class NumericJoinQuery extends Query {
   @Override
   public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost)
       throws IOException {
-    checkCancellation(searcher);
-    long[] numbers = new long[this.keys.size()];
-    var scratch = new BytesRef();
-    for (int i = 0; i < numbers.length; i++) {
-      if ((i & 1023) == 0) {
-        checkCancellation(searcher);
+    Weight pointWeight;
+    try (var ignored =
+        new InvocationCountingTimer.AutocloseableOptional<>(
+            this.explain.map(JoinFeatureExplainer.Execution::timeWeightSetup))) {
+      checkCancellation(searcher);
+      long[] numbers = new long[this.keys.size()];
+      var scratch = new BytesRef();
+      for (int i = 0; i < numbers.length; i++) {
+        if ((i & 1023) == 0) {
+          checkCancellation(searcher);
+        }
+        var key = this.keys.get(i, scratch);
+        numbers[i] = NumericUtils.sortableBytesToLong(key.bytes, key.offset);
       }
-      var key = this.keys.get(i, scratch);
-      numbers[i] = NumericUtils.sortableBytesToLong(key.bytes, key.offset);
+      Query points = LongPoint.newSetQuery(this.field, numbers);
+      checkCancellation(searcher);
+      pointWeight = searcher.createWeight(searcher.rewrite(points), scoreMode, boost);
     }
-    Query points = LongPoint.newSetQuery(this.field, numbers);
-    checkCancellation(searcher);
-    Weight pointWeight = searcher.createWeight(searcher.rewrite(points), scoreMode, boost);
     return new ConstantScoreWeight(this, boost) {
       @Override
       @Nullable
       public ScorerSupplier scorerSupplier(LeafReaderContext context) throws IOException {
         checkCancellation(searcher);
-        // Borrow a cancellation-aware view; the pinned snapshot retains ownership of the reader.
-        // Lucene's point traversal happens while constructing the scorer, before its bulk-scoring
-        // timeout wrapper is installed, so the reader must check cancellation during traversal.
-        var checkedReader =
-            new ExitableDirectoryReader.ExitableFilterAtomicReader(
-                context.reader(),
-                () ->
-                    Thread.currentThread().isInterrupted()
-                        || (searcher.getTimeout() != null && searcher.getTimeout().shouldExit())) {
-              @Override
-              @Nullable
-              public PointValues getPointValues(String field) throws IOException {
-                var values = super.getPointValues(field);
-                return values == null ? null : checkBulkPointVisits(values, searcher);
-              }
-            };
-        var pointSupplier = pointWeight.scorerSupplier(checkedReader.getContext());
+        var segment =
+            NumericJoinQuery.this.explain.flatMap(
+                trace -> trace.segment(context.ord, context.reader().maxDoc()));
+        ScorerSupplier pointSupplier;
+        try (var ignored =
+            new InvocationCountingTimer.AutocloseableOptional<>(
+                segment.map(Segment::timeCostEstimation))) {
+          // Borrow a cancellation-aware view; the pinned snapshot retains ownership of the reader.
+          // Lucene's point traversal happens while constructing the scorer, before its bulk-scoring
+          // timeout wrapper is installed, so the reader must check cancellation during traversal.
+          var checkedReader =
+              new ExitableDirectoryReader.ExitableFilterAtomicReader(
+                  context.reader(),
+                  () ->
+                      Thread.currentThread().isInterrupted()
+                          || (searcher.getTimeout() != null
+                              && searcher.getTimeout().shouldExit())) {
+                @Override
+                @Nullable
+                public PointValues getPointValues(String field) throws IOException {
+                  var values = super.getPointValues(field);
+                  return values == null ? null : checkBulkPointVisits(values, searcher);
+                }
+              };
+          pointSupplier = pointWeight.scorerSupplier(checkedReader.getContext());
+          segment.ifPresent(
+              trace ->
+                  trace.estimates(
+                      Map.of(
+                          "pointCost", pointSupplier == null ? 0d : (double) pointSupplier.cost()),
+                      Optional.empty()));
+        }
         if (pointSupplier == null) {
           return null;
         }
@@ -107,8 +145,14 @@ public final class NumericJoinQuery extends Query {
             // Follow Lucene's numeric point/DocValues cost choice. The DocValues branch uses
             // owned byte-hash membership rather than a collision-prone Long.hashCode table.
             if ((pointSupplier.cost() >>> 3) <= leadCost) {
-              return pointSupplier.get(leadCost);
+              segment.ifPresent(trace -> trace.scorer(Strategy.POINTS, leadCost));
+              try (var ignored =
+                  new InvocationCountingTimer.AutocloseableOptional<>(
+                      segment.map(Segment::timeIndexSetup))) {
+                return pointSupplier.get(leadCost);
+              }
             }
+            segment.ifPresent(trace -> trace.scorer(Strategy.DOC_VALUES, leadCost));
             var values = DocValues.getSortedNumeric(context.reader(), NumericJoinQuery.this.field);
             var confirmation =
                 new TwoPhaseIterator(values) {
@@ -116,12 +160,15 @@ public final class NumericJoinQuery extends Query {
 
                   @Override
                   public boolean matches() throws IOException {
+                    segment.ifPresent(Segment::probe);
                     for (int i = 0; i < values.docValueCount(); i++) {
                       if ((i & 1023) == 0) {
                         checkCancellation(searcher);
                       }
                       NumericUtils.longToSortableBytes(values.nextValue(), this.key.bytes, 0);
+                      segment.ifPresent(Segment::valueExamined);
                       if (NumericJoinQuery.this.keys.contains(this.key)) {
+                        segment.ifPresent(Segment::probeMatch);
                         return true;
                       }
                     }

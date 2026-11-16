@@ -3,8 +3,11 @@ package com.xgen.mongot.index.lucene.query.custom;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
 import java.io.IOException;
+import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.lucene.document.Document;
@@ -33,6 +36,58 @@ import org.apache.lucene.util.NumericUtils;
 import org.junit.Test;
 
 public class NumericJoinQueryTest {
+  @Test
+  public void search_explainedPointAndDocValuesChoices_preservesResultsAndReportsActualWork()
+      throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var scope = Explain.setup(Optional.of(Explain.Verbosity.EXECUTION_STATS), Optional.of(1))) {
+      writeBoundaryDocuments(directory);
+      try (var reader = DirectoryReader.open(directory)) {
+        var searcher = new IndexSearcher(reader);
+        var keys = keys(Long.MIN_VALUE, Long.MAX_VALUE, 9007199254740993L, 0, -7);
+        var expected = matchingDocs(searcher, new NumericJoinQuery("key", keys), Long.MAX_VALUE);
+        var trace = JoinFeatureExplainer.forJoin(keys, "key", "INT64", true, 1000);
+        var query = new NumericJoinQuery("key", keys, trace);
+
+        var points = matchingDocs(searcher, query, Long.MAX_VALUE);
+        var values = matchingDocs(searcher, query, 0);
+        var execution =
+            Explain.collect()
+                .orElseThrow()
+                .joins()
+                .orElseThrow()
+                .execution()
+                .orElseThrow()
+                .getFirst();
+
+        assertThat(points).isEqualTo(expected);
+        assertThat(values).isEqualTo(expected);
+        assertThat(execution.strategy()).isEqualTo("numeric");
+        assertThat(execution.segments().orElseThrow()).hasSize(1);
+        var segment = execution.segments().orElseThrow().getFirst();
+        assertThat(segment.strategyCounts().get("points")).isEqualTo(1L);
+        assertThat(segment.strategyCounts().get("docValuesProbe")).isEqualTo(1L);
+        assertThat(segment.counters().get("probeMatches")).isEqualTo((long) expected.length);
+        assertThat(segment.counters().get("probes")).isGreaterThan(0L);
+        assertThat(segment.counters().get("valuesExamined"))
+            .isAtLeast(segment.counters().get("probes"));
+        assertThat(segment.counters().get("fallbacks")).isEqualTo(0L);
+        assertThat(segment.fallbackReason()).isEmpty();
+        assertThat(segment.probeBudget()).isEmpty();
+        assertThat(segment.minLeadCost()).hasValue(0L);
+        assertThat(segment.maxLeadCost()).hasValue(Long.MAX_VALUE);
+        assertThat(
+                execution
+                    .weightSetup()
+                    .orElseThrow()
+                    .invocationCounts()
+                    .orElseThrow()
+                    .get("createWeight"))
+            .isEqualTo(2L);
+      }
+    }
+  }
+
   @Test
   public void search_acceptedPointSubtree_cancelsDuringBulkDocIdVisits() throws Exception {
     try (var directory = new ByteBuffersDirectory()) {

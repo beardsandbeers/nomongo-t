@@ -1,3 +1,6 @@
+# The snapshot target is separate to avoid an index/statistics dependency cycle.
+# gazelle:ignore
+
 load("//bazel/java:package.bzl", "java_library")
 
 java_library(

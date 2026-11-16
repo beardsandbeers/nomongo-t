@@ -129,8 +129,19 @@ explain responses.
 For joins, the query tree describes the local predicate after foreign keys have been materialized;
 partitioned local indexes report their plans and collector statistics in `indexPartitionExplain`.
 The `luceneQuery` renderings likewise describe local execution. Foreign key collection does not
-emit a separate explain tree or contribute to the local query's
-collector statistics, including for self-joins. Foreign indexes may use a different partition count.
+emit a separate scorer tree or contribute to local collector statistics, including for self-joins.
+Its preparation is reported separately in top-level `joins.preparation`, including foreign index
+identity, equality domains, key counts, resource estimates and limits. Execution verbosity adds
+preparation and foreign-collection timings and work units. Foreign indexes may use a different
+partition count.
+
+Local `joins.execution` appears alongside each partition's `query`; on a single-partition index
+it appears at the top level. Match execution `id` values to `joins.preparation.sources[].id`.
+For adaptive joins, segment records include sampled cost estimates, probe budgets, actual probe
+work, and fallback counts with `probeBudgetExceeded` reasons. Numeric joins report point versus
+DocValues choices. Small key sets use Lucene's direct term-set path and have no custom segment
+counters. Planner verbosity omits execution counters and timings. See [join explain](../docs/join-design-guide.md#join-explain)
+for the field definitions and timing caveats.
 
 Execution-level `GetMore` responses carry cumulative explain snapshots for that cursor; do not
 sum snapshots. Statistics cover work performed so far, including any engine prefetch, rather than

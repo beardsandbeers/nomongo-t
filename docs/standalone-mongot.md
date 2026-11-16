@@ -256,7 +256,14 @@ after Lucene rewrite (`rewritten`) at every verbosity. It accompanies the struct
 and is emitted per local partition when applicable. Identical rendering pairs are deduplicated
 across batches; multiple pairs are represented as an array. See the client guide for retention
 and rendering details. This additive section uses the shared engine and is also available in
-MongoDB-backed explain. Foreign join selection remains outside the local explain output.
+MongoDB-backed explain.
+
+Inline joins also add `joins.preparation` at the top level and `joins.execution` per local
+partition (or at the top level for a single partition). Preparation identifies each foreign index
+and equality domain and reports keys, admission estimates and limits. Execution verbosity adds
+phase timings, sampled local cost estimates, probe work, and strategy/fallback counters that
+accumulate across `GetMore` batches. Foreign scorer trees remain separate from the local `query`
+and collector statistics. See [join explain](join-design-guide.md#join-explain) for field meanings.
 
 The ordinary query role and per-index grants apply, including every foreign index in a join.
 Existing generation fences, reader snapshots, cursor ownership, idle expiration, cancellation,

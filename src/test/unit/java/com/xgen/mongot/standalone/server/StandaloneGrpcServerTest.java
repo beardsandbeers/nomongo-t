@@ -74,6 +74,7 @@ public class StandaloneGrpcServerTest {
       var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
       assertThat(explain.getDocument("query").getString("type").getValue()).isEqualTo("TermQuery");
       assertThat(explain.getDocument("query").containsKey("stats")).isFalse();
+      assertThat(explain.containsKey("joins")).isFalse();
       assertThat(explain.getDocument("luceneQuery").getString("analyzed").getValue())
           .contains("title:coffee");
       assertThat(explain.getDocument("luceneQuery").getString("rewritten").getValue())

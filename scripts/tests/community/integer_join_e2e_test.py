@@ -430,8 +430,67 @@ def run(args):
             }
         )
         assert "indexPartitionExplain" in str(explanation), explanation
+        native_explain = explanation["stages"][0]["$_internalSearchMongotRemote"]["explain"]
+        for partition in native_explain["indexPartitionExplain"]:
+            assert "title:coffee" in partition["luceneQuery"]["analyzed"]
+            assert "title:coffee" in partition["luceneQuery"]["rewritten"]
         (args.output / "pipeline-explain.json").write_text(json_util.dumps(explanation, indent=2))
         passed("native exact int64 equality and partitioned $search/$lookup executionStats explain")
+
+        traced = client.search(
+            api.QueryRequest(
+                index_id=local["children"],
+                query_bson=encode_bson(QUERY),
+                batch_size=1,
+                explain_verbosity=api.EXPLAIN_VERBOSITY_EXECUTION_STATS,
+            )
+        )
+        first_trace = decode_bson(traced.explain_bson)
+        final_trace = first_trace
+        previous_counters = {}
+        try:
+            preparation = first_trace["joins"]["preparation"]
+            assert preparation["localPartitions"] == 2, preparation
+            assert preparation["keyCount"] > 0, preparation
+            assert preparation["keyBytes"] == preparation["keyCount"] * 8, preparation
+            assert preparation["reservedBytes"] <= preparation["limits"]["memoryBytes"]
+            assert preparation["timing"]["millisElapsed"] >= 0
+            source = preparation["sources"][0]
+            assert source["foreignIndexId"] == local["parents"], source
+            assert source["keyType"] == "INT64" and source["foreignPartitions"] == 2, source
+            while True:
+                final_trace = decode_bson(traced.explain_bson)
+                assert final_trace["joins"]["preparation"] == preparation
+                for partition_id, partition in enumerate(final_trace["indexPartitionExplain"]):
+                    assert "preparation" not in partition["joins"]
+                    for execution in partition["joins"]["execution"]:
+                        assert execution["id"] == source["id"]
+                        assert execution["strategy"] == "numeric", execution
+                        for segment in execution["segments"]:
+                            key = (partition_id, execution["id"], segment["ordinal"])
+                            counters = {**segment["counters"], **segment["strategyCounts"]}
+                            assert all(
+                                value >= previous_counters.get(key, {}).get(name, 0)
+                                for name, value in counters.items()
+                            ), segment
+                            previous_counters[key] = counters
+                            assert counters["fallbacks"] == 0, segment
+                if not traced.cursor_id:
+                    break
+                traced = client.get_more(
+                    api.GetMoreRequest(cursor_id=traced.cursor_id, batch_size=1)
+                )
+            assert (
+                sum(row["points"] + row["docValuesProbe"] for row in previous_counters.values()) > 0
+            )
+        finally:
+            if traced.cursor_id:
+                client.kill_cursor(api.KillCursorRequest(cursor_id=traced.cursor_id))
+        (args.output / "join-explain-first.json").write_text(json_util.dumps(first_trace, indent=2))
+        (args.output / "join-explain-final.json").write_text(json_util.dumps(final_trace, indent=2))
+        passed(
+            "inline join explain keeps preparation stable and accumulates partition execution across pages"
+        )
 
         mixed = {}
         for collection, mapping, documents in (

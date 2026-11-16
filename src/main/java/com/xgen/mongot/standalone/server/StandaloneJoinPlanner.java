@@ -1,6 +1,8 @@
 package com.xgen.mongot.standalone.server;
 
 import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot;
+import com.xgen.mongot.index.lucene.explain.information.JoinSourceInformation;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.CollectorQuery;
 import com.xgen.mongot.index.query.OperatorQuery;
@@ -87,9 +89,11 @@ final class StandaloneJoinPlanner {
       throw exhausted("Too many join predicates (maximum " + MAX_JOINS + ")");
     }
     var plan = new Plan(query);
+    var joinExplain = JoinFeatureExplainer.root();
     long startNanos = System.nanoTime();
     try {
       plan.reserveBytes(8192L + 8L * query.toBson().toJson().length());
+      long dependencyStart = joinExplain.isPresent() ? System.nanoTime() : 0;
       plan.add(localGeneration.indexId.toHexString(), Optional.of(localGeneration));
       // Authorize and pin every dependency before executing any foreign predicate.
       Map<JoinOperator, String> targets = new HashMap<>();
@@ -105,6 +109,7 @@ final class StandaloneJoinPlanner {
         }
         targets.put(join, id);
       }
+      long dependencyNanos = joinExplain.isPresent() ? System.nanoTime() - dependencyStart : 0;
       var localSnapshot =
           Objects.requireNonNull(plan.snapshots.get(localGeneration.indexId.toHexString()));
       plan.localSnapshot = localSnapshot;
@@ -124,10 +129,14 @@ final class StandaloneJoinPlanner {
             throw invalid("Join fields must use the same type and token normalizer");
           }
           // Each equality domain owns separate membership and uses the same bounded plan.
+          long bytesBefore = plan.bytes;
+          long keyBytesBefore = plan.keyBytes;
+          long workBefore = plan.work;
           plan.reserveBytes(
               64L * 1024 * (1L + (long) localSnapshot.partitions() * plan.localQueryCopies));
           var keys = new JoinKeySet.Builder(plan::reserveKey);
           long foreignStart = System.nanoTime();
+          long foreignNanos;
           try (var ignored = Explain.suspend()) {
             foreign.collectKeys(
                 join.operator(),
@@ -136,9 +145,32 @@ final class StandaloneJoinPlanner {
                 keys::add,
                 plan::checkWork);
           } finally {
+            foreignNanos = joinExplain.isPresent() ? System.nanoTime() - foreignStart : 0;
             this.runtime.metrics().elapsed("joins.foreign", foreignStart);
           }
-          domains.add(materializeJoin(join, localField, keys.build(), query));
+          var membership = keys.build();
+          if (joinExplain.isPresent()) {
+            var explanation = joinExplain.get();
+            String foreignId = Objects.requireNonNull(targets.get(join));
+            explanation.source(
+                new JoinSourceInformation(
+                    explanation.register(membership),
+                    join.from(),
+                    foreignId,
+                    Objects.requireNonNull(plan.dependencies.get(foreignId)).toString(),
+                    foreignId.equals(localGeneration.indexId.toHexString()),
+                    join.localField().toString(),
+                    join.foreignField().toString(),
+                    localField.type().name(),
+                    localField.normalizer().getNormalizerName(),
+                    foreign.partitions(),
+                    membership.size(),
+                    plan.keyBytes - keyBytesBefore,
+                    plan.bytes - bytesBefore,
+                    explanation.executionCount(plan.work - workBefore),
+                    explanation.executionTiming(foreignNanos, "collectForeignKeys")));
+          }
+          domains.add(materializeJoin(join, localField, membership, query));
         }
         if (domains.isEmpty()) {
           throw invalid("Join fields must use the same type and token normalizer");
@@ -173,6 +205,25 @@ final class StandaloneJoinPlanner {
       plan.activate(Context.current());
       plan.verifyDependencies();
       this.runtime.metrics().count("joins.keys", plan.keys);
+      joinExplain.ifPresent(
+          explanation ->
+              explanation.prepared(
+                  localSnapshot.partitions(),
+                  plan.keys,
+                  plan.keyBytes,
+                  plan.bytes,
+                  Map.of(
+                      "keys",
+                      (long) MAX_KEYS,
+                      "memoryBytes",
+                      MAX_QUERY_BYTES,
+                      "concurrentMemoryBytes",
+                      MAX_CONCURRENT_BYTES,
+                      "workUnits",
+                      MAX_FOREIGN_WORK),
+                  plan.work,
+                  System.nanoTime() - startNanos,
+                  dependencyNanos));
       return plan;
     } catch (Exception | Error e) {
       try {
@@ -278,6 +329,7 @@ final class StandaloneJoinPlanner {
     private long bytes;
     private long work;
     private int keys;
+    private long keyBytes;
     private boolean closed;
 
     private Plan(SearchQuery query) {
@@ -375,6 +427,7 @@ final class StandaloneJoinPlanner {
       long estimate =
           (400L + 16L * keyBytes) * (1L + (long) snapshot().partitions() * this.localQueryCopies);
       reserveBytes(estimate);
+      this.keyBytes += keyBytes;
     }
 
     private void reserveBytes(long estimate) {

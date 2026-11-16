@@ -151,19 +151,26 @@ genrule(
 
 js_library(
     name = "format_check_lib",
-    srcs = ["scripts/format_check.js"],
+    srcs = [
+        "scripts/format_check.js",
+        "scripts/formatting.js",
+    ],
     data = [
         ".prettierignore",
         ".prettierrc",
+        ":node_modules/glob",
         ":node_modules/prettier",
     ] + glob([
         "schema/**/*.json",
         "scripts/**/*.js",
         "test/**/*.json",
         "*.json",
+        "*.js",
+        "*.ts",
         "*.md",
     ]),
     deps = [
+        ":node_modules/glob",
         ":node_modules/prettier",
     ],
 )
@@ -179,19 +186,26 @@ js_test(
 
 js_library(
     name = "format_lib",
-    srcs = ["scripts/format.js"],
+    srcs = [
+        "scripts/format.js",
+        "scripts/formatting.js",
+    ],
     data = [
         ".prettierignore",
         ".prettierrc",
+        ":node_modules/glob",
         ":node_modules/prettier",
     ] + glob([
         "schema/**/*.json",
         "scripts/**/*.js",
         "test/**/*.json",
         "*.json",
+        "*.js",
+        "*.ts",
         "*.md",
     ]),
     deps = [
+        ":node_modules/glob",
         ":node_modules/prettier",
     ],
 )

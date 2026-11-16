@@ -1,3 +1,5 @@
+# gazelle:resolve java com.xgen.mongot.index.statistics //src/main/java/com/xgen/mongot/index/statistics
+
 load("//bazel/java:package.bzl", "java_library")
 
 java_library(
@@ -86,6 +88,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/query/aggregation",
         "//src/main/java/com/xgen/mongot/index/query/collectors",
         "//src/main/java/com/xgen/mongot/index/query/highlights",
+        "//src/main/java/com/xgen/mongot/index/query/operators",
         "//src/main/java/com/xgen/mongot/index/statistics",
         "//src/main/java/com/xgen/mongot/index/status",
         "//src/main/java/com/xgen/mongot/index/synonym",

@@ -8,6 +8,7 @@ import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.batch.BatchCursorOptions;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
+import com.xgen.mongot.index.lucene.explain.information.JoinExplainInformation;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
@@ -39,6 +40,7 @@ import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import com.xgen.mongot.util.Bytes;
+import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import io.grpc.ManagedChannel;
 import io.grpc.Metadata;
 import io.grpc.Status;
@@ -168,6 +170,72 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_explainedMixedJoin_reportsSeparateEqualityDomains() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign =
+          f.create("foreign", MAPPING.replace("key:{type:'token'}", "key:" + MIXED_FIELD));
+      String local =
+          f.create("local", MAPPING.replace("parent:{type:'token'}", "parent:" + MIXED_FIELD));
+      f.upsert(foreign, "{_id:'f',key:['a',42,{$oid:'507f1f77bcf86cd799439011'}],office:'Berlin'}");
+      f.upsert(local, "{_id:'l',parent:['a',42,{$oid:'507f1f77bcf86cd799439011'}]}");
+
+      var response =
+          f.queries.search(
+              request(local, JOIN, 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+      var preparation = preparation(response);
+      var sources = preparation.getArray("sources");
+
+      assertThat(ids(response)).containsExactly("l");
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(3);
+      assertThat(preparation.getInt64("keyBytes").getValue()).isEqualTo(21);
+      assertThat(sources).hasSize(3);
+      assertThat(
+              sources.stream()
+                  .map(value -> value.asDocument().getString("keyType").getValue())
+                  .toList())
+          .containsExactly("TOKEN", "OBJECT_ID", "INT64");
+      assertThat(
+              sources.stream().map(value -> value.asDocument().getInt32("id").getValue()).toList())
+          .containsExactly(0, 1, 2);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_explainedEmptyMembership_reportsPreparationAndEmptyStrategy()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING.replace("numPartitions:2", "numPartitions:1"));
+      f.upsert(foreign, "{_id:'f',key:'account',office:'Paris'}");
+      f.upsert(local, "{_id:'l',parent:'account'}");
+
+      var response =
+          f.queries.search(
+              request(local, JOIN, 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+      var preparation = preparation(response);
+      var execution =
+          new RawBsonDocument(response.getExplainBson().toByteArray())
+              .getDocument("joins")
+              .getArray("execution")
+              .getFirst()
+              .asDocument();
+
+      assertThat(ids(response)).isEmpty();
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(0);
+      assertThat(preparation.getInt64("keyBytes").getValue()).isEqualTo(0);
+      assertThat(execution.getString("strategy").getValue()).isEqualTo("empty");
+      assertThat(execution.getString("selectionReason").getValue()).isEqualTo("noForeignKeys");
+      assertThat(execution.getArray("segments")).isEmpty();
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
   public void search_explainedJoin_preservesPartitionPlansAndCursorDependencies() throws Exception {
     try (var f = new Fixture(data(), List.of())) {
       String foreign = f.create("foreign", MAPPING.replace("numPartitions:2", "numPartitions:4"));
@@ -190,6 +258,27 @@ public class StandaloneJoinsTest {
 
       assertPartitionPlans(first);
       assertPartitionPlans(next);
+      var preparation = preparation(first);
+      assertThat(preparation(next)).isEqualTo(preparation);
+      assertThat(preparation.getInt32("localPartitions").getValue()).isEqualTo(2);
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(1);
+      assertThat(preparation.getInt64("keyBytes").getValue()).isEqualTo(7);
+      assertThat(preparation.getInt64("reservedBytes").getValue()).isGreaterThan(7);
+      assertThat(preparation.getDocument("timing").getDouble("millisElapsed").getValue())
+          .isAtLeast(0.0);
+      var source = preparation.getArray("sources").getFirst().asDocument();
+      assertThat(source.getString("foreignIndexId").getValue()).isEqualTo(foreign);
+      assertThat(source.getString("foreignGeneration").getValue()).startsWith(foreign);
+      assertThat(source.getBoolean("selfJoin").getValue()).isFalse();
+      assertThat(source.getInt32("foreignPartitions").getValue()).isEqualTo(4);
+      assertThat(source.getInt64("foreignWorkUnits").getValue()).isGreaterThan(0);
+      assertThat(
+              source
+                  .getDocument("collection")
+                  .getDocument("invocationCounts")
+                  .getInt64("collectForeignKeys")
+                  .getValue())
+          .isEqualTo(1);
       assertThat(
               new RawBsonDocument(next.getExplainBson().toByteArray())
                   .getDocument("resourceUsage")
@@ -235,6 +324,10 @@ public class StandaloneJoinsTest {
 
       assertPartitionPlans(first);
       assertPartitionPlans(next);
+      assertThat(preparation(next)).isEqualTo(preparation(first));
+      var source = preparation(first).getArray("sources").getFirst().asDocument();
+      assertThat(source.getBoolean("selfJoin").getValue()).isTrue();
+      assertThat(source.getString("foreignIndexId").getValue()).isEqualTo(local);
       assertThat(new RawBsonDocument(first.getBatchBson().toByteArray()).getArray("results"))
           .hasSize(1);
       assertThat(new RawBsonDocument(next.getBatchBson().toByteArray()).getArray("results"))
@@ -262,6 +355,14 @@ public class StandaloneJoinsTest {
       assertThat(explain.getDocument("query").toJson()).contains("parent");
       assertThat(explain.getDocument("query").toJson()).doesNotContain("office");
       assertThat(explain.getDocument("query").containsKey("stats")).isFalse();
+      var preparation = preparation(response);
+      assertThat(preparation.containsKey("timing")).isFalse();
+      assertThat(preparation.containsKey("foreignWorkUnits")).isFalse();
+      assertThat(preparation.getArray("sources").getFirst().asDocument().containsKey("collection"))
+          .isFalse();
+      var execution = explain.getDocument("joins").getArray("execution").getFirst().asDocument();
+      assertThat(execution.getString("strategy").getValue()).isEqualTo("termInSet");
+      assertThat(execution.containsKey("segments")).isFalse();
       assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
           .isEmpty();
       assertThat(response.getCursorId()).isEqualTo(0);
@@ -270,15 +371,27 @@ public class StandaloneJoinsTest {
   }
 
   private static void assertPartitionPlans(QueryResponse response) {
+    assertPartitionPlans(response, "termInSet", 1);
+  }
+
+  private static void assertPartitionPlans(QueryResponse response, String strategy, int keyCount) {
     var partitions =
         new RawBsonDocument(response.getExplainBson().toByteArray())
             .getArray("indexPartitionExplain");
     assertThat(partitions).hasSize(2);
-    assertLocalPlan(partitions.get(0).asDocument());
-    assertLocalPlan(partitions.get(1).asDocument());
+    assertLocalPlan(partitions.get(0).asDocument(), strategy, keyCount);
+    assertLocalPlan(partitions.get(1).asDocument(), strategy, keyCount);
   }
 
-  private static void assertLocalPlan(BsonDocument explain) {
+  private static BsonDocument preparation(QueryResponse response) throws Exception {
+    var joins = new RawBsonDocument(response.getExplainBson().toByteArray()).getDocument("joins");
+    try (var parser = BsonDocumentParser.fromRoot(joins).build()) {
+      assertThat(JoinExplainInformation.fromBson(parser).toBson()).isEqualTo(joins);
+    }
+    return joins.getDocument("preparation");
+  }
+
+  private static void assertLocalPlan(BsonDocument explain, String strategy, int keyCount) {
     assertThat(explain.getDocument("luceneQuery").getString("analyzed").getValue())
         .contains("parent");
     assertThat(explain.getDocument("luceneQuery").getString("rewritten").getValue())
@@ -287,6 +400,13 @@ public class StandaloneJoinsTest {
     assertThat(explain.containsKey("collectors")).isTrue();
     assertThat(explain.get("query").toString()).contains("parent");
     assertThat(explain.get("query").toString()).doesNotContain("office");
+    var joins = explain.getDocument("joins");
+    assertThat(joins.containsKey("preparation")).isFalse();
+    assertThat(joins.getArray("execution")).hasSize(1);
+    var execution = joins.getArray("execution").getFirst().asDocument();
+    assertThat(execution.getInt32("id").getValue()).isEqualTo(0);
+    assertThat(execution.getString("strategy").getValue()).isEqualTo(strategy);
+    assertThat(execution.getInt32("keyCount").getValue()).isEqualTo(keyCount);
   }
 
   @Test
@@ -446,7 +566,7 @@ public class StandaloneJoinsTest {
                       .map(value -> value.asDocument().getString("_id").getValue())
                       .toList())
           .containsExactly("Berlin", "Paris");
-      assertPartitionPlans(response);
+      assertPartitionPlans(response, "numeric", 2);
       assertThat(reservedBytes(f)).isEqualTo(0.0);
     }
   }

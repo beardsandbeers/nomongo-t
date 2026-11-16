@@ -1,6 +1,7 @@
 load("//bazel/java:test.bzl", "java_test_suite", "mongot_java_unit_test_suite")
 
 _TEST_DEPS = [
+    "//src/main/java/com/xgen/mongot/index/lucene/explain/joins",
     "//src/main/java/com/xgen/mongot/featureflag",
     "//src/main/java/com/xgen/mongot/featureflag/dynamic",
     "//src/main/java/com/xgen/mongot/index",
@@ -114,7 +115,7 @@ java_test_suite(
         "VectorSearchNestedFilterTest.java",
     ],
     tags = ["unit"],
-    deps = _TEST_DEPS,
+    deps = _TEST_DEPS,  # keep: shared with the separate custom test suite
 )
 
 mongot_java_unit_test_suite(
@@ -123,5 +124,5 @@ mongot_java_unit_test_suite(
         ["*.java"],
         exclude = ["AdaptiveJoinQueryTest.java"],
     ),
-    deps = _TEST_DEPS,
+    deps = _TEST_DEPS,  # keep: shared with the separate custom test suite
 )

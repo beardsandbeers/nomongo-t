@@ -1259,6 +1259,7 @@ public class VectorSearchCommandTest {
         Optional.empty(),
         Optional.empty(),
         Optional.empty(),
+        Optional.empty(),
         Optional.empty());
   }
 

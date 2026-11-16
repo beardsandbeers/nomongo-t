@@ -2,10 +2,15 @@ package com.xgen.mongot.index.lucene.query;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import com.xgen.mongot.index.lucene.explain.information.JoinExplainInformation;
+import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
@@ -44,6 +49,85 @@ import org.junit.runner.RunWith;
 
 @RunWith(Theories.class)
 public class AdaptiveJoinQueryTest {
+  @Test
+  public void search_smallKeyPlanner_keepsFastPathAndOmitsExecutionCounters() throws Exception {
+    try (var fixture = new Fixture(100, 128, false, false, 100);
+        var scope = Explain.setup(Optional.of(Explain.Verbosity.QUERY_PLANNER), Optional.of(1))) {
+      var keys = keys(2, false);
+      var trace = JoinFeatureExplainer.forJoin(keys, "key", "TOKEN", false, 1000);
+      var query = new AdaptiveJoinQuery("key", keys, false, 1000, trace);
+
+      var actual = fixture.searcher.count(query);
+      var expected = fixture.searcher.count(new TermInSetQuery("key", keys.terms()));
+      var execution =
+          Explain.collect()
+              .orElseThrow()
+              .joins()
+              .orElseThrow()
+              .execution()
+              .orElseThrow()
+              .getFirst();
+
+      assertThat(actual).isEqualTo(expected);
+      assertThat(execution.strategy()).isEqualTo("termInSet");
+      assertThat(execution.selectionReason()).isEqualTo("smallKeySet");
+      assertThat(execution.segments()).isEmpty();
+      assertThat(execution.weightSetup()).isEmpty();
+    }
+  }
+
+  @Test
+  public void search_explainedFallback_preservesResultsAndAccumulatesWithoutGrowingSegments()
+      throws Exception {
+    try (var fixture = new Fixture(10000, 128, false, true, 10000);
+        var scope = Explain.setup(Optional.of(Explain.Verbosity.EXECUTION_STATS), Optional.of(1))) {
+      var keys = keys(1000, false);
+      var baseline = compound(new TermInSetQuery("key", keys.terms()), false, false);
+      var trace = JoinFeatureExplainer.forJoin(keys, "key", "TOKEN", false, 0);
+      var query = compound(new AdaptiveJoinQuery("key", keys, false, 0, trace), false, false);
+
+      var expected = fixture.searcher.search(baseline, 10001, Sort.INDEXORDER);
+      var actual = fixture.searcher.search(query, 10001, Sort.INDEXORDER);
+      var first = Explain.collect().orElseThrow().joins().orElseThrow();
+      var nextQuery =
+          compound(
+              new AdaptiveJoinQuery(
+                  "key",
+                  keys,
+                  false,
+                  0,
+                  JoinFeatureExplainer.forJoin(keys, "key", "TOKEN", false, 0)),
+              false,
+              false);
+      fixture.searcher.search(nextQuery, 10001, Sort.INDEXORDER);
+      var second = Explain.collect().orElseThrow().joins().orElseThrow();
+
+      assertThat(Arrays.stream(actual.scoreDocs).mapToInt(hit -> hit.doc).toArray())
+          .isEqualTo(Arrays.stream(expected.scoreDocs).mapToInt(hit -> hit.doc).toArray());
+      var firstSegments = first.execution().orElseThrow().getFirst().segments().orElseThrow();
+      var secondSegments = second.execution().orElseThrow().getFirst().segments().orElseThrow();
+      assertThat(first.execution().orElseThrow()).hasSize(1);
+      assertThat(second.execution().orElseThrow()).hasSize(1);
+      assertThat(firstSegments).hasSize(1);
+      assertThat(secondSegments).hasSize(1);
+      var initial = firstSegments.getFirst();
+      var cumulative = secondSegments.getFirst();
+      assertThat(initial.strategyCounts().get("docValuesProbe")).isEqualTo(1L);
+      assertThat(initial.counters().get("fallbacks")).isEqualTo(1L);
+      assertThat(initial.fallbackReason()).hasValue("probeBudgetExceeded");
+      assertThat(initial.counters().get("probes")).isAtLeast(initial.probeBudget().orElseThrow());
+      assertThat(initial.counters().get("dictionaryLookups")).isGreaterThan(0L);
+      assertThat(cumulative.counters().get("fallbacks")).isEqualTo(2L);
+      assertThat(cumulative.counters().get("probes"))
+          .isEqualTo(2 * initial.counters().get("probes"));
+      assertThat(cumulative.costEstimation().invocationCounts().orElseThrow().get("estimateCost"))
+          .isEqualTo(2L);
+      try (var parser = BsonDocumentParser.fromRoot(second.toBson()).build()) {
+        assertThat(JoinExplainInformation.fromBson(parser)).isEqualTo(second);
+      }
+    }
+  }
+
   public record Scenario(boolean binary, boolean multi, boolean exhaustive, boolean exclusion) {}
 
   @DataPoints public static final boolean[] BINARY_KEYS = {false, true};
