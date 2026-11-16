@@ -9,6 +9,7 @@ import org.bson.BsonDocument;
 
 public class SearchExplainInformationBuilder {
   private Optional<List<QueryExplainInformation>> queryInfos = Optional.empty();
+  private Optional<List<LuceneQueryDetails>> luceneQuery = Optional.empty();
   private Optional<QueryExecutionArea> allCollectorStats = Optional.empty();
   private Optional<ResourceUsageOutput> resourceUsage = Optional.empty();
   private Optional<List<VectorSearchTracingSpec>> vectorTracingInfos = Optional.empty();
@@ -47,6 +48,11 @@ public class SearchExplainInformationBuilder {
 
   public SearchExplainInformationBuilder queryExplainInfos(List<QueryExplainInformation> query) {
     this.queryInfos = Optional.of(query);
+    return this;
+  }
+
+  public SearchExplainInformationBuilder luceneQuery(List<LuceneQueryDetails> luceneQuery) {
+    this.luceneQuery = Optional.of(luceneQuery);
     return this;
   }
 
@@ -176,7 +182,8 @@ public class SearchExplainInformationBuilder {
           this.numCandidates,
           Optional.empty(),
           this.dynamicFeatureFlags,
-          this.optimizerRulesFired);
+          this.optimizerRulesFired,
+          this.luceneQuery);
     }
 
     // Query/collect/highlight land in indexPartitionExplain. aggregation stays top-level because
@@ -198,6 +205,7 @@ public class SearchExplainInformationBuilder {
         Optional.empty(),
         Optional.of(this.indexPartitionExplainInformations),
         this.dynamicFeatureFlags,
-        this.optimizerRulesFired);
+        this.optimizerRulesFired,
+        Optional.empty());
   }
 }

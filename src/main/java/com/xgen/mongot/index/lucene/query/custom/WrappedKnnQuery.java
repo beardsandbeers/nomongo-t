@@ -81,6 +81,6 @@ public class WrappedKnnQuery extends Query {
 
   @Override
   public String toString(String field) {
-    return "(WrappedKnn (" + this.query.toString(field) + ")";
+    return "(WrappedKnn (" + this.query.toString(field) + "))";
   }
 }

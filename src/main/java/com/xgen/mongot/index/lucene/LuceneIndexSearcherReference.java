@@ -112,7 +112,9 @@ public class LuceneIndexSearcherReference implements Closeable {
                             initialSearcher,
                             info.getFeatureExplainer(
                                     QueryProfilerFeatureExplainer.class,
-                                    () -> new QueryProfilerFeatureExplainer(metricsUpdater))
+                                    () ->
+                                        new QueryProfilerFeatureExplainer(
+                                            metricsUpdater, info.getVerbosity()))
                                 .getQueryProfiler(),
                             info.getFeatureExplainer(
                                 CollectorTimingFeatureExplainer.class,
@@ -140,7 +142,9 @@ public class LuceneIndexSearcherReference implements Closeable {
                             initialSearcher,
                             info.getFeatureExplainer(
                                     QueryProfilerFeatureExplainer.class,
-                                    () -> new QueryProfilerFeatureExplainer(metricsUpdater))
+                                    () ->
+                                        new QueryProfilerFeatureExplainer(
+                                            metricsUpdater, info.getVerbosity()))
                                 .getQueryProfiler(),
                             info.getFeatureExplainer(
                                 CollectorTimingFeatureExplainer.class,

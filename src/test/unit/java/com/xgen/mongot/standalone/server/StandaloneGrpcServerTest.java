@@ -64,7 +64,7 @@ public class StandaloneGrpcServerTest {
           f.queries.search(
               QueryRequest.newBuilder()
                   .setIndexId(id)
-                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .setQueryBson(bson("{text:{path:'title',query:'COFFEE'}}"))
                   .setBatchSize(1)
                   .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
                   .build());
@@ -72,6 +72,10 @@ public class StandaloneGrpcServerTest {
       var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
       assertThat(explain.getDocument("query").getString("type").getValue()).isEqualTo("TermQuery");
       assertThat(explain.getDocument("query").containsKey("stats")).isFalse();
+      assertThat(explain.getDocument("luceneQuery").getString("analyzed").getValue())
+          .contains("title:coffee");
+      assertThat(explain.getDocument("luceneQuery").getString("rewritten").getValue())
+          .contains("title:coffee");
       assertThat(explain.getDocument("metadata").getString("indexName").getValue())
           .isEqualTo("explain-plan");
       assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
@@ -79,6 +83,56 @@ public class StandaloneGrpcServerTest {
       assertThat(response.getCursorId()).isEqualTo(0);
       assertThat(response.getGenerationId()).isNotEmpty();
       assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void search_fuzzyExplain_preservesAnalyzedTermsWhenRewriteMatchesNothing()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-fuzzy", "{analyzer:'lucene.english',mappings:{dynamic:true}}");
+      f.upsert(id, "{_id:'a',title:'fox'}");
+
+      var response =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(
+                      bson("{text:{path:'title',query:'THE RUNNING',fuzzy:{maxEdits:1}}}"))
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      var details =
+          new RawBsonDocument(response.getExplainBson().toByteArray()).getDocument("luceneQuery");
+      assertThat(details.getString("analyzed").getValue()).contains("title:run~1");
+      assertThat(details.getString("analyzed").getValue()).doesNotContain("THE");
+      assertThat(details.getString("analyzed").getValue()).doesNotContain("title:the");
+      assertThat(details.getString("rewritten").getValue()).contains("MatchNoDocsQuery");
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .isEmpty();
+    }
+  }
+
+  @Test
+  public void search_phraseExplain_showsStemmedTermsAndPhraseStructure() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("explain-phrase", "{analyzer:'lucene.english',mappings:{dynamic:true}}");
+      f.upsert(id, "{_id:'a',title:'running foxes'}");
+
+      var response =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(bson("{phrase:{path:'title',query:'RUNNING FOXES'}}"))
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_ALL_PLANS_EXECUTION)
+                  .build());
+
+      var details =
+          new RawBsonDocument(response.getExplainBson().toByteArray()).getDocument("luceneQuery");
+      assertThat(details.getString("analyzed").getValue()).contains("title:\"run fox\"");
+      assertThat(details.getString("rewritten").getValue()).contains("title:\"run fox\"");
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
     }
   }
 
@@ -150,6 +204,8 @@ public class StandaloneGrpcServerTest {
       var nextExplain = new RawBsonDocument(next.getExplainBson().toByteArray());
       assertThat(initialExplain.getDocument("query").containsKey("stats")).isTrue();
       assertThat(nextExplain.getDocument("query").containsKey("stats")).isTrue();
+      assertThat(nextExplain.getDocument("luceneQuery"))
+          .isEqualTo(initialExplain.getDocument("luceneQuery"));
       assertThat(initialExplain.getDocument("resourceUsage").getNumber("numBatches").intValue())
           .isEqualTo(1);
       assertThat(nextExplain.getDocument("resourceUsage").getNumber("numBatches").intValue())
@@ -1787,13 +1843,17 @@ public class StandaloneGrpcServerTest {
     }
 
     private String create(String name) throws Exception {
+      return create(name, "{mappings:{dynamic:true}}");
+    }
+
+    private String create(String name, String definition) throws Exception {
       String id =
           this.catalog
               .createIndex(
                   CreateIndexRequest.newBuilder()
                       .setName(name)
                       .setType(IndexType.INDEX_TYPE_SEARCH)
-                      .setDefinitionBson(bson("{mappings:{dynamic:true}}"))
+                      .setDefinitionBson(bson(definition))
                       .build())
               .getIndexId();
       ready(id, 1);

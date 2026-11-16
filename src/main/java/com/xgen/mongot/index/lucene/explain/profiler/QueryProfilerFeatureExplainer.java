@@ -18,6 +18,11 @@ public class QueryProfilerFeatureExplainer implements FeatureExplainer {
     this(new QueryProfiler(), metricsUpdater);
   }
 
+  public QueryProfilerFeatureExplainer(
+      IndexMetricsUpdater.QueryingMetricsUpdater metricsUpdater, Explain.Verbosity verbosity) {
+    this(new QueryProfiler(verbosity), metricsUpdater);
+  }
+
   @VisibleForTesting
   QueryProfilerFeatureExplainer(
       QueryProfiler profiler, IndexMetricsUpdater.QueryingMetricsUpdater metricsUpdater) {
@@ -42,6 +47,10 @@ public class QueryProfilerFeatureExplainer implements FeatureExplainer {
   @Override
   public void emitExplanation(
       Explain.Verbosity verbosity, SearchExplainInformationBuilder builder) {
+    var luceneQueries = this.profiler.luceneQueries(verbosity);
+    if (!luceneQueries.isEmpty()) {
+      builder.luceneQuery(luceneQueries);
+    }
     var allExplainInfos = this.profiler.explainInformation(verbosity);
     if (verbosity.equals(Explain.Verbosity.ALL_PLANS_EXECUTION)) {
       builder.queryExplainInfos(allExplainInfos);

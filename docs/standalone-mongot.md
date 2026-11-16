@@ -237,6 +237,13 @@ measure the work performed so far; the server does not automatically drain the c
 final response for complete execution statistics. Tracing is opt-in and adds profiling overhead.
 Planner requests can still perform preparation, join key collection, and metadata/count work.
 
+The fork-specific `luceneQuery` section shows the compiled query after analysis (`analyzed`) and
+after Lucene rewrite (`rewritten`) at every verbosity. It accompanies the structured `query` tree
+and is emitted per local partition when applicable. Identical rendering pairs are deduplicated
+across batches; multiple pairs are represented as an array. See the client guide for retention
+and rendering details. This additive section uses the shared engine and is also available in
+MongoDB-backed explain. Foreign join selection remains outside the local explain output.
+
 The ordinary query role and per-index grants apply, including every foreign index in a join.
 Existing generation fences, reader snapshots, cursor ownership, idle expiration, cancellation,
 and dependency invalidation also apply. Explain state is restored on each batch and released with

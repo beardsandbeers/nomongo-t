@@ -8,17 +8,16 @@ logs are kept under that directory.
 import argparse
 import contextlib
 import os
-from pathlib import Path
 import socket
 import struct
 import subprocess
 import time
+from pathlib import Path
 
-from bson import json_util
 import grpc
 import pymongo
 import yaml
-
+from bson import json_util
 from mongot_standalone import Client, api, decode_bson, encode_bson
 
 

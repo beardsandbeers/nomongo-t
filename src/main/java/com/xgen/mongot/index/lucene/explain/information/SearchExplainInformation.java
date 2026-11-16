@@ -27,10 +27,19 @@ public record SearchExplainInformation(
     Optional<VectorSearchNumCandidatesSpec> numCandidates,
     Optional<List<SearchExplainInformation>> indexPartitionExplainInformation,
     Optional<List<FeatureFlagEvaluationSpec>> dynamicFeatureFlags,
-    Optional<List<String>> optimizerRulesFired)
+    Optional<List<String>> optimizerRulesFired,
+    Optional<List<LuceneQueryDetails>> luceneQuery)
     implements DocumentEncodable {
 
   static class Fields {
+    static final Field.Optional<List<LuceneQueryDetails>> LUCENE_QUERY =
+        Field.builder("luceneQuery")
+            .classField(LuceneQueryDetails::fromBson)
+            .disallowUnknownFields()
+            .asSingleValueOrList()
+            .optional()
+            .noDefault();
+
     static final Field.Optional<List<QueryExplainInformation>> QUERY =
         Field.builder("query")
             .classField(QueryExplainInformation::fromBson)
@@ -151,7 +160,8 @@ public record SearchExplainInformation(
         parser.getField(Fields.NUM_CANDIDATES).unwrap(),
         parser.getField(Fields.INDEX_PARTITION_EXPLAIN_INFORMATION).unwrap(),
         parser.getField(Fields.DYNAMIC_FEATURE_FLAGS).unwrap(),
-        parser.getField(Fields.OPTIMIZER_RULES_FIRED).unwrap());
+        parser.getField(Fields.OPTIMIZER_RULES_FIRED).unwrap(),
+        parser.getField(Fields.LUCENE_QUERY).unwrap());
   }
 
   @Override
@@ -163,6 +173,7 @@ public record SearchExplainInformation(
 
     return BsonDocumentBuilder.builder()
         .field(Fields.QUERY, list)
+        .field(Fields.LUCENE_QUERY, this.luceneQuery)
         .field(Fields.COLLECT_STATS, this.collectStats)
         .field(Fields.HIGHLIGHT, this.highlightStats)
         .field(Fields.RESULT_MATERIALIZATION, this.resultMaterialization)

@@ -104,9 +104,32 @@ The same options apply to `client.vector_search(...)`. Keep the search/vector ex
 BSON document using the upstream engine's format. Sections depend on the query and verbosity;
 examples include `query`, `collectors`, `resultMaterialization`, `resourceUsage`, and
 `indexPartitionExplain` for partitioned indexes.
+
+This fork also adds `luceneQuery` at every verbosity, alongside the structured `query` tree:
+
+- `analyzed` is Lucene's rendering of the compiled query before Lucene rewrites it. For example,
+  an English-analyzed phrase `RUNNING FOXES` contains the stemmed phrase `"run fox"` here.
+- `rewritten` is the rendering after Lucene's rewrite, showing such changes as fuzzy-term
+  expansion or replacement with `MatchNoDocsQuery` when no terms match the index. Both fields
+  are present even when the renderings are identical.
+
+For a single-partition index, inspect `decode_bson(response.explain_bson)["luceneQuery"]`.
+For partitioned indexes, inspect `luceneQuery` in each `indexPartitionExplain` entry. The field
+is an object for one distinct pair of renderings, or an array when several are recorded. Repeated
+pairs across `GetMore` batches are deduplicated within the retained history. Planner/execution
+verbosity retains at most ten distinct pairs in insertion order, evicting the oldest when a new
+pair arrives; all-plans verbosity retains all recorded pairs.
+These are diagnostic strings from the actual Lucene query objects, including internal field names
+and query wrappers, rather than BSON expressions or a complete analyzer token-stream dump.
+Custom query renderings may summarize their contents, and analyzer names, token offsets, and
+position increments are not added by this section. The structured tree remains available for
+per-clause arguments and timings. This shared-engine addition also appears in MongoDB-backed
+explain responses.
+
 For joins, the query tree describes the local predicate after foreign keys have been materialized;
 partitioned local indexes report their plans and collector statistics in `indexPartitionExplain`.
-Foreign key collection does not emit a separate explain tree or contribute to the local query's
+The `luceneQuery` renderings likewise describe local execution. Foreign key collection does not
+emit a separate explain tree or contribute to the local query's
 collector statistics, including for self-joins. Foreign indexes may use a different partition count.
 
 Execution-level `GetMore` responses carry cumulative explain snapshots for that cursor; do not

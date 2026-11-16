@@ -12,7 +12,6 @@ public class MeteredIndexWriter implements IndexWriter {
     return this.indexWriter.getBufferHeapBytes();
   }
 
-
   private final IndexWriter indexWriter;
   private final IndexMetricsUpdater.IndexingMetricsUpdater indexingMetricsUpdater;
 

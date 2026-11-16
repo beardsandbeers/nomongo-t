@@ -170,6 +170,7 @@ alias(
 
 # TODO: remove ignores and exclusions to fully adopt gazelle.
 # gazelle:ignore
+# gazelle:exclude .cache
 # gazelle:exclude src/main/java/com/xgen/availability
 # gazelle:exclude src/main/java/com/xgen/perf
 # gazelle:exclude src/proto/searchenvoy

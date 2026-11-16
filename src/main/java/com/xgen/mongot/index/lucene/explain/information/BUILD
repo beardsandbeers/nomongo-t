@@ -39,6 +39,7 @@ java_library(
         "LatLonShapeQuerySpec.java",
         "LongDistanceFeatureQuerySpec.java",
         "LuceneMetadataExplainInformation.java",
+        "LuceneQueryDetails.java",
         "LuceneQuerySpecification.java",
         "MatchAllDocsQuerySpec.java",
         "MatchNoDocsQuerySpec.java",

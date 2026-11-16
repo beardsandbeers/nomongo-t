@@ -50,7 +50,7 @@ public class WrappedQuery extends Query {
 
   @Override
   public String toString(String field) {
-    return "(Wrapped (" + this.query.toString(field) + ")";
+    return "(Wrapped (" + this.query.toString(field) + "))";
   }
 
   @Override

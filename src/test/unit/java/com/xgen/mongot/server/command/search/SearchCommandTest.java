@@ -53,6 +53,7 @@ import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.definition.SearchIndexCapabilities;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.AggregationFeatureExplainer;
+import com.xgen.mongot.index.lucene.explain.information.LuceneQueryDetails;
 import com.xgen.mongot.index.lucene.explain.information.LuceneQuerySpecification;
 import com.xgen.mongot.index.lucene.explain.information.MetadataExplainInformation;
 import com.xgen.mongot.index.lucene.explain.information.SearchExplainInformation;
@@ -475,6 +476,7 @@ public class SearchCommandTest {
   public void intermediateSearchCommand_explain_valid(MongoDbVersion mdbVersion) throws Exception {
     SearchExplainInformation explain =
         SearchExplainInformationBuilder.newBuilder()
+            .luceneQuery(List.of(new LuceneQueryDetails("a:hello", "a:hello")))
             .queryExplainInfos(
                 List.of(
                     QueryExplainInformationBuilder.builder()
@@ -517,6 +519,8 @@ public class SearchCommandTest {
             Explain.Verbosity.EXECUTION_STATS, NUM_PARTITIONS.getDefaultValue(), explain)) {
       BsonDocument result = command.run();
       MongotIntermediateCursorBatch batch = MongotIntermediateCursorBatch.fromBson(result);
+      Truth.assertThat(batch.cursors().getFirst().explain().orElseThrow().luceneQuery())
+          .isEqualTo(explain.luceneQuery());
       Truth.assertThat(batch.cursors().stream().map(MongotCursorBatch::explain).toList())
           .comparingElementsUsing(
               Correspondence.from(

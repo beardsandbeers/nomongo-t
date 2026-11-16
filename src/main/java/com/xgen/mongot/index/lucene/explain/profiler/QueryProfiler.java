@@ -5,6 +5,7 @@ import static com.xgen.mongot.util.Check.checkArg;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Streams;
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.lucene.explain.information.LuceneQueryDetails;
 import com.xgen.mongot.index.lucene.explain.information.QueryExplainInformation;
 import com.xgen.mongot.index.lucene.explain.information.creator.QueryExplainInformationCreator;
 import com.xgen.mongot.index.lucene.explain.query.QueryExecutionContext;
@@ -17,6 +18,7 @@ import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.Optionals;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -24,20 +26,39 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.Query;
 
 public class QueryProfiler {
+  private static final int RECENT_LUCENE_QUERY_LIMIT = 10;
+
   private final List<QueryExecutionContext<QueryVisitorQueryExecutionContextNode>>
       executionContexts;
   @Var private Optional<RewrittenQueryExecutionContextNode> mergedNode;
+  private final LinkedHashSet<LuceneQueryDetails> luceneQueries = new LinkedHashSet<>();
+  private final int luceneQueryLimit;
 
   public QueryProfiler() {
-    this(new ArrayList<>(), Optional.empty());
+    this(Explain.Verbosity.ALL_PLANS_EXECUTION);
+  }
+
+  public QueryProfiler(Explain.Verbosity verbosity) {
+    this(new ArrayList<>(), Optional.empty(), verbosity);
   }
 
   @VisibleForTesting
   QueryProfiler(
       List<QueryExecutionContext<QueryVisitorQueryExecutionContextNode>> executionContexts,
       Optional<RewrittenQueryExecutionContextNode> mergedNode) {
+    this(executionContexts, mergedNode, Explain.Verbosity.ALL_PLANS_EXECUTION);
+  }
+
+  private QueryProfiler(
+      List<QueryExecutionContext<QueryVisitorQueryExecutionContextNode>> executionContexts,
+      Optional<RewrittenQueryExecutionContextNode> mergedNode,
+      Explain.Verbosity verbosity) {
     this.executionContexts = executionContexts;
     this.mergedNode = mergedNode;
+    this.luceneQueryLimit =
+        verbosity == Explain.Verbosity.ALL_PLANS_EXECUTION
+            ? Integer.MAX_VALUE
+            : RECENT_LUCENE_QUERY_LIMIT;
   }
 
   public void createQueryExecutionContext() {
@@ -51,6 +72,7 @@ public class QueryProfiler {
 
   /** Adds a child must node to a root vector query node */
   public void addVectorMustNode(Query original, Query rewritten) {
+    recordLuceneQuery(original, rewritten);
     if (original == rewritten) {
       return;
     }
@@ -69,8 +91,9 @@ public class QueryProfiler {
     currentExecutionContext.addChildNode(root.getQuery(), filter, BooleanClause.Occur.FILTER);
   }
 
-  /** Replace a rewritten node in the query tree. Does nothing if rewritten == original. */
+  /** Records root query renderings and replaces the node when rewritten != original. */
   public void replaceNode(Query original, Query rewritten) {
+    recordLuceneQuery(original, rewritten);
     if (original == rewritten) {
       return;
     }
@@ -86,6 +109,32 @@ public class QueryProfiler {
     }
 
     getCurrentExecutionContext().replaceNode(original, rewritten);
+  }
+
+  private void recordLuceneQuery(Query original, Query rewritten) {
+    if (this.executionContexts.isEmpty()) {
+      return;
+    }
+    var root = getCurrentExecutionContext().getRoot();
+    if (root.isEmpty() || root.get().getQuery() == original) {
+      // Only root rewrites describe the whole search. Nested rewrites (including lazy join
+      // postings and vector filters) must not appear as independent query plans.
+      this.luceneQueries.add(new LuceneQueryDetails(original.toString(), rewritten.toString()));
+      // Bound retained diagnostic strings, not just the serialized snapshot. Otherwise a
+      // long-lived executionStats cursor could keep every discarded rendering indefinitely.
+      if (this.luceneQueries.size() > this.luceneQueryLimit) {
+        this.luceneQueries.removeFirst();
+      }
+    }
+  }
+
+  /** Retained distinct query renderings across batches, in insertion order. */
+  public List<LuceneQueryDetails> luceneQueries(Explain.Verbosity verbosity) {
+    int skip =
+        verbosity == Explain.Verbosity.ALL_PLANS_EXECUTION
+            ? 0
+            : Math.max(0, this.luceneQueries.size() - RECENT_LUCENE_QUERY_LIMIT);
+    return this.luceneQueries.stream().skip(skip).toList();
   }
 
   /** Get the complete explain information associated with the root query of this Profiler. */

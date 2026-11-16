@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import bson
 from bson import Int64, ObjectId
+
 from mongot_standalone import api
 from mongot_standalone.documents import DocumentCommandsMixin
 

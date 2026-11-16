@@ -279,6 +279,10 @@ public class StandaloneJoinsTest {
   }
 
   private static void assertLocalPlan(BsonDocument explain) {
+    assertThat(explain.getDocument("luceneQuery").getString("analyzed").getValue())
+        .contains("parent");
+    assertThat(explain.getDocument("luceneQuery").getString("rewritten").getValue())
+        .contains("parent");
     assertThat(explain.containsKey("query")).isTrue();
     assertThat(explain.containsKey("collectors")).isTrue();
     assertThat(explain.get("query").toString()).contains("parent");

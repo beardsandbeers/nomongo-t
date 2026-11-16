@@ -9,6 +9,7 @@ import com.mongodb.client.model.geojson.Position;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
+import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.lucene.query.context.QueryFactoryContext;
 import com.xgen.mongot.index.query.operators.AllDocumentsOperator;
 import com.xgen.mongot.index.query.operators.CompoundOperator;
@@ -19,6 +20,8 @@ import com.xgen.mongot.index.query.operators.ExistsOperator;
 import com.xgen.mongot.index.query.operators.GeoShapeOperator;
 import com.xgen.mongot.index.query.operators.GeoWithinOperator;
 import com.xgen.mongot.index.query.operators.InOperator;
+import com.xgen.mongot.index.query.operators.JoinField;
+import com.xgen.mongot.index.query.operators.JoinKeySet;
 import com.xgen.mongot.index.query.operators.KnnBetaOperator;
 import com.xgen.mongot.index.query.operators.MoreLikeThisOperator;
 import com.xgen.mongot.index.query.operators.NearOperator;
@@ -318,7 +321,12 @@ public class OperatorRewriteEngineTest {
     m.put(com.xgen.mongot.index.query.operators.JoinOperator.class, join);
     m.put(
         com.xgen.mongot.index.query.operators.MaterializedJoinOperator.class,
-        new com.xgen.mongot.index.query.operators.MaterializedJoinOperator(join, List.of("v")));
+        new com.xgen.mongot.index.query.operators.MaterializedJoinOperator(
+            join,
+            new JoinField(JoinField.Type.TOKEN, StockNormalizerName.NONE),
+            new JoinKeySet.Builder(ignored -> {}).build(),
+            false,
+            1000));
     m.put(
         KnnBetaOperator.class,
         new KnnBetaOperator(score, List.of(fp), List.of(), Optional.empty(), 1));

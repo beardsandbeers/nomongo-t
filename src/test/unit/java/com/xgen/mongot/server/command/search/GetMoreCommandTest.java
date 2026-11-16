@@ -18,6 +18,7 @@ import com.xgen.mongot.cursor.QueryBatchTimerRecorder;
 import com.xgen.mongot.cursor.serialization.MongotCursorBatch;
 import com.xgen.mongot.cursor.serialization.MongotCursorResult;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.lucene.explain.information.LuceneQueryDetails;
 import com.xgen.mongot.index.lucene.explain.information.LuceneQuerySpecification;
 import com.xgen.mongot.index.lucene.explain.information.SearchExplainInformation;
 import com.xgen.mongot.index.lucene.explain.information.SearchExplainInformationBuilder;
@@ -251,6 +252,7 @@ public class GetMoreCommandTest {
 
     var explainInformation =
         SearchExplainInformationBuilder.newBuilder()
+            .luceneQuery(List.of(new LuceneQueryDetails("a:hello", "a:hello")))
             .queryExplainInfos(
                 List.of(
                     QueryExplainInformationBuilder.builder()

@@ -20,6 +20,7 @@ java_test_suite(
         "//src/main/java/com/xgen/mongot/index/lucene/explain/timing",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/tracing",
         "//src/main/java/com/xgen/mongot/util",
+        "//src/main/java/com/xgen/mongot/util/bson/parser",
         "//src/main/java/com/xgen/testing/mongot/index/lucene/explain/query",
         "//src/main/java/com/xgen/testing/mongot/mock/index",
         "@maven//:com_google_truth_truth",
