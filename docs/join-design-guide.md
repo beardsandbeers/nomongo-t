@@ -8,6 +8,11 @@ This guide adapts the original two-Lucene-index example to this repository's
 standalone push server, BSON search expressions, mappings, and cursor lifecycle.
 It covers joins across indexes and self-joins within one index.
 
+For joins through mongod over replicated indexes, see [coupled joins](coupled-joins.md).
+That entry point uses `from: {collection, index}` and has a documented foreign-collection
+authorization caveat. The standalone string-source syntax and dependency access checks below
+remain unchanged; both architectures use the shared planner in `extensions/join`.
+
 The initial feature is an equality **semijoin**: return local documents
 when at least one qualifying foreign document has a matching key. Returning
 foreign documents, expanding rows, and combining relevance scores are separate

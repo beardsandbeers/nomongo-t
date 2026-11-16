@@ -23,6 +23,7 @@ java_library(
         "JoinField.java",
         "JoinKeySet.java",
         "JoinOperator.java",
+        "JoinSource.java",
         "KnnBetaOperator.java",
         "MaterializedJoinOperator.java",
         "MoreLikeThisOperator.java",

@@ -1,5 +1,6 @@
 package com.xgen.mongot.standalone.coexistence;
 
+import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.IntermediateSearchCursorInfo;
 import com.xgen.mongot.cursor.MongotCursorManager;
@@ -26,9 +27,18 @@ import java.util.UUID;
 /** Keeps native cursor IDs compatible while denying transport access to direct-API cursors. */
 public final class NativeCursorManager implements MongotCursorManager {
   private final MongotCursorManagerImpl delegate;
+  private final Optional<CoupledJoinService> joins;
+  private final java.util.Set<Long> joinCursors =
+      java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   public NativeCursorManager(MongotCursorManagerImpl delegate) {
     this.delegate = delegate;
+    this.joins = Optional.empty();
+  }
+
+  public NativeCursorManager(MongotCursorManagerImpl delegate, CoupledJoinService joins) {
+    this.delegate = delegate;
+    this.joins = Optional.of(joins);
   }
 
   private void requireNative(long id) throws MongotCursorNotFoundException {
@@ -52,7 +62,66 @@ public final class NativeCursorManager implements MongotCursorManager {
           IndexUnavailableException,
           InterruptedException,
           ReaderClosedException {
-    return this.delegate.newCursor(db, collection, uuid, view, query, options, flags, metadata);
+    if (this.joins.isEmpty()
+        || !(query instanceof CursorQuery.Search search)
+        || !(search.query() instanceof SearchQuery logical)
+        || !CoupledJoinService.contains(logical)
+        || metadata.map(m -> m.getRoutedFromAnotherShard()).orElse(false)) {
+      return this.delegate.newCursor(db, collection, uuid, view, query, options, flags, metadata);
+    }
+    @Var CoupledJoinService.Prepared prepared = null;
+    @Var Long cursor = null;
+    try {
+      var plan = this.joins.get().prepare(db, uuid, view, logical);
+      if (plan.isEmpty()) {
+        return this.delegate.newCursor(db, collection, uuid, view, query, options, flags, metadata);
+      }
+      prepared = plan.get();
+      var info =
+          this.delegate.newCursor(
+              db,
+              collection,
+              uuid,
+              view,
+              new CursorQuery.Search(
+                  prepared.plan.query(), Optional.of(prepared), Optional.of(prepared.generation)),
+              options,
+              flags,
+              metadata);
+      cursor = info.cursorId;
+      if (!prepared.consumed()) {
+        throw new CoupledJoinService.Failure("Join dependency disappeared during registration");
+      }
+      prepared.validateInitial.run();
+      prepared.plan.verifyDependencies();
+      this.joinCursors.add(info.cursorId);
+      prepared.registered(() -> this.joinCursors.remove(info.cursorId));
+      return info;
+    } catch (Exception | Error e) {
+      if (cursor != null) {
+        this.delegate.killCursor(cursor);
+      }
+      if (prepared != null) {
+        try {
+          prepared.close();
+        } catch (IOException cleanup) {
+          e.addSuppressed(cleanup);
+        }
+      }
+      if (e instanceof IOException io) {
+        throw io;
+      }
+      if (e instanceof InterruptedException interrupted) {
+        throw interrupted;
+      }
+      if (e instanceof IndexUnavailableException unavailable) {
+        throw unavailable;
+      }
+      if (e instanceof Error error) {
+        throw error;
+      }
+      throw new InvalidQueryException(e.getMessage());
+    }
   }
 
   @Override
@@ -67,6 +136,9 @@ public final class NativeCursorManager implements MongotCursorManager {
       QueryOptimizationFlags flags,
       Optional<SearchEnvoyMetadata> metadata)
       throws IOException, InvalidQueryException, IndexUnavailableException, InterruptedException {
+    if (CoupledJoinService.contains(query)) {
+      throw new InvalidQueryException("Joins do not support intermediate/sharded search execution");
+    }
     return this.delegate.newIntermediateCursors(
         db, collection, uuid, view, query, version, options, flags, metadata);
   }
@@ -75,7 +147,20 @@ public final class NativeCursorManager implements MongotCursorManager {
   public MongotCursorResultInfo getNextBatch(long id, Bytes limit, BatchCursorOptions options)
       throws MongotCursorNotFoundException, IOException, IndexUnavailableException {
     requireNative(id);
-    return this.delegate.getNextBatch(id, limit, options);
+    boolean join = this.joinCursors.contains(id);
+    try {
+      return this.delegate.getNextBatch(id, limit, options);
+    } catch (IOException | RuntimeException | Error e) {
+      if (join) {
+        this.delegate.killCursor(id);
+      }
+      if (e instanceof CoupledJoinService.Failure
+          || e instanceof java.util.concurrent.CancellationException) {
+        throw new IndexUnavailableException(
+            java.util.Objects.toString(e.getMessage(), "Join request failed"));
+      }
+      throw e;
+    }
   }
 
   @Override

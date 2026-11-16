@@ -11,6 +11,9 @@ import hashlib
 import os
 import secrets
 import shutil
+import struct
+import urllib.request
+from queue import Queue
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -140,6 +143,157 @@ def read_local(client, index_id, query=QUERY):
     return ids, pages
 
 
+def check_coupled_continuations(db, client, metrics_address, passed):
+    """Force server-side continuation; a mongod batchSize alone does not keep mongot open."""
+
+    def resources():
+        with urllib.request.urlopen(
+            "http://" + metrics_address + "/metrics", timeout=5
+        ) as response:
+            metrics = response.read().decode()
+        values = dict(
+            line.split()
+            for line in metrics.splitlines()
+            if line.startswith(
+                ("mongot_cursorManager_trackedCursors ", "mongot_coupled_joins_reservedBytes ")
+            )
+        )
+        return tuple(
+            float(values[name])
+            for name in (
+                "mongot_cursorManager_trackedCursors",
+                "mongot_coupled_joins_reservedBytes",
+            )
+        )
+
+    def released():
+        wait_for(
+            "coupled cursor and reservation cleanup", resources, lambda value: value == baseline
+        )
+
+    def retained():
+        wait_for(
+            "live mongot join cursor",
+            resources,
+            lambda value: value[0] > baseline[0] and value[1] > baseline[1],
+        )
+
+    ids = [f"page-{i:05}" for i in range(4096)]
+    db.page_parents.insert_one({"_id": 42, "office": "Berlin"})
+    db.page_children.insert_many([{"_id": value, "parent": 42, "title": "coffee"} for value in ids])
+    for name, mapping in (("page_parents", PARENT_MAPPING), ("page_children", CHILD_MAPPING)):
+        db.command(
+            {"createSearchIndexes": name, "indexes": [{"name": "default", "definition": mapping}]}
+        )
+    query = copy.deepcopy(QUERY)
+    query["compound"]["filter"][0]["join"]["from"] = {"collection": "page_parents"}
+    meta = copy.deepcopy(query)
+    meta.pop("returnStoredSource")
+    meta.pop("sort")
+
+    def count():
+        return list(db.page_children.aggregate([{"$searchMeta": meta}]))[0]["count"]["total"]
+
+    wait_for("large coupled fixture indexed", count, lambda value: value == len(ids))
+    baseline = resources()
+    assert baseline == (0, 0), baseline
+    with db.page_children.aggregate([{"$search": query}], batchSize=1) as cursor:
+        observed = [next(cursor)["_id"]]
+        retained()
+        db.page_parents.update_one({"_id": 42}, {"$set": {"office": "Paris"}})
+        wait_for("fresh joins see changed membership", count, lambda value: value == 0)
+        retained()
+        observed.extend(row["_id"] for row in cursor)
+        assert observed == ids, observed
+    released()
+    passed("coupled mongot getMore preserves membership after foreign mutation", documents=len(ids))
+
+    db.page_parents.update_one({"_id": 42}, {"$set": {"office": "Berlin"}})
+    wait_for("restore foreign membership", count, lambda value: value == len(ids))
+    with db.page_children.aggregate([{"$search": query}], batchSize=1) as cursor:
+        next(cursor)
+        retained()
+        db.command({"dropSearchIndex": "page_parents", "name": "default"})
+
+        def retired():
+            try:
+                count()
+                return False
+            except PyMongoError as error:
+                return "Foreign join index does not exist" in str(error)
+
+        wait_for("foreign generation retired in mongot", retired)
+        try:
+            list(cursor)  # Drain mongod's buffered hits and force the next mongot batch.
+        except PyMongoError as error:
+            assert "Join dependency" in str(error), error
+        else:
+            raise AssertionError("Retired foreign generation allowed coupled getMore")
+    released()
+    passed("coupled foreign retirement rejects getMore and releases reservation")
+
+    db.command(
+        {
+            "createSearchIndexes": "page_parents",
+            "indexes": [{"name": "default", "definition": PARENT_MAPPING}],
+        }
+    )
+    wait_for("foreign index rebuilt", count, lambda value: value == len(ids))
+    uuid = next(db.list_collections(filter={"name": "page_children"}))["info"]["uuid"]
+
+    def encode_wire(document):
+        body = encode_bson(document)
+        return struct.pack("<iiiiiB", 21 + len(body), 1, 0, 2013, 0, 0) + body
+
+    def decode_wire(message):
+        length, _, response_to, opcode = struct.unpack("<iiii", message[:16])
+        assert length == len(message) and response_to == 1 and opcode == 2013
+        assert message[20] == 0
+        size = struct.unpack("<i", message[21:25])[0]
+        return decode_bson(message[21 : 21 + size])
+
+    native = client.channel.stream_stream(
+        "/mongodb.CommandService/UnauthenticatedCommandStream",
+        request_serializer=encode_wire,
+        response_deserializer=decode_wire,
+    )
+    requests = Queue()
+    requests.put(
+        {
+            "search": "page_children",
+            "$db": db.name,
+            "collectionUUID": uuid,
+            "query": query,
+            "cursorOptions": {"batchSize": 1},
+        }
+    )
+    call = native(iter(requests.get, None), metadata=(("mongodb-wireversion", "25"),), timeout=30)
+    try:
+        first = next(call)
+        assert first.get("ok"), first
+        cursor_id = first["cursor"]["id"]
+        assert cursor_id != 0, first
+        retained()
+        get_more = {
+            "getMore": cursor_id,
+            "collection": "page_children",
+            "$db": db.name,
+            "cursorOptions": {"batchSize": 1},
+        }
+        requests.put(get_more)
+        second = next(call)
+        assert second.get("ok") and second["cursor"]["id"] == cursor_id, second
+        assert len(second["cursor"]["nextBatch"]) == 1, second
+        # Cancel the native transport with a continuation queued or in flight.
+        requests.put(get_more)
+        call.cancel()
+    finally:
+        call.cancel()
+        requests.put(None)
+    released()
+    passed("native coupled stream cancellation after getMore releases cursor and reservation")
+
+
 def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     scratch = Path(tempfile.mkdtemp(prefix=".integer-join-e2e-", dir=Path.cwd())).resolve()
@@ -174,7 +328,11 @@ def run(args):
         results["candidate_jar_sha256"] = hashlib.sha256(
             (args.mongot.parent / "bin/mongot_community_deploy.jar").read_bytes()
         ).hexdigest()
+        keyfile = scratch / "keyfile"
+        keyfile.write_text(secrets.token_hex(64))
+        keyfile.chmod(0o400)
         mongo_config = {
+            "security": {"authorization": "enabled", "keyFile": "/mongo-keyfile"},
             "net": {"bindIp": "127.0.0.1", "port": mongo_port},
             "replication": {"replSetName": "integerjoins"},
             "storage": {
@@ -219,6 +377,8 @@ def run(args):
             f"{volume}:/data/db",
             "-v",
             f"{scratch / 'mongod.yaml'}:/mongod.yaml:ro",
+            "-v",
+            f"{keyfile}:/mongo-keyfile:ro",
             *mounts,
             args.runtime_image,
             *command,
@@ -247,6 +407,17 @@ def run(args):
         mongo.admin.command(
             "createUser", "searchTest", pwd=password.read_text(), roles=["root", "__system"]
         )
+        mongo.close()
+        mongo = MongoClient(
+            "127.0.0.1",
+            mongo_port,
+            username="searchTest",
+            password=password.read_text(),
+            authSource="admin",
+            directConnection=True,
+            serverSelectionTimeoutMS=2000,
+            socketTimeoutMS=30000,
+        )
         config = {
             "syncSource": {
                 "replicaSet": {
@@ -262,7 +433,7 @@ def run(args):
             "storage": {"dataPath": str(search_data)},
             "server": {"grpc": {"address": f"127.0.0.1:{grpc_port}"}},
             "healthCheck": {"address": f"127.0.0.1:{port()}"},
-            "metrics": {"enabled": False, "address": f"127.0.0.1:{port()}"},
+            "metrics": {"enabled": True, "address": f"127.0.0.1:{port()}"},
         }
         (scratch / "mongot.yaml").write_text(yaml.safe_dump(config))
         shutil.copyfile(scratch / "mongot.yaml", args.output / "mongot.yaml")
@@ -367,6 +538,25 @@ def run(args):
                 )
             )
 
+        def coupled_query(query=QUERY, local_index="children", foreign_index="parents"):
+            result = copy.deepcopy(query)
+            result["index"] = local_index
+            clause = "filter" if "filter" in result["compound"] else "mustNot"
+            result["compound"][clause][0]["join"]["from"] = {
+                "collection": "parents",
+                "index": foreign_index,
+            }
+            return result
+
+        def coupled_rows(query=QUERY, local_index="children", foreign_index="parents"):
+            return list(
+                db.children.aggregate(
+                    [{"$search": coupled_query(query, local_index, foreign_index)}],
+                    batchSize=1,
+                    maxTimeMS=15000,
+                )
+            )
+
         def compare(label):
             oracle = [doc["_id"] for doc in pipeline_rows(search=False)]
             rows = wait_for(
@@ -379,6 +569,17 @@ def run(args):
                 lambda: read_local(client, local["children"]),
                 lambda value: value[0] == oracle,
             )
+            wait_for(
+                label + " coupled inline join",
+                coupled_rows,
+                lambda rows: [r["_id"] for r in rows] == oracle,
+            )
+            meta_query = coupled_query()
+            meta_query.pop("returnStoredSource", None)
+            meta_query.pop("sort", None)
+            assert list(db.children.aggregate([{"$searchMeta": meta_query}]))[0]["count"][
+                "total"
+            ] == len(oracle)
             passed(
                 label,
                 ids=ids,
@@ -393,6 +594,90 @@ def run(args):
         assert initial == sorted(
             ["min", "max", "large", "wide", "narrow", "negative", "zero", "array"]
         ), initial
+        default_mapping = copy.deepcopy(PARENT_MAPPING)
+        default_mapping["numPartitions"] = 1
+        db.command(
+            {
+                "createSearchIndexes": "parents",
+                "indexes": [{"name": "default", "definition": default_mapping}],
+            }
+        )
+        default_query = coupled_query()
+        default_query["compound"]["filter"][0]["join"]["from"] = {"collection": "parents"}
+        wait_for(
+            "default foreign index with different partition count",
+            lambda: list(db.children.aggregate([{"$search": default_query}], batchSize=1)),
+            lambda rows: [r["_id"] for r in rows] == initial,
+        )
+        self_query = {
+            "index": "parents",
+            "compound": {
+                "filter": [
+                    {
+                        "join": {
+                            "localField": "_id",
+                            "foreignField": "_id",
+                            "operator": {"equals": {"path": "office", "value": "Berlin"}},
+                        }
+                    }
+                ]
+            },
+            "returnStoredSource": True,
+        }
+        self_expected = {
+            encode_bson({"_id": doc["_id"]})
+            for doc in parents
+            if isinstance(doc["_id"], int) and doc["office"] == "Berlin"
+        }
+        assert {
+            encode_bson({"_id": row["_id"]})
+            for row in db.parents.aggregate([{"$search": self_query}])
+        } == self_expected
+        db.command({"create": "parents_view", "viewOn": "parents", "pipeline": []})
+        for source in (
+            "parents",
+            {"collection": "missing"},
+            {"collection": "parents_view"},
+            {"collection": "parents", "index": "missing"},
+        ):
+            invalid = coupled_query()
+            invalid["compound"]["filter"][0]["join"]["from"] = source
+            try:
+                list(db.children.aggregate([{"$search": invalid}]))
+            except PyMongoError:
+                pass
+            else:
+                raise AssertionError(f"Invalid coupled source was accepted: {source}")
+        passed("coupled default index, unequal partitions, self joins and invalid source rejection")
+
+        db.command(
+            {
+                "createRole": "outerOnly",
+                "privileges": [
+                    {"resource": {"db": db.name, "collection": "children"}, "actions": ["find"]}
+                ],
+                "roles": [],
+            }
+        )
+        db.command({"createUser": "outerOnly", "pwd": password.read_text(), "roles": ["outerOnly"]})
+        with MongoClient(
+            "127.0.0.1",
+            mongo_port,
+            username="outerOnly",
+            password=password.read_text(),
+            authSource=db.name,
+            directConnection=True,
+        ) as restricted:
+            try:
+                restricted[db.name].parents.find_one()
+            except PyMongoError as error:
+                assert error.code == 13, error
+            else:
+                raise AssertionError("Foreign direct read must be unauthorized")
+            leaked = list(restricted[db.name].children.aggregate([{"$search": coupled_query()}]))
+            assert [row["_id"] for row in leaked] == initial
+        passed("known authorization caveat: outer-only user can infer foreign membership")
+
         ordinary = [doc["_id"] for doc in pipeline_rows(integer_only=False)]
         assert set(ordinary) == {
             *initial,
@@ -412,7 +697,32 @@ def run(args):
         expected = [doc["_id"] for doc in pipeline_rows(search=False, exclude=True)]
         assert [doc["_id"] for doc in pipeline_rows(exclude=True)] == expected
         assert read_local(client, local["children"], exclusion)[0] == expected
-        passed("exclusion keeps missing, null, empty, orphan and non-integer keys", ids=expected)
+        assert [doc["_id"] for doc in coupled_rows(exclusion)] == expected
+        inline_explain = db.command(
+            {
+                "explain": {
+                    "aggregate": "children",
+                    "pipeline": [{"$search": coupled_query()}],
+                    "cursor": {},
+                },
+                "verbosity": "executionStats",
+            }
+        )
+        assert "indexPartitionExplain" in str(inline_explain), inline_explain
+        coupled_explain = inline_explain["stages"][0]["$_internalSearchMongotRemote"]["explain"]
+        coupled_preparation = coupled_explain["joins"]["preparation"]
+        coupled_source = coupled_preparation["sources"][0]
+        assert coupled_source["from"] == {"collection": "parents", "index": "parents"}
+        assert coupled_source["keyType"] == "INT64", coupled_source
+        assert coupled_preparation["keyCount"] > 0, coupled_preparation
+        assert all(
+            partition["joins"]["execution"]
+            for partition in coupled_explain["indexPartitionExplain"]
+        )
+        (args.output / "coupled-join-explain.json").write_text(
+            json_util.dumps(inline_explain, indent=2)
+        )
+        passed("coupled exclusion, partitioned explain, counts and pagination", ids=expected)
 
         # A numeric predicate must select adjacent large IDs exactly through the native endpoint.
         parent_pipeline = [
@@ -560,6 +870,11 @@ def run(args):
                 lambda: read_local(client, mixed["children"], excluded_query),
                 lambda result: typed_ids(result[0]) == typed_ids(excluded),
             )
+            wait_for(
+                label + " coupled mixed join",
+                lambda: coupled_rows(mixed_query, "mixed-children", "mixed-parents"),
+                lambda rows: typed_ids([r["_id"] for r in rows]) == typed_ids(expected),
+            )
             passed(label, ids=ids, standalone_pages=pages, excluded=excluded)
             return ids
 
@@ -574,7 +889,8 @@ def run(args):
         )
         assert mixed_first.cursor_id
 
-        # Freeze a local cursor, then change foreign membership and local text on both ingestion paths.
+        # Freeze standalone cursors, then change foreign membership and local text.
+        # Coupled continuation is checked below with enough hits to keep mongot cursors open.
         first = client.search(
             api.QueryRequest(
                 index_id=local["children"], query_bson=encode_bson(QUERY), batch_size=1
@@ -698,6 +1014,31 @@ def run(args):
             concern="visible",
         )
         compare_mixed("mixed-ID joins converge again after MongoDB outage")
+        db.parents.rename("renamed_parents")
+        db.parents.insert_one({"_id": Int64(43), "office": "Berlin"})
+        stale_query = coupled_query()
+        try:
+            list(db.children.aggregate([{"$search": stale_query}]))
+        except PyMongoError:
+            pass
+        else:
+            raise AssertionError("Recreated namespace reused the old collection index")
+        db.command(
+            {
+                "createSearchIndexes": "parents",
+                "indexes": [{"name": "parents", "definition": PARENT_MAPPING}],
+            }
+        )
+        replacement_expected = [doc["_id"] for doc in pipeline_rows(search=False)]
+        wait_for(
+            "recreated collection resolves its new UUID",
+            coupled_rows,
+            lambda rows: [r["_id"] for r in rows] == replacement_expected,
+        )
+        passed(
+            "rename/recreate resolves the current namespace UUID and never reuses the stale name"
+        )
+        check_coupled_continuations(db, client, config["metrics"]["address"], passed)
         results["passed"] = True
     except Exception as error:
         results["failure"] = repr(error)

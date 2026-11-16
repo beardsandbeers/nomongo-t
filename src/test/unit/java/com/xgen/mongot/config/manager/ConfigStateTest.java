@@ -72,7 +72,12 @@ public class ConfigStateTest {
                 ConnectionStringUtil.toConnectionInfo("mongodb://newString"))
             .mongodClusterReadWriteUri(ConnectionStringUtil.toConnectionInfo("mongodb://newString"))
             .build();
+    var publishedSource = mocks.configState.syncSourceSnapshotSupplier();
+    var beforeUpdate = publishedSource.get();
     mocks.configState.updateSyncSource(newSyncSourceConfig);
+    var firstUpdate = publishedSource.get();
+    Assert.assertEquals(beforeUpdate.epoch() + 1, firstUpdate.epoch());
+    Assert.assertEquals(Optional.of(newSyncSourceConfig), firstUpdate.config());
     Assert.assertTrue(
         mocks
             .configState
@@ -84,6 +89,8 @@ public class ConfigStateTest {
 
     mocks.replicationGate.close();
     mocks.configState.updateSyncSource(newSyncSourceConfig);
+    Assert.assertNotSame(firstUpdate, publishedSource.get());
+    Assert.assertEquals(firstUpdate.epoch(), publishedSource.get().epoch());
     Assert.assertTrue(
         mocks
             .configState
@@ -100,6 +107,48 @@ public class ConfigStateTest {
             .get()
             .equals(newSyncSourceConfig));
     Assert.assertFalse(mocks.configState.getLifecycleManager().isReplicationSupported());
+  }
+
+  @Test
+  public void updateSyncSource_replicationHostLossAndRecovery_preservesQueryEpoch()
+      throws Exception {
+    var mocks = ConfigStateMocks.create();
+    var source = ConfigStateMocks.MOCK_SYNC_SOURCE_CONFIG;
+    var published = mocks.configState.syncSourceSnapshotSupplier();
+    long epoch = published.get().epoch();
+    var unavailable = source.copyWithUpdatedReplicationUris(Optional.empty(), Optional.empty());
+
+    mocks.configState.updateSyncSource(unavailable);
+
+    Assert.assertEquals(epoch, published.get().epoch());
+    Assert.assertEquals(Optional.of(unavailable), published.get().config());
+
+    var recovered =
+        source.copyWithUpdatedReplicationUris(
+            Optional.of(ConnectionStringUtil.toConnectionInfo("mongodb://replacement-host")),
+            Optional.empty());
+    mocks.configState.updateSyncSource(recovered);
+
+    Assert.assertEquals(epoch, published.get().epoch());
+    Assert.assertEquals(Optional.of(recovered), published.get().config());
+  }
+
+  @Test
+  public void updateSyncSource_clusterChangesAndReturns_doesNotReuseQueryEpoch() throws Exception {
+    var mocks = ConfigStateMocks.create();
+    var published = mocks.configState.syncSourceSnapshotSupplier();
+    long epoch = published.get().epoch();
+    var other = ConnectionStringUtil.toConnectionInfo("mongodb://other-cluster");
+
+    mocks.configState.updateSyncSource(
+        SyncSourceConfig.builder()
+            .mongodClusterReadWriteUri(other)
+            .mongodClusterReplicationUri(other)
+            .build());
+    Assert.assertEquals(epoch + 1, published.get().epoch());
+    mocks.configState.updateSyncSource(ConfigStateMocks.MOCK_SYNC_SOURCE_CONFIG);
+
+    Assert.assertEquals(epoch + 2, published.get().epoch());
   }
 
   @Test
