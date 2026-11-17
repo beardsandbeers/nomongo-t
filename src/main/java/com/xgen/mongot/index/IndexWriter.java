@@ -68,6 +68,16 @@ public interface IndexWriter extends Closeable {
    */
   void commit(EncodedUserData userData) throws IOException;
 
+  /** Validates a pinned committed baseline without flushing pending mutations. */
+  default void validateCommittedData() throws IOException {
+    throw new UnsupportedOperationException("Committed snapshot validation is unsupported");
+  }
+
+  /** Copies pinned committed files into an empty directory; callers must first drain and commit. */
+  default void copyCommittedData(java.nio.file.Path destination) throws IOException {
+    throw new UnsupportedOperationException("Committed file snapshots are unsupported");
+  }
+
   /**
    * Returns the last set of user data that was committed, or an empty map if the index has not been
    * committed yet.

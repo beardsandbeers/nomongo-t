@@ -20,6 +20,7 @@ import com.xgen.mongot.index.definition.VectorIndexDefinition;
 import com.xgen.mongot.index.ingestion.BsonDocumentProcessor;
 import com.xgen.mongot.index.lucene.codec.LuceneCodec;
 import com.xgen.mongot.index.lucene.commit.LuceneCommitData;
+import com.xgen.mongot.index.lucene.directory.ExistingIndexDirectory;
 import com.xgen.mongot.index.lucene.document.DefaultIndexingPolicy;
 import com.xgen.mongot.index.lucene.document.LuceneIndexingPolicy;
 import com.xgen.mongot.index.lucene.document.builder.DocumentBlockBuilder;
@@ -98,7 +99,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
    * This factory creates a single {@link DocumentBlockBuilder} instance per ingested BSON document,
    * and produces an array of Lucene Documents to be indexed as a block.
    */
-  private final LuceneIndexingPolicy indexingPolicy;
+  private volatile LuceneIndexingPolicy indexingPolicy;
 
   /**
    * An optional upper limit for fields in an index. To support different indexing patterns, this
@@ -199,6 +200,10 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             .setMergePolicy(mergePolicy)
             .setRAMBufferSizeMB(ramBufferSizeMb)
             .setMergeScheduler(mergeScheduler)
+            .setOpenMode(
+                directory instanceof ExistingIndexDirectory
+                    ? IndexWriterConfig.OpenMode.APPEND
+                    : IndexWriterConfig.OpenMode.CREATE_OR_APPEND)
             .setCommitOnClose(false);
     indexDeletionPolicy.ifPresent(indexWriterConfig::setIndexDeletionPolicy);
     // initializes the corresponding PerIndexMergeScheduler
@@ -258,7 +263,40 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
       BooleanSupplier useIdBloomFilter)
       throws IOException {
 
-    Similarity similarity = LuceneSimilarity.from(resolver.indexDefinition);
+    return createForSearchIndex(
+        directory,
+        mergeScheduler,
+        mergePolicy,
+        ramBufferSizeMb,
+        fieldLimit,
+        docsLimit,
+        indexAnalyzer,
+        resolver,
+        indexingMetricsUpdater,
+        indexDeletionPolicy,
+        featureFlags,
+        useIdBloomFilter,
+        Optional.empty());
+  }
+
+  public static SingleLuceneIndexWriter createForSearchIndex(
+      Directory directory,
+      InstrumentedConcurrentMergeScheduler.PerIndexPartitionMergeScheduler mergeScheduler,
+      MergePolicy mergePolicy,
+      double ramBufferSizeMb,
+      Optional<Integer> fieldLimit,
+      Optional<Integer> docsLimit,
+      Analyzer indexAnalyzer,
+      SearchFieldDefinitionResolver resolver,
+      IndexMetricsUpdater.IndexingMetricsUpdater indexingMetricsUpdater,
+      Optional<IndexDeletionPolicy> indexDeletionPolicy,
+      FeatureFlags featureFlags,
+      BooleanSupplier useIdBloomFilter,
+      Optional<Similarity> liveSimilarity)
+      throws IOException {
+
+    Similarity similarity =
+        liveSimilarity.orElseGet(() -> LuceneSimilarity.from(resolver.indexDefinition));
 
     Map<FieldPath, VectorFieldSpecification> pathToField =
         LuceneCodecUtils.extractVectorFieldsFromSearchMappings(
@@ -277,9 +315,15 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             .setMergePolicy(mergePolicy)
             .setRAMBufferSizeMB(ramBufferSizeMb)
             .setMergeScheduler(mergeScheduler)
+            .setOpenMode(
+                directory instanceof ExistingIndexDirectory
+                    ? IndexWriterConfig.OpenMode.APPEND
+                    : IndexWriterConfig.OpenMode.CREATE_OR_APPEND)
             .setCommitOnClose(false)
             .setIndexDeletionPolicy(
-                indexDeletionPolicy.orElse(new KeepOnlyLastCommitDeletionPolicy()));
+                liveSimilarity.isPresent()
+                    ? snapshotPolicy(indexDeletionPolicy)
+                    : indexDeletionPolicy.orElseGet(KeepOnlyLastCommitDeletionPolicy::new));
     // initializes the corresponding PerIndexMergeScheduler
     mergeScheduler.setInfoStream(indexWriterConfig.getInfoStream());
 
@@ -333,6 +377,15 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
     }
   }
 
+  @Override
+  public Runnable prepareSchemaUpdate(Analyzer analyzer, SearchFieldDefinitionResolver resolver) {
+    var policy =
+        DefaultIndexingPolicy.create(
+            analyzer, resolver, this.indexingMetricsUpdater, this.featureFlags);
+    // The local owner excludes mutations across all partitions while publishing this callback.
+    return () -> this.indexingPolicy = policy;
+  }
+
   /** Updates the index to reflect the changed document. */
   @Override
   public void updateIndex(DocumentEvent event) throws IOException, FieldExceededLimitsException {
@@ -347,6 +400,76 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
       switch (event.getEventType()) {
         case DELETE -> handleDelete(encodedDocumentId, event);
         case INSERT, UPDATE -> handleInsertOrUpdate(encodedDocumentId, event);
+      }
+    }
+  }
+
+  private static org.apache.lucene.index.SnapshotDeletionPolicy snapshotPolicy(
+      Optional<IndexDeletionPolicy> policy) {
+    var delegate = policy.orElseGet(KeepOnlyLastCommitDeletionPolicy::new);
+    return delegate instanceof org.apache.lucene.index.SnapshotDeletionPolicy snapshots
+        ? snapshots
+        : new org.apache.lucene.index.SnapshotDeletionPolicy(delegate);
+  }
+
+  @Override
+  public void validateCommittedData() throws IOException {
+    try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("validateCommittedData");
+      var policy =
+          (org.apache.lucene.index.SnapshotDeletionPolicy)
+              this.luceneWriter.getConfig().getIndexDeletionPolicy();
+      org.apache.lucene.index.IndexCommit snapshot;
+      try {
+        snapshot = policy.snapshot();
+      } catch (IllegalStateException noCommit) {
+        throw new IOException("Source partition has no committed baseline", noCommit);
+      }
+      try {
+        var segments =
+            org.apache.lucene.index.SegmentInfos.readCommit(
+                snapshot.getDirectory(), snapshot.getSegmentsFileName());
+        String internal = segments.getUserData().get(LuceneCommitData.Keys.INDEX_WRITER_DATA);
+        if (internal != null
+            && LuceneCommitData.IndexWriterData.fromEncodedString(internal).isCleared()) {
+          throw new IOException("Source partition contains an interrupted-clear marker");
+        }
+        for (String file : snapshot.getFileNames()) {
+          if (Thread.currentThread().isInterrupted()) {
+            throw new java.io.InterruptedIOException("Source validation cancelled");
+          }
+          snapshot.getDirectory().fileLength(file);
+        }
+      } catch (com.xgen.mongot.util.bson.parser.BsonParseException
+          | org.bson.BsonInvalidOperationException
+          | org.bson.json.JsonParseException error) {
+        throw new IOException("Invalid source commit metadata", error);
+      } finally {
+        policy.release(snapshot);
+      }
+    }
+  }
+
+  @Override
+  public void copyCommittedData(java.nio.file.Path destination) throws IOException {
+    try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("copyCommittedData");
+      var policy =
+          (org.apache.lucene.index.SnapshotDeletionPolicy)
+              this.luceneWriter.getConfig().getIndexDeletionPolicy();
+      var snapshot = policy.snapshot();
+      try (var target = org.apache.lucene.store.FSDirectory.open(destination)) {
+        for (String file : snapshot.getFileNames()) {
+          if (Thread.currentThread().isInterrupted()) {
+            throw new java.io.InterruptedIOException("Index snapshot cancelled");
+          }
+          target.copyFrom(
+              snapshot.getDirectory(), file, file, org.apache.lucene.store.IOContext.DEFAULT);
+        }
+        target.sync(snapshot.getFileNames());
+        target.syncMetaData();
+      } finally {
+        policy.release(snapshot);
       }
     }
   }

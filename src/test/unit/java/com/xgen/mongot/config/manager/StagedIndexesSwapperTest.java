@@ -49,6 +49,40 @@ import org.mockito.InOrder;
 @RunWith(Theories.class)
 public class StagedIndexesSwapperTest {
 
+  @Test
+  public void swapReady_preservedTargetNotReady_doesNotReplaceFailedSource() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    var target = mocks.stageIndex(source.getDefinition().getIndexId());
+    source.getIndex().setStatus(IndexStatus.failed("source unavailable"));
+    target.getIndex().setStatus(IndexStatus.notStarted());
+    when(mocks.indexFactory.requiresExistingData(target.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    runSwaps(mocks);
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertStagedIndexesAre(target);
+    mocks.assertNoIndexActivity();
+  }
+
+  @Test
+  public void swapReady_authorizedBootstrapNotReady_doesNotReplaceFailedSource() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    var target = mocks.stageIndex(source.getDefinition().getIndexId());
+    source.getIndex().setStatus(IndexStatus.failed("source unavailable"));
+    target.getIndex().setStatus(IndexStatus.notStarted());
+    when(mocks.indexFactory.prohibitsEmptyRecovery(target.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    runSwaps(mocks);
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertStagedIndexesAre(target);
+    mocks.assertNoIndexActivity();
+  }
+
   /** All index statuses. */
   @DataPoints("allStatuses")
   public static Set<IndexStatus> allStatuses() {
@@ -305,7 +339,8 @@ public class StagedIndexesSwapperTest {
 
   @Test
   public void testSwapWhereNoLiveIndexIsPresentWorks() throws Exception {
-    // ConfigState can't be in this state to begin with, however, the swapper shouldn't care about
+    // ConfigState can't be in this state to begin with, however, the swapper shouldn't care
+    // about
     // this invariant.
     ConfigStateMocks mocks = getEmptyMocks();
 

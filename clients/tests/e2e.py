@@ -688,6 +688,7 @@ def exercise(client):
         {
             "indexId": text["indexId"],
             "expectedRevision": "1",
+            "updateMode": "INDEX_UPDATE_MODE_REBUILD_EMPTY",
             "definitionBson": request["definitionBson"],
         },
     )
@@ -711,6 +712,7 @@ def exercise(client):
         {
             "indexId": text["indexId"],
             "expectedRevision": "1",
+            "updateMode": "INDEX_UPDATE_MODE_REBUILD_EMPTY",
             "definitionBson": request["definitionBson"],
         },
         error="ABORTED",
@@ -726,6 +728,91 @@ def exercise(client):
     client.call("Upsert", {"indexId": text["indexId"], "documentsBson": [encoded(docs[0])]})
     checks.append(
         "schema update starts empty; explicit reingestion; revision and generation fences"
+    )
+    original_mapping = {"mappings": {"dynamic": False, "fields": {"title": {"type": "string"}}}}
+    preserved = client.call(
+        "CreateIndex",
+        {
+            "name": name + "-preserved",
+            "type": "INDEX_TYPE_SEARCH",
+            "definitionBson": encoded(original_mapping),
+        },
+    )
+    preserved = ready(client, preserved["indexId"], 1)
+    original_generation = preserved["generationId"]
+    unchanged = client.call(
+        "UpdateIndex",
+        {
+            "indexId": preserved["indexId"],
+            "expectedRevision": "1",
+            "definitionBson": encoded(original_mapping),
+        },
+    )
+    check(int(unchanged["desiredRevision"]) == 1, "No-op advanced the revision")
+    check(unchanged["generationId"] == original_generation, "No-op changed the generation")
+    preserved_document = {"_id": "retained", "title": "coffee", "category": "books"}
+    client.call(
+        "Upsert", {"indexId": preserved["indexId"], "documentsBson": [encoded(preserved_document)]}
+    )
+    new_mapping = {
+        "mappings": {
+            "dynamic": False,
+            "fields": {
+                "title": {"type": "string"},
+                "category": {"type": "token"},
+            },
+        }
+    }
+    client.call(
+        "UpdateIndex",
+        {
+            "indexId": preserved["indexId"],
+            "expectedRevision": "1",
+            "definitionBson": encoded(new_mapping),
+            "updateMode": "INDEX_UPDATE_MODE_REQUIRE_PRESERVE",
+        },
+    )
+    preserved = ready(client, preserved["indexId"], 2)
+    check(
+        preserved["generationId"] == original_generation,
+        "Compatible schema update replaced physical storage",
+    )
+    check(
+        len(all_results(client, search(client, preserved, "coffee"))) == 1,
+        "Additive update lost content",
+    )
+    category_query = {
+        "indexId": preserved["indexId"],
+        "queryBson": encoded(
+            {
+                "equals": {"path": "category", "value": "books"},
+            }
+        ),
+    }
+    check(
+        not all_results(client, client.call("Search", category_query)),
+        "New field was implicitly backfilled",
+    )
+    client.call(
+        "Upsert", {"indexId": preserved["indexId"], "documentsBson": [encoded(preserved_document)]}
+    )
+    check(
+        len(all_results(client, client.call("Search", category_query))) == 1,
+        "New field was not indexed on re-upsert",
+    )
+    client.call(
+        "UpdateIndex",
+        {
+            "indexId": preserved["indexId"],
+            "expectedRevision": "2",
+            "definitionBson": encoded(original_mapping),
+            "updateMode": "INDEX_UPDATE_MODE_REQUIRE_PRESERVE",
+        },
+        error="FAILED_PRECONDITION",
+    )
+    client.call("DropIndex", {"indexId": preserved["indexId"], "expectedRevision": "2"})
+    checks.append(
+        "no-op revisions; in-place schema publication with stable physical identity; explicit backfill; incompatible preservation rejection"
     )
     vector = client.call(
         "CreateIndex",

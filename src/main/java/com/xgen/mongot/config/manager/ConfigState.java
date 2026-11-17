@@ -281,6 +281,11 @@ public class ConfigState {
   }
 
   /** This method should be called after {@link ConfigState#postInitializationFromConfigJournal}. */
+  public synchronized void reserveUserIndexVersion(ObjectId indexId, int version) {
+    this.maxUserIndexVersionNumberPerIndex.merge(indexId, version, Math::max);
+  }
+
+  /** This method should be called after {@link ConfigState#postInitializationFromConfigJournal}. */
   @VisibleForTesting
   public UserIndexVersion getNewUserIndexVersion(ObjectId indexId) {
     // For conservative purposes, also check the version number from indexCatalog, staged and

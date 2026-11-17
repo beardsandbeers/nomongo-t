@@ -331,6 +331,15 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       // Consult the index catalog so that such a cursor cannot serve another batch.
       try {
         this.runtime.catalog().getIndex(lease.index);
+        if (this.runtime
+            .liveIndexes()
+            .getIndexById(new ObjectId(lease.index))
+            .filter(index -> index.getGenerationId().uniqueString().equals(lease.generation))
+            .isEmpty()) {
+          throw Status.NOT_FOUND
+              .withDescription("Cursor generation is no longer live")
+              .asRuntimeException();
+        }
         lease.joinPlan.ifPresent(StandaloneJoinPlanner.Plan::verifyDependencies);
       } catch (io.grpc.StatusRuntimeException e) {
         release(id, lease);
@@ -345,6 +354,18 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         (id, lease) -> {
           if (lease.index.equals(indexId)
               || lease.joinPlan.map(plan -> plan.dependsOn(indexId)).orElse(false)) {
+            synchronized (lease) {
+              release(id, lease);
+            }
+          }
+        });
+  }
+
+  void generationRetired(String generation) {
+    this.leases.forEach(
+        (id, lease) -> {
+          if (lease.generation.equals(generation)
+              || lease.joinPlan.map(plan -> plan.dependsOnGeneration(generation)).orElse(false)) {
             synchronized (lease) {
               release(id, lease);
             }

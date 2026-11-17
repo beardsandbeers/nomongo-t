@@ -57,6 +57,78 @@ import org.junit.runner.RunWith;
 @RunWith(Theories.class)
 public class IndexRecoveryStagerTest {
 
+  @Test
+  public void stageRecovery_preservedFailedSource_doesNotCreateEmptyAttempt() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    source
+        .getIndex()
+        .setStatus(IndexStatus.failed("missing files", IndexStatus.Reason.INITIALIZATION_FAILED));
+    when(mocks.indexFactory.requiresExistingData(source.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    stageIndexes(mocks, Set.of());
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertNoIndexActivity();
+    verify(mocks.indexFactory, never()).getIndex(any());
+  }
+
+  @Test
+  public void stageRecovery_preservedFailedTarget_doesNotReplaceItsSeed() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    var target = mocks.stageIndexAttempt(source.getDefinition().getIndexId());
+    source.getIndex().setStatus(IndexStatus.steady());
+    target
+        .getIndex()
+        .setStatus(IndexStatus.failed("missing seed", IndexStatus.Reason.INITIALIZATION_FAILED));
+    when(mocks.indexFactory.requiresExistingData(target.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    stageIndexes(mocks, Set.of());
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertStagedIndexesAre(target);
+    mocks.assertNoIndexActivity();
+  }
+
+  @Test
+  public void stageRecovery_authorizedFailedBootstrap_doesNotCreateEmptyAttempt() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    source
+        .getIndex()
+        .setStatus(IndexStatus.failed("missing files", IndexStatus.Reason.INITIALIZATION_FAILED));
+    when(mocks.indexFactory.prohibitsEmptyRecovery(source.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    stageIndexes(mocks, Set.of());
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertNoIndexActivity();
+    verify(mocks.indexFactory, never()).getIndex(any());
+  }
+
+  @Test
+  public void stageRecovery_authorizedFailedRebuild_doesNotReplaceItsSeed() throws Exception {
+    var mocks = getEmptyMocks();
+    var source = mocks.addIndex(new ObjectId(), ConfigStateMocks.State.LIVE);
+    var target = mocks.stageIndexAttempt(source.getDefinition().getIndexId());
+    source.getIndex().setStatus(IndexStatus.steady());
+    target
+        .getIndex()
+        .setStatus(IndexStatus.failed("missing seed", IndexStatus.Reason.INITIALIZATION_FAILED));
+    when(mocks.indexFactory.prohibitsEmptyRecovery(target.getGenerationId())).thenReturn(true);
+    mocks.clearInvocations();
+
+    stageIndexes(mocks, Set.of());
+
+    mocks.assertLiveIndexesAre(source);
+    mocks.assertStagedIndexesAre(target);
+    mocks.assertNoIndexActivity();
+  }
+
   /** All IndexStatuses except RECOVERING. */
   @DataPoints("nonRecoveringIndexStatuses")
   public static Set<IndexStatus> nonRecoveringIndex() {
@@ -258,7 +330,8 @@ public class IndexRecoveryStagerTest {
 
     var unresolvedIndex = mocks.indexCatalog.getIndexById(VectorIndex.MOCK_INDEX_ID).orElseThrow();
     assertFalse(
-        "Index with MONGO_CLIENT_NOT_AVAILABLE should NOT be recoverable before updateSyncSource",
+        "Index with MONGO_CLIENT_NOT_AVAILABLE should NOT be recoverable before"
+            + " updateSyncSource",
         unresolvedIndex.getIndex().getStatus().canBeRecovered());
     assertThat(unresolvedIndex.getIndex().getStatus().getReason())
         .isEqualTo(Optional.of(AUTO_EMBEDDING_RESOLUTION_FAILED));
@@ -280,7 +353,8 @@ public class IndexRecoveryStagerTest {
     when(mocks.configState.materializedViewIndexFactory.get().isMongodReachableFromCachedTopology())
         .thenReturn(false);
 
-    // updateSyncSource resets unresolved indexes to AUTO_EMBEDDING_RESOLUTION_RETRY (recoverable)
+    // updateSyncSource resets unresolved indexes to AUTO_EMBEDDING_RESOLUTION_RETRY
+    // (recoverable)
     mocks.configState.updateSyncSource(ConfigStateMocks.MOCK_SYNC_SOURCE_CONFIG);
 
     assertEquals(
@@ -306,7 +380,7 @@ public class IndexRecoveryStagerTest {
 
     var stagedIndex = mocks.staged.getIndex(VectorIndex.MOCK_INDEX_ID);
     assertTrue(
-        "Unresolved auto-embedding index should be staged for recovery after updateSyncSource",
+        "Unresolved auto-embedding index should be staged for recovery after" + " updateSyncSource",
         stagedIndex.isPresent());
     assertEquals(
         definitionGeneration.generation().nextAttempt(),
@@ -318,7 +392,8 @@ public class IndexRecoveryStagerTest {
       throws Exception {
     var mocks = getEmptyMocks();
 
-    // Simulate transient error with UNKNOWN reason (default) - should be recoverable immediately
+    // Simulate transient error with UNKNOWN reason (default) - should be recoverable
+    // immediately
     doThrow(new MaterializedViewTransientException("Transient MongoDB error"))
         .when(mocks.configState.materializedViewIndexFactory.get())
         .getIndex(any(IndexDefinitionGeneration.class));
@@ -361,7 +436,8 @@ public class IndexRecoveryStagerTest {
     when(mocks.configState.materializedViewIndexFactory.get().isMongodReachableFromCachedTopology())
         .thenReturn(true);
 
-    // IndexRecoveryStager should stage a recovery attempt immediately (no updateSyncSource needed)
+    // IndexRecoveryStager should stage a recovery attempt immediately (no updateSyncSource
+    // needed)
     stageIndexes(mocks, Set.of());
 
     var stagedIndex = mocks.staged.getIndex(VectorIndex.MOCK_INDEX_ID);
@@ -408,7 +484,8 @@ public class IndexRecoveryStagerTest {
     inOrder.verify(cleanupIndex).close();
     inOrder.verify(cleanupIndex).drop();
     assertThat(mocks.phasingOut.getIndexes()).isEmpty();
-    // An unresolved auto-embedding generation never entered the lifecycle, so its teardown skips
+    // An unresolved auto-embedding generation never entered the lifecycle, so its teardown
+    // skips
     // the lifecycle drop rather than invoking it.
     verify(mocks.lifecycleManager, never()).dropIndex(failedIndex.getGenerationId());
   }
@@ -418,9 +495,12 @@ public class IndexRecoveryStagerTest {
       throws Exception {
     var mocks = getEmptyMocks();
 
-    // A live, unresolved auto-embedding index whose on-disk derived Lucene was queryable at commit
-    // time: it serves offline from the reconstructed derived index and reports a real STALE status,
-    // so it parks in the live indexCatalog and recovery re-stages it by type (not by a recoverable
+    // A live, unresolved auto-embedding index whose on-disk derived Lucene was queryable at
+    // commit
+    // time: it serves offline from the reconstructed derived index and reports a real STALE
+    // status,
+    // so it parks in the live indexCatalog and recovery re-stages it by type (not by a
+    // recoverable
     // FAILED reason).
     var definitionGeneration =
         mockDefinitionGeneration(
@@ -465,8 +545,8 @@ public class IndexRecoveryStagerTest {
 
     var stagedIndex = mocks.staged.getIndex(VectorIndex.MOCK_INDEX_ID);
     assertTrue(
-        "Queryable unresolved auto-embedding index in the live catalog should be staged for "
-            + "recovery",
+        "Queryable unresolved auto-embedding index in the live catalog should be staged for"
+            + " recovery",
         stagedIndex.isPresent());
     assertEquals(
         definitionGeneration.generation().nextAttempt(),
@@ -589,7 +669,8 @@ public class IndexRecoveryStagerTest {
         .isEqualTo(Optional.of(COLLECTION_NOT_FOUND));
     mocks.clearInvocations();
 
-    // The COLLECTION_NOT_FOUND generation must carry the *source* collection UUID so the recovery
+    // The COLLECTION_NOT_FOUND generation must carry the *source* collection UUID so the
+    // recovery
     // stager can match it against directMongodCollectionSet when the collection reappears.
     UUID sourceCollectionUuid = unresolvedIndex.getDefinition().getCollectionUuid();
 
@@ -599,7 +680,8 @@ public class IndexRecoveryStagerTest {
     mocks.assertNoIndexActivity();
 
     // Scenario 2: source collection reappears on this shard (its UUID is now in
-    // directMongodCollectionSet). Restore the factory so the re-staged attempt resolves to a real
+    // directMongodCollectionSet). Restore the factory so the re-staged attempt resolves to a
+    // real
     // composite (isSourceCollectionAbsentOnMongod defaults to false after reset).
     reset(mocks.configState.materializedViewIndexFactory.get());
     when(mocks
@@ -616,8 +698,9 @@ public class IndexRecoveryStagerTest {
 
     var stagedIndex = mocks.staged.getIndex(VectorIndex.MOCK_INDEX_ID);
     assertTrue(
-        "Auto-embedding COLLECTION_NOT_FOUND index should be staged for recovery when its source "
-            + "collection reappears (same reappearance path regular search indexes use)",
+        "Auto-embedding COLLECTION_NOT_FOUND index should be staged for recovery when its"
+            + " source collection reappears (same reappearance path regular search indexes"
+            + " use)",
         stagedIndex.isPresent());
     assertEquals(
         definitionGeneration.generation().nextAttempt(),

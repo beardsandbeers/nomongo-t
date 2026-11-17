@@ -391,6 +391,62 @@ public class DefaultConfigManager implements ConfigManager {
     configState.postInitializationFromConfigJournal();
   }
 
+  /** Snapshot of live, staged, and retained retirement entries for an external recovery owner. */
+  public synchronized ConfigJournalV1 getJournalSnapshot() {
+    return this.configState.currentJournal();
+  }
+
+  /**
+   * Changes the schema of an API-owned live index without staging or retiring its physical data.
+   */
+  public synchronized void publishLocalSchema(
+      com.xgen.mongot.index.definition.IndexDefinitionGeneration expected,
+      com.xgen.mongot.index.definition.IndexDefinitionGeneration replacement,
+      Runnable publishRuntime)
+      throws IOException, Invariants.InvariantException {
+    ensureOpen("publishLocalSchema");
+    var current = this.configState.indexCatalog.getIndexById(expected.getIndexId()).orElseThrow();
+    checkState(
+        current.getDefinitionGeneration().equals(expected)
+            && expected.getGenerationId().equals(replacement.getGenerationId())
+            && this.configState.staged.getIndex(expected.getIndexId()).isEmpty()
+            && this.configState.indexFactory.prohibitsEmptyRecovery(expected.getGenerationId()),
+        "Only the schema of the current API-owned physical index may change");
+    var index = new com.xgen.mongot.index.IndexGeneration(current.getIndex(), replacement);
+    var journal = this.configState.currentJournal();
+    var live =
+        journal.getLiveEntries().stream()
+            .map(
+                entry ->
+                    entry.getGenerationId().equals(expected.getGenerationId())
+                        ? com.xgen.mongot.config.backup.JournalEntry
+                            .<com.xgen.mongot.index.definition.IndexDefinitionGeneration>parsed(
+                                replacement)
+                        : entry)
+            .toList();
+    this.configState.persist(
+        new ConfigJournalV1(journal.getStagedEntries(), live, journal.getDeletedEntries()));
+    publishRuntime.run();
+    this.configState.indexCatalog.addIndex(index);
+  }
+
+  /** Retires a failed prepared target before its owner retries from the preserved source. */
+  public synchronized void retireFailedPreparedIndex(com.xgen.mongot.index.version.GenerationId id)
+      throws IOException, Invariants.InvariantException {
+    var staged = this.configState.staged.getIndex(id.indexId).orElseThrow();
+    checkState(
+        staged.getGenerationId().equals(id)
+            && staged.getIndex().getStatus().getStatusCode()
+                == com.xgen.mongot.index.status.IndexStatus.StatusCode.FAILED,
+        "Only a failed staged generation may be retried");
+    this.configState.persist(
+        com.xgen.mongot.config.backup.JournalEditor.on(this.configState.currentJournal())
+            .fromStagedToDropped(List.of(id))
+            .journal());
+    this.configState.phasingOut.addIndex(staged);
+    this.configState.staged.removeIndex(staged);
+  }
+
   @Override
   public synchronized void update(
       List<VectorIndexDefinition> vectorDefinitions,

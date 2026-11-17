@@ -38,6 +38,8 @@ public class LocalIndexCatalogTest {
       assertThat(catalog.createIndex(request).getIndexId()).isEqualTo(id);
       catalog.updateIndex(
           UpdateIndexRequest.newBuilder()
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
               .setIndexId(id)
               .setExpectedRevision(1)
               .setDefinitionBson(definition)

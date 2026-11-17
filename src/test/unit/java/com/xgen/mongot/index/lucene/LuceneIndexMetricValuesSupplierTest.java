@@ -1,5 +1,6 @@
 package com.xgen.mongot.index.lucene;
 
+import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -70,6 +71,171 @@ import org.junit.Test;
 import org.mockito.Mockito;
 
 public class LuceneIndexMetricValuesSupplierTest {
+
+  @Test
+  public void prepareSchemaUpdate_publishedSchema_invalidatesCachedCountsAndRefreshInterval()
+      throws Exception {
+    var reader = mock(LuceneSearchIndexReader.class);
+    var before = plainFieldCountSchema();
+    var after = fieldCountSchemaWithEdgeField();
+    when(reader.getFieldInfos())
+        .thenReturn(
+            List.of(new FieldInfos(new FieldInfo[] {createFieldInfo("$type:string/title", 0)})));
+    var supplier =
+        (LuceneSearchIndexMetricValuesSupplier)
+            LuceneIndexMetricsSupplierBuilder.builder()
+                .indexReader(reader)
+                .indexWriter(mock(SingleLuceneIndexWriter.class))
+                .resolver(before.createFieldDefinitionResolver(IndexFormatVersion.CURRENT))
+                .numFieldsCacheDuration(Duration.ofDays(1))
+                .dynamicFeatureFlagRegistry(createEnabledFeatureFlagRegistry())
+                .build();
+    assertThat(supplier.getNumFieldsPerDatatype()).containsExactly(FieldName.TypeField.STRING, 1.0);
+
+    var publish =
+        supplier.prepareSchemaUpdate(
+            after.createFieldDefinitionResolver(IndexFormatVersion.CURRENT), after.getAnalyzers());
+    when(reader.getFieldInfos())
+        .thenReturn(
+            List.of(
+                new FieldInfos(
+                    new FieldInfo[] {
+                      createFieldInfo("$type:string/title", 0),
+                      createFieldInfo("$type:string/label", 1)
+                    })));
+    assertThat(supplier.getNumFieldsPerDatatype()).containsExactly(FieldName.TypeField.STRING, 1.0);
+    publish.run();
+
+    assertThat(supplier.getNumFieldsPerDatatype())
+        .containsExactly(FieldName.TypeField.STRING, 1.0, FieldName.TypeField.AUTOCOMPLETE, 1.0);
+    verify(reader, times(2)).getFieldInfos();
+  }
+
+  @Test
+  public void prepareSchemaUpdate_oldRefreshFinishesLast_keepsNewSchemaCounts() throws Exception {
+    var reader = mock(LuceneSearchIndexReader.class);
+    var before = plainFieldCountSchema();
+    var after = fieldCountSchemaWithEdgeField();
+    when(reader.getFieldInfos())
+        .thenReturn(
+            List.of(
+                new FieldInfos(
+                    new FieldInfo[] {
+                      createFieldInfo("$type:string/title", 0),
+                      createFieldInfo("$type:string/label", 1)
+                    })));
+    var tasks = new ArrayList<Runnable>();
+    var supplier =
+        (LuceneSearchIndexMetricValuesSupplier)
+            LuceneIndexMetricsSupplierBuilder.builder()
+                .indexReader(reader)
+                .indexWriter(mock(SingleLuceneIndexWriter.class))
+                .resolver(before.createFieldDefinitionResolver(IndexFormatVersion.CURRENT))
+                .asyncRefreshExecutor(tasks::add)
+                .dynamicFeatureFlagRegistry(createEnabledFeatureFlagRegistry())
+                .build();
+    assertThat(supplier.getNumFieldsPerDatatype()).isEmpty();
+    assertThat(tasks).hasSize(1);
+
+    supplier
+        .prepareSchemaUpdate(
+            after.createFieldDefinitionResolver(IndexFormatVersion.CURRENT), after.getAnalyzers())
+        .run();
+    assertThat(supplier.getNumFieldsPerDatatype()).isEmpty();
+    assertThat(tasks).hasSize(2);
+    tasks.get(1).run();
+    tasks.get(0).run();
+
+    assertThat(supplier.getNumFieldsPerDatatype())
+        .containsExactly(FieldName.TypeField.STRING, 1.0, FieldName.TypeField.AUTOCOMPLETE, 1.0);
+  }
+
+  @Test
+  public void prepareSchemaUpdate_metricDisabledDuringPublication_usesNewSchemaWhenEnabled()
+      throws Exception {
+    var reader = mock(LuceneSearchIndexReader.class);
+    var flags = DynamicFeatureFlagRegistry.communityDefault();
+    var before = plainFieldCountSchema();
+    var after = fieldCountSchemaWithEdgeField();
+    when(reader.getFieldInfos())
+        .thenReturn(
+            List.of(
+                new FieldInfos(
+                    new FieldInfo[] {
+                      createFieldInfo("$type:string/title", 0),
+                      createFieldInfo("$type:string/label", 1)
+                    })));
+    var supplier =
+        (LuceneSearchIndexMetricValuesSupplier)
+            LuceneIndexMetricsSupplierBuilder.builder()
+                .indexReader(reader)
+                .indexWriter(mock(SingleLuceneIndexWriter.class))
+                .resolver(before.createFieldDefinitionResolver(IndexFormatVersion.CURRENT))
+                .dynamicFeatureFlagRegistry(flags)
+                .build();
+    assertThat(supplier.getNumFieldsPerDatatype()).isEmpty();
+
+    supplier
+        .prepareSchemaUpdate(
+            after.createFieldDefinitionResolver(IndexFormatVersion.CURRENT), after.getAnalyzers())
+        .run();
+    assertThat(supplier.getNumFieldsPerDatatype()).isEmpty();
+    verify(reader, never()).getFieldInfos();
+    flags.updateDynamicFeatureFlags(
+        List.of(
+            new DynamicFeatureFlagConfig(
+                DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC.getName(),
+                DynamicFeatureFlagConfig.Phase.ENABLED,
+                List.of(),
+                List.of(),
+                100,
+                DynamicFeatureFlagConfig.Scope.MONGOT_CLUSTER)));
+
+    assertThat(supplier.getNumFieldsPerDatatype())
+        .containsExactly(FieldName.TypeField.STRING, 1.0, FieldName.TypeField.AUTOCOMPLETE, 1.0);
+  }
+
+  private static SearchIndexDefinition plainFieldCountSchema() {
+    return SearchIndexDefinitionBuilder.from(SearchIndexDefinitionBuilder.VALID_INDEX)
+        .mappings(
+            DocumentFieldDefinitionBuilder.builder()
+                .dynamic(false)
+                .field(
+                    "title",
+                    FieldDefinitionBuilder.builder()
+                        .string(StringFieldDefinitionBuilder.builder().build())
+                        .build())
+                .build())
+        .build();
+  }
+
+  private static SearchIndexDefinition fieldCountSchemaWithEdgeField() {
+    return SearchIndexDefinitionBuilder.from(plainFieldCountSchema())
+        .mappings(
+            DocumentFieldDefinitionBuilder.builder()
+                .dynamic(false)
+                .field(
+                    "title",
+                    FieldDefinitionBuilder.builder()
+                        .string(StringFieldDefinitionBuilder.builder().build())
+                        .build())
+                .field(
+                    "label",
+                    FieldDefinitionBuilder.builder()
+                        .string(StringFieldDefinitionBuilder.builder().analyzerName("edge").build())
+                        .build())
+                .build())
+        .analyzers(
+            List.of(
+                CustomAnalyzerDefinitionBuilder.builder(
+                        "edge",
+                        TokenizerDefinitionBuilder.EdgeGramTokenizer.builder()
+                            .minGram(2)
+                            .maxGram(15)
+                            .build())
+                    .build()))
+        .build();
+  }
 
   /** Creates a feature flag registry with numFieldsPerDatatype metric enabled. */
   private static DynamicFeatureFlagRegistry createEnabledFeatureFlagRegistry() {

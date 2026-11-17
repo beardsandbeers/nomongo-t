@@ -43,6 +43,7 @@ import com.xgen.mongot.standalone.grpc.GetIndexMappingsResponse;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
 import com.xgen.mongot.standalone.grpc.ServiceMetric;
 import com.xgen.mongot.standalone.grpc.ServiceStatus;
+import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.ingestion.ApiIngestionManager;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
 import io.grpc.Status;
@@ -79,6 +80,7 @@ public final class StandaloneRuntime implements Closeable {
   private final MongotCursorManagerImpl cursors;
   private final ApiIngestionManager ingestion;
   private final StandaloneIndexStatistics statistics;
+  private final StandaloneIndexUpdates updates;
   private final DefaultConfigManager configManager;
   private final MeterAndFtdcRegistry metrics;
   private final StandaloneMetrics serviceMetrics;
@@ -107,6 +109,7 @@ public final class StandaloneRuntime implements Closeable {
     this.catalog = new LocalIndexCatalog(config.dataPath());
     this.resources.addFirst(this.catalog);
     try {
+      StandaloneIndexUpdates.recover(config.dataPath(), this.catalog);
       var previous =
           ConfigJournalV1.fromFileIfExists(
               config.dataPath().resolve("configJournal.json"), QuarantinePolicy.QUARANTINE);
@@ -145,6 +148,7 @@ public final class StandaloneRuntime implements Closeable {
               Optional.empty(),
               AnalyzerRegistry.factory(),
               diskMonitor);
+      StandaloneIndexUpdates.configureFactory(factory, this.catalog, config.dataPath());
       this.resources.addFirst(factory);
       this.cursors =
           MongotCursorManagerImpl.fromConfig(
@@ -192,6 +196,16 @@ public final class StandaloneRuntime implements Closeable {
           this.catalog.definitions().stream()
               .map(index -> index.getIndexId())
               .collect(Collectors.toSet());
+      var retirements =
+          java.util.concurrent.Executors.newSingleThreadExecutor(
+              Thread.ofPlatform().name("standalone-retirement").factory());
+      this.resources.addFirst(
+          () -> {
+            retirements.shutdown();
+            if (!retirements.awaitTermination(30, TimeUnit.SECONDS)) {
+              throw new IOException("Standalone retirements did not drain");
+            }
+          });
       this.configManager =
           DefaultConfigManager.initialize(
               this.liveIndexes,
@@ -208,11 +222,23 @@ public final class StandaloneRuntime implements Closeable {
               flags,
               config.dataPath().resolve("dynamicFeatureFlags.json"),
               dynamicFlags);
+      synchronized (this.configManager) {
+        this.configManager.configState.enableDeferredRetirement(retirements);
+      }
       // The config manager now owns these three resources, including their drain/close ordering.
       this.resources.remove(factory);
       this.resources.remove(cursorOwner);
       this.resources.remove(lifecycleOwner);
       this.resources.addFirst(this.configManager::close);
+      this.updates =
+          new StandaloneIndexUpdates(
+              config,
+              this.catalog,
+              this.liveIndexes,
+              this.ingestion,
+              this.configManager,
+              this.serviceMetrics);
+      this.resources.addFirst(this.updates);
       this.statistics =
           new StandaloneIndexStatistics(
               this.catalog,
@@ -266,6 +292,10 @@ public final class StandaloneRuntime implements Closeable {
     this.metrics = metrics;
     this.externalReconcile = Optional.of(reconcile);
     this.serviceMetrics = new StandaloneMetrics(metrics.meterRegistry());
+    this.updates =
+        new StandaloneIndexUpdates(
+            config, catalog, indexes, ingestion, manager, this.serviceMetrics);
+    this.resources.addFirst(this.updates);
     this.statistics =
         new StandaloneIndexStatistics(
             catalog, indexes, ingestion, config.maxRpcDuration(), this.serviceMetrics);
@@ -298,6 +328,22 @@ public final class StandaloneRuntime implements Closeable {
 
   public LocalIndexCatalog catalog() {
     return this.catalog;
+  }
+
+  public IndexDescription updateIndex(UpdateIndexRequest request) {
+    var result = this.updates.update(request);
+    return result.getDesiredRevision() == request.getExpectedRevision()
+        ? describeIndex(request.getIndexId())
+        : result;
+  }
+
+  StandaloneIndexUpdates updatesForTesting() {
+    return this.updates;
+  }
+
+  /** Publication notifications identify only the retired source generation. */
+  public void onIndexPublication(java.util.function.Consumer<String> listener) {
+    this.updates.onPublication(listener);
   }
 
   public ApiIngestionManager ingestion() {
@@ -430,23 +476,35 @@ public final class StandaloneRuntime implements Closeable {
   }
 
   private void reconcile() throws Exception {
+    this.updates.reconcile();
     if (this.externalReconcile.isPresent()) {
       this.externalReconcile.get().run();
       return;
     }
-    var desired = this.catalog.definitions();
-    this.configManager.update(
-        desired.stream()
-            .filter(VectorIndexDefinition.class::isInstance)
-            .map(VectorIndexDefinition.class::cast)
-            .toList(),
-        desired.stream()
-            .filter(SearchIndexDefinition.class::isInstance)
-            .map(SearchIndexDefinition.class::cast)
-            .toList(),
-        List.of(),
-        Set.of(),
-        Set.of());
+    synchronized (this.configManager) {
+      var desired =
+          this.catalog.reconciliationDefinitions(
+              this.liveIndexes.getIndexes().stream()
+                  .collect(
+                      java.util.stream.Collectors.toMap(
+                          index -> index.getGenerationId().indexId.toHexString(),
+                          com.xgen.mongot.index.IndexGeneration::getDefinition,
+                          (first, second) -> {
+                            throw new IllegalStateException("Duplicate physical index identity");
+                          })));
+      this.configManager.update(
+          desired.stream()
+              .filter(VectorIndexDefinition.class::isInstance)
+              .map(VectorIndexDefinition.class::cast)
+              .toList(),
+          desired.stream()
+              .filter(SearchIndexDefinition.class::isInstance)
+              .map(SearchIndexDefinition.class::cast)
+              .toList(),
+          List.of(),
+          Set.of(),
+          Set.of());
+    }
   }
 
   public boolean managementReady() {
@@ -513,11 +571,11 @@ public final class StandaloneRuntime implements Closeable {
    * Desired-catalog status includes uninitialized/failed resources and exact live/build identities.
    */
   public IndexDescription describeIndex(String id) {
-    var desired = this.catalog.getIndex(id);
-    if (desired.getLifecycleState().equals("DROPPED")) {
-      return desired;
-    }
     synchronized (this.configManager) {
+      var desired = this.catalog.getIndex(id);
+      if (desired.getLifecycleState().equals("DROPPED")) {
+        return desired;
+      }
       var result = desired.toBuilder();
       var live = this.liveIndexes.getIndexById(new ObjectId(id));
       var staged = this.configManager.configState.staged.getIndex(new ObjectId(id));
@@ -530,6 +588,7 @@ public final class StandaloneRuntime implements Closeable {
           result.setActiveRevision(active);
           state = active == desired.getDesiredRevision() ? "READY" : "BUILDING";
         } else {
+          result.setFailureMessage(generation.getIndex().getStatus().getMessage().orElse(""));
           state =
               generation.getIndex().getStatus().getStatusCode() == IndexStatus.StatusCode.FAILED
                   ? "FAILED"
@@ -537,7 +596,18 @@ public final class StandaloneRuntime implements Closeable {
         }
       }
       if (staged.isPresent()) {
-        state = "BUILDING";
+        var status = staged.orElseThrow().getIndex().getStatus();
+        if (status.getStatusCode() == IndexStatus.StatusCode.FAILED) {
+          state = "FAILED";
+          result.setFailureMessage(status.getMessage().orElse("Index initialization failed"));
+        } else {
+          state = "BUILDING";
+        }
+      }
+      var migration = this.catalog.migration(id);
+      if (migration.isPresent() && !migration.get().failure().isEmpty()) {
+        state = "FAILED";
+        result.setFailureMessage(migration.get().failure());
       }
       return result.setLifecycleState(state).build();
     }

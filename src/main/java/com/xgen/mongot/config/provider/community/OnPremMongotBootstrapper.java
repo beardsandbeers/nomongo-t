@@ -1033,6 +1033,8 @@ public class OnPremMongotBootstrapper {
                         diskMonitor,
                         mongotConfigs.initialSyncConfig.enableNaturalOrderScan()));
 
+    coexistence.ifPresent(extension -> extension.configurePreservingUpdates(indexFactory));
+
     var mvMetadataCatalog = new MaterializedViewCollectionMetadataCatalog();
     var autoEmbeddingMongoClient =
         new AutoEmbeddingMongoClient(

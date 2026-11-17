@@ -84,6 +84,8 @@ public final class CoexistenceRuntime {
     }
     this.catalog = new LocalIndexCatalog(config.dataPath());
     try {
+      com.xgen.mongot.standalone.runtime.StandaloneIndexUpdates.recover(
+          config.dataPath(), this.catalog);
       if (!Files.exists(marker)) {
         FileUtils.atomicallyReplace(marker, "{\"version\":1}");
       }
@@ -138,6 +140,11 @@ public final class CoexistenceRuntime {
                 .getIndexingWorkSchedulers()
                 .get(IndexingWorkSchedulerFactory.IndexingStrategy.DEFAULT));
     return this.schedulers;
+  }
+
+  public void configurePreservingUpdates(com.xgen.mongot.index.lucene.LuceneIndexFactory factory) {
+    com.xgen.mongot.standalone.runtime.StandaloneIndexUpdates.configureFactory(
+        factory, this.catalog, this.config.dataPath());
   }
 
   public LifecycleManager routeLifecycle(

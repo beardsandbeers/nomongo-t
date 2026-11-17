@@ -219,15 +219,65 @@ closing indexes. Uncommitted writes can be lost on a crash; replay them from you
 Documents within a batch are ordered; concurrent batches can interleave. Batches are not atomic. A failure, deadline, or disconnect can leave a prefix applied.
 Repeating a replacement/delete is idempotent in isolation, but there is no durable request ledger:
 callers must order retries so an old retry cannot overwrite a newer update. Optional
-`generation_id` fences writes against schema changes. Requests during a mapping transition fail
-until the requested schema is ready.
+`generation_id` fences writes against physical index replacement. Compatible schema changes keep
+that identity and accept writes; explicit rebuilds and other generation replacements invalidate it.
 
 ### Mapping changes and index lifecycle
 
-UpdateIndex requires the current `expected_revision`. It replaces the index with a new empty
-Lucene generation. Wait for the new revision to be READY and reingest all desired content.
-The previous generation is retired; no source snapshot or automatic backfill exists. Even
-resubmitting the same mapping through UpdateIndex is an explicit empty rebuild.
+UpdateIndex requires the current `expected_revision`. Its default `AUTO` mode preserves content
+for supported additions to static search mappings, new string multi fields, new custom analyzers,
+and query-only `searchAnalyzer` changes. Existing field encodings and global indexing settings
+must remain unchanged. Adding an explicit field under a dynamic mapping is currently a rebuild,
+because it replaces the implicit mapping. Vector mapping changes and additions of embedded,
+autocomplete, geo, or legacy facet representations also use the rebuild path in this release.
+
+A compatible change keeps the same physical Lucene index, writer, files, and `generation_id`.
+It increments the schema revision and publishes new ingestion and query configuration in place.
+Existing cursors and foreign-join readers remain usable with their captured query configuration.
+Preparation runs while writes continue. Publication briefly serializes against executing mutation
+batches and their write-concern barriers; queued writes then use the new schema. It does not copy
+index files or require temporary capacity for a second index.
+
+A successful in-place response reports the new revision as `READY`. The update itself does not
+refresh or commit pending document writes: their normal `INDEXED`, `VISIBLE`, and `COMMITTED`
+guarantees still apply. If metadata publication is interrupted after durable acceptance, the
+server resumes the accepted schema on the same physical index. Retry the identical definition
+using the current desired revision, or restart; do not assume a lost response means rejection.
+The durable catalog binding never authorizes recreating missing data as an empty index.
+
+New fields are **not backfilled** into old documents, even when stored source contains them.
+Upsert complete documents again to populate the new fields. Existing documents remain searchable
+through their previously indexed fields.
+
+Equivalent definitions are no-ops: revision, generation, content, and cursors stay unchanged.
+Use the revision returned by the API instead of assuming it increments. An identical-definition
+update no longer resets an index. Use `INDEX_UPDATE_MODE_REBUILD_EMPTY` for an explicit reset.
+
+Set `update_mode` to `INDEX_UPDATE_MODE_REQUIRE_PRESERVE` to reject unsupported changes with
+`FAILED_PRECONDITION` and leave the catalog untouched. `AUTO` retains the existing empty-rebuild
+behavior for incompatible changes; reingest the desired content after that rebuild. A failure
+while applying a compatible update never falls back to an empty rebuild. Concurrent requests
+recheck `expected_revision` at publication, so only one update can claim a given revision.
+
+A failed empty create or rebuild reports `FAILED` with the initialization error, even while an
+older live generation remains searchable. An identical `AUTO` or `REQUIRE_PRESERVE` update of an
+unfinished failed initialization returns `FAILED_PRECONDITION` with recovery instructions. After
+repairing the underlying problem, restart to resume the same authorized generation, or explicitly
+use `REBUILD_EMPTY` with the current desired revision to start a fresh empty generation. Drop is
+also available. These paths do not restore empty-creation permission to a previously ready index.
+
+Catalog version 4 records in-place schema bindings and explicit authorization to initialize a
+new empty generation. Versions 1–3 are readable, including recovery of already accepted legacy
+copy migrations; new compatible updates never start such migrations. Every partition must have a
+durable commit before the index is ready. After readiness, missing commits fail the affected index instead of recreating it empty.
+Legacy indexes without initialization records reopen only when all commits are valid; incomplete
+legacy data requires restoration or an explicit rebuild. Older binaries cannot open a version-4
+catalog. A catalog mutation can upgrade older metadata, so retain a stopped backup before upgrade.
+Unreadable live or staged local journal entries stop startup before native quarantine cleanup can
+delete local files, including when native quarantine is enabled. Restore compatible journal
+metadata from the matching backup before restarting. See the
+[design and recovery protocol](standalone-index-update-design.md) for compatibility rules and
+failure handling.
 
 DropIndex removes the definition and its Lucene data through the ordinary mongot lifecycle.
 A later index with the same name receives a new ID and starts empty. Physical cleanup runs

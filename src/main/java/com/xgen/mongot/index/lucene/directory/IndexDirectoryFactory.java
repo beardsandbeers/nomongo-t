@@ -21,6 +21,24 @@ public class IndexDirectoryFactory extends IndexPathFactory {
   private final Optional<ByteReadCollector> byteReadCollector;
   private final boolean prewarm;
   private final Optional<CacheWarmerTimer> cacheWarmerTimer;
+  private boolean requireExistingData;
+  private boolean protectData;
+
+  public void protectData() {
+    this.protectData = true;
+  }
+
+  public boolean protectsData() {
+    return this.protectData || this.requireExistingData;
+  }
+
+  public void requireExistingData() {
+    this.requireExistingData = true;
+  }
+
+  public boolean requiresExistingData() {
+    return this.requireExistingData;
+  }
 
   public IndexDirectoryFactory(
       Path indexPath,
@@ -79,6 +97,9 @@ public class IndexDirectoryFactory extends IndexPathFactory {
 
   public Directory create(int indexPartitionId) throws IOException {
     var indexPartitionPath = getIndexPartitionDataPath(indexPartitionId);
+    if (this.requireExistingData && !java.nio.file.Files.isDirectory(indexPartitionPath)) {
+      throw new java.nio.file.NoSuchFileException(indexPartitionPath.toString());
+    }
     FileUtils.mkdirIfNotExist(indexPartitionPath);
     FileSystemDirectory fsd = new FileSystemDirectory(indexPartitionPath, this.byteReadCollector);
     if (this.prewarm) {
@@ -92,10 +113,12 @@ public class IndexDirectoryFactory extends IndexPathFactory {
           .addKeyValue("milliseconds", elapsedMilliseconds)
           .log("Cache Warmer: finished warming directory");
     }
-    return this.config.nrtCacheEnabled()
-        ? new NRTCachingDirectory(
-            fsd, this.config.nrtMaxMergeSizeMb(), this.config.nrtTotalCacheSizeMb())
-        : fsd;
+    Directory directory =
+        this.config.nrtCacheEnabled()
+            ? new NRTCachingDirectory(
+                fsd, this.config.nrtMaxMergeSizeMb(), this.config.nrtTotalCacheSizeMb())
+            : fsd;
+    return this.requireExistingData ? new ExistingIndexDirectory(directory) : directory;
   }
 
   public File createMetadata(int indexPartitionId) throws IOException {

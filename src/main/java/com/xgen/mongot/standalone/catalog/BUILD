@@ -3,6 +3,10 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "catalog",
     srcs = [
+        "IndexInitialization.java",
+        "IndexMigration.java",
+        "IndexSchemaUpdate.java",
+        "IndexUpdateCompatibility.java",
         "LocalIndexCatalog.java",
         "StandaloneDefinitionValidator.java",
     ],

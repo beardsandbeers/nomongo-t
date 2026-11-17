@@ -352,6 +352,11 @@ final class StandaloneJoinPlanner {
       return this.dependencies.containsKey(id);
     }
 
+    boolean dependsOnGeneration(String generation) {
+      return this.dependencies.values().stream()
+          .anyMatch(value -> value.uniqueString().equals(generation));
+    }
+
     void activate(Context context) {
       checkCancellation(context);
       snapshot().setCancellationCheck(() -> checkCancellation(context));

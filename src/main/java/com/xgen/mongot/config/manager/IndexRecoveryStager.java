@@ -48,6 +48,11 @@ class IndexRecoveryStager {
   }
 
   private boolean isRecoveringIndex(IndexGeneration indexGeneration) {
+    if (this.configState.indexFactory.requiresExistingData(indexGeneration.getGenerationId())
+        || this.configState.indexFactory.prohibitsEmptyRecovery(
+            indexGeneration.getGenerationId())) {
+      return false;
+    }
     IndexStatus indexStatus = indexGeneration.getIndex().getStatus();
     boolean isOnline =
         !AutoEmbeddingIndexGenerationFactory.isAutoEmbeddingResolutionFailed(indexGeneration);
@@ -188,6 +193,11 @@ class IndexRecoveryStager {
     // we only want to re-stage attempt for failed stage index when it failed during initialization
     // or resolving materialized view collection metadata for auto-embedding index
     return this.configState.staged.getIndexes().stream()
+        .filter(
+            index ->
+                !this.configState.indexFactory.requiresExistingData(index.getGenerationId())
+                    && !this.configState.indexFactory.prohibitsEmptyRecovery(
+                        index.getGenerationId()))
         .filter(
             indexGeneration -> {
               IndexStatus status = indexGeneration.getIndex().getStatus();
