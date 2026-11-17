@@ -66,6 +66,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.dispatcher = new RpcDispatcher(runtime.config(), runtime.metrics());
     this.queries = new StandaloneQueryService(runtime, this.dispatcher);
     this.deleteByQuery = new StandaloneDeleteByQuery(runtime);
+    runtime.onIndexPublication(this::generationRetired);
     this.deadlines =
         new ScheduledThreadPoolExecutor(
             1, Thread.ofPlatform().name("standalone-deadlines").factory());
@@ -154,6 +155,13 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.deadlines.awaitTermination(10, TimeUnit.SECONDS);
   }
 
+  void generationRetired(String generation) {
+    if (!generation.isEmpty()) {
+      this.queries.generationRetired(generation);
+      this.runtime.statistics().invalidateGeneration(generation);
+    }
+  }
+
   private final class Catalog extends CatalogServiceGrpc.CatalogServiceImplBase {
     @Override
     public void createIndex(CreateIndexRequest request, StreamObserver<IndexDescription> observer) {
@@ -180,15 +188,14 @@ public final class StandaloneGrpcServer implements AutoCloseable {
           observer,
           () -> {
             StandaloneAuthInterceptor.requireIndex(request.getIndexId());
-            var result =
-                StandaloneGrpcServer.this
-                    .runtime
-                    .ingestion()
-                    .coordinate(
-                        () -> StandaloneGrpcServer.this.runtime.catalog().updateIndex(request));
-            StandaloneGrpcServer.this.queries.indexDropped(request.getIndexId());
-            StandaloneGrpcServer.this.runtime.statistics().invalidate(request.getIndexId());
-            StandaloneGrpcServer.this.runtime.catalogChanged();
+            var result = StandaloneGrpcServer.this.runtime.updateIndex(request);
+            if (result.getDesiredRevision() != request.getExpectedRevision()
+                && !result.getLifecycleState().equals("READY")) {
+              StandaloneGrpcServer.this.generationRetired(result.getGenerationId());
+            }
+            if (!result.getLifecycleState().equals("READY")) {
+              StandaloneGrpcServer.this.runtime.catalogChanged();
+            }
             return result;
           });
     }

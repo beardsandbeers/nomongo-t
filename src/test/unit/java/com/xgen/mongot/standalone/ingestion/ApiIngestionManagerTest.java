@@ -40,6 +40,225 @@ import org.mockito.ArgumentCaptor;
 
 public class ApiIngestionManagerTest {
   @Test
+  public void publishSchema_newWritesQueueAndReadersRemainAvailable() throws Exception {
+    try (var f = new Fixture();
+        var pin = f.manager.acquireQueryLease(f.generation.getGenerationId());
+        var workers = Executors.newSingleThreadExecutor()) {
+      var publishing = new CountDownLatch(1);
+      var release = new CountDownLatch(1);
+      var update =
+          workers.submit(
+              () ->
+                  f.manager.publishSchema(
+                      pin,
+                      () -> {
+                        publishing.countDown();
+                        try {
+                          await(release);
+                        } catch (InterruptedException error) {
+                          Thread.currentThread().interrupt();
+                          throw new IllegalStateException(error);
+                        }
+                        return "published";
+                      }));
+      try {
+        assertThat(publishing.await(5, TimeUnit.SECONDS)).isTrue();
+        var write =
+            f.manager.writeAsync(
+                f.generation.getGenerationId().indexId.toHexString(),
+                () -> f.generation.getDefinition().getDefinitionVersion().orElse(1L),
+                "",
+                List.of(Fixture.bson("queued")),
+                false,
+                DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED);
+        try (var reader = f.manager.acquireQueryLease(f.generation.getGenerationId())) {
+          assertThat(reader.retired()).isFalse();
+          assertThat(write.isDone()).isFalse();
+          release.countDown();
+          assertThat(update.get(5, TimeUnit.SECONDS)).isEqualTo("published");
+          assertThat(write.get(5, TimeUnit.SECONDS))
+              .isEqualTo(f.generation.getGenerationId().uniqueString());
+          verify(f.writer).updateIndex(any());
+          verify(f.writer).commit(EncodedUserData.EMPTY);
+        }
+      } finally {
+        release.countDown();
+      }
+    }
+  }
+
+  @Test
+  public void publishSchema_waitsForExecutingMutationIncludingItsCommit() throws Exception {
+    try (var f = new Fixture();
+        var pin = f.manager.acquireQueryLease(f.generation.getGenerationId());
+        var workers = Executors.newSingleThreadExecutor()) {
+      var committing = new CountDownLatch(1);
+      var release = new CountDownLatch(1);
+      doAnswer(
+              invocation -> {
+                committing.countDown();
+                await(release);
+                return null;
+              })
+          .when(f.writer)
+          .commit(EncodedUserData.EMPTY);
+      var write =
+          f.manager.writeAsync(
+              f.generation.getGenerationId().indexId.toHexString(),
+              () -> f.generation.getDefinition().getDefinitionVersion().orElse(1L),
+              "",
+              List.of(Fixture.bson("active")),
+              false,
+              DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED);
+      try {
+        assertThat(committing.await(5, TimeUnit.SECONDS)).isTrue();
+        var update = workers.submit(() -> f.manager.publishSchema(pin, () -> "published"));
+        assertThat(update.isDone()).isFalse();
+        release.countDown();
+        write.get(5, TimeUnit.SECONDS);
+        assertThat(update.get(5, TimeUnit.SECONDS)).isEqualTo("published");
+        assertThat(pin.retired()).isFalse();
+      } finally {
+        release.countDown();
+      }
+    }
+  }
+
+  @Test
+  public void quiesce_readersAndUpdatePin_doNotBlockMutationsDrainButDoBlockRetirement()
+      throws Exception {
+    try (var f = new Fixture()) {
+      var generation = f.generation.getGenerationId();
+      var first = f.manager.acquireQueryLease(generation);
+      try (first) {
+        var drained = f.manager.quiesce(generation);
+        assertThat(drained.isDone()).isTrue();
+        try (var late = f.manager.acquireQueryLease(generation)) {
+          var update = f.manager.acquireUpdateLease(generation);
+          try (update) {
+            assertThrows(
+                StatusRuntimeException.class, () -> f.manager.acquireUpdateLease(generation));
+            assertThrows(
+                StatusRuntimeException.class, () -> f.manager.acquireStatisticsLease(generation));
+            assertThrows(StatusRuntimeException.class, () -> f.write("late"));
+            var retirement = f.manager.dropIndex(generation);
+            first.close();
+            first.close();
+            late.close();
+            assertThat(retirement.isDone()).isFalse();
+            update.close();
+            assertThat(retirement.isDone()).isTrue();
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void quiesce_secondMutationEpochWithReader_waitsForTheCurrentBatch() throws Exception {
+    try (var f = new Fixture();
+        var read = f.manager.acquireQueryLease(f.generation.getGenerationId());
+        var workers = Executors.newSingleThreadExecutor()) {
+      f.write("first");
+      var entered = new CountDownLatch(1);
+      var release = new CountDownLatch(1);
+      doAnswer(
+              invocation -> {
+                entered.countDown();
+                await(release);
+                return null;
+              })
+          .when(f.writer)
+          .updateIndex(any());
+      var second = workers.submit(() -> f.write("second"));
+      try {
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+        var drained = f.manager.quiesce(f.generation.getGenerationId());
+        assertThat(drained.isDone()).isFalse();
+        assertThat(f.manager.quiesce(f.generation.getGenerationId())).isSameInstanceAs(drained);
+        release.countDown();
+        second.get(5, TimeUnit.SECONDS);
+        drained.get(5, TimeUnit.SECONDS);
+        try (var update = f.manager.acquireUpdateLease(f.generation.getGenerationId())) {
+          assertThat(read.retired()).isFalse();
+          f.manager.commitForUpdate(update);
+        }
+      } finally {
+        release.countDown();
+      }
+    }
+  }
+
+  @Test
+  public void shutdown_readAndUpdateLeases_waitsForBothKinds() throws Exception {
+    try (var f = new Fixture()) {
+      var generation = f.generation.getGenerationId();
+      f.manager.quiesce(generation).get(5, TimeUnit.SECONDS);
+      try (var read = f.manager.acquireQueryLease(generation);
+          var update = f.manager.acquireUpdateLease(generation)) {
+        var shutdown = f.manager.shutdown();
+        assertThat(shutdown.isDone()).isFalse();
+        assertThrows(StatusRuntimeException.class, () -> f.manager.acquireQueryLease(generation));
+        read.close();
+        assertThat(shutdown.isDone()).isFalse();
+        update.close();
+        shutdown.get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  public void quiesce_admittedBatch_drainsBeforeSnapshotAndKeepsQueriesReady() throws Exception {
+    try (var f = new Fixture()) {
+      var entered = new CountDownLatch(1);
+      var release = new CountDownLatch(1);
+      doAnswer(
+              invocation -> {
+                entered.countDown();
+                await(release);
+                return null;
+              })
+          .when(f.writer)
+          .updateIndex(any());
+      var response =
+          f.manager.writeAsync(
+              f.generation.getGenerationId().indexId.toHexString(),
+              () -> f.generation.getDefinition().getDefinitionVersion().orElse(1L),
+              "",
+              List.of(Fixture.bson("a")),
+              false,
+              DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE);
+
+      try {
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+        var drained = f.manager.quiesce(f.generation.getGenerationId());
+
+        assertThat(drained.isDone()).isFalse();
+        assertThat(f.manager.isGenerationReady(f.generation.getGenerationId())).isTrue();
+        assertThrows(StatusRuntimeException.class, () -> f.write("late"));
+        try (var read = f.manager.acquireQueryLease(f.generation.getGenerationId())) {
+          assertThat(read.retired()).isFalse();
+        }
+        assertThrows(
+            StatusRuntimeException.class,
+            () -> f.manager.acquireUpdateLease(f.generation.getGenerationId()));
+        release.countDown();
+        response.get(5, TimeUnit.SECONDS);
+        drained.get(5, TimeUnit.SECONDS);
+        verify(f.reader).refresh();
+        try (var lease = f.manager.acquireUpdateLease(f.generation.getGenerationId())) {
+          f.manager.commitForUpdate(lease);
+          verify(f.writer).commit(EncodedUserData.EMPTY);
+        }
+        f.manager.commitDirty();
+        verify(f.writer).commit(EncodedUserData.EMPTY);
+      } finally {
+        release.countDown();
+      }
+    }
+  }
+
+  @Test
   public void retired_scanCheck_doesNotAcquireIngestionMonitorAndObservesDrop() throws Exception {
     try (var f = new Fixture();
         var caller = Executors.newSingleThreadExecutor()) {

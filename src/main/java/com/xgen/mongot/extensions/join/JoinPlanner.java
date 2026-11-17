@@ -369,6 +369,11 @@ public class JoinPlanner {
       return this.dependencies.containsKey(id);
     }
 
+    public boolean dependsOnGeneration(String generation) {
+      return this.dependencies.values().stream()
+          .anyMatch(value -> value.uniqueString().equals(generation));
+    }
+
     public void activate(Runnable check) {
       check.run();
       snapshot().setCancellationCheck(check);

@@ -146,6 +146,9 @@ class InitializedLuceneVectorIndex implements InitializedVectorIndex {
           .log("Completed initializing index");
       return ret;
     } catch (Exception e) {
+      if (directoryFactory.protectsData()) {
+        throw e;
+      }
       boolean isIndexDropped = index.getStatus().isIndexDropped();
       if (!indexDirectoryHelper.attemptToRecoverUnreadableIndex(
           generationId,

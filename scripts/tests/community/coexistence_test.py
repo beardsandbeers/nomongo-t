@@ -7,6 +7,7 @@ logs are kept under that directory.
 
 import argparse
 import contextlib
+import hashlib
 import os
 import socket
 import struct
@@ -276,7 +277,9 @@ def run(args):
             api.CreateIndexRequest(
                 name="shared-name",
                 type=api.INDEX_TYPE_SEARCH,
-                definition_bson=encode_bson({"mappings": {"dynamic": True}}),
+                definition_bson=encode_bson(
+                    {"mappings": {"dynamic": False, "fields": {"title": {"type": "string"}}}}
+                ),
             )
         )
         wait_for("local index", lambda: local_ready(local.index_id))
@@ -343,6 +346,51 @@ def run(args):
             "committed local write visibility",
             lambda: local_results(local.index_id, "offline"),
         )
+        print("Preserving a local schema update while MongoDB is unavailable", flush=True)
+        previous_generation = client.get_index(
+            api.GetIndexRequest(index_id=local.index_id)
+        ).generation_id
+        client.update_index(
+            api.UpdateIndexRequest(
+                index_id=local.index_id,
+                expected_revision=1,
+                update_mode=api.INDEX_UPDATE_MODE_REQUIRE_PRESERVE,
+                definition_bson=encode_bson(
+                    {
+                        "mappings": {
+                            "dynamic": False,
+                            "fields": {"title": {"type": "string"}, "category": {"type": "token"}},
+                        }
+                    }
+                ),
+            )
+        )
+        changed = wait_for("preserved local update", lambda: local_ready(local.index_id, 2))
+        assert changed.generation_id == previous_generation
+        assert len(local_results(local.index_id, "offline")) == 1
+        client.upsert(
+            local.index_id,
+            {"_id": "offline", "title": "manual offline", "category": "local"},
+            concern="committed",
+        )
+        wait_for(
+            "added field visibility",
+            lambda: (
+                len(
+                    decode_bson(
+                        client.search(
+                            api.QueryRequest(
+                                index_id=local.index_id,
+                                query_bson=encode_bson(
+                                    {"equals": {"path": "category", "value": "local"}}
+                                ),
+                            )
+                        ).batch_bson
+                    )["results"]
+                )
+                == 1
+            ),
+        )
         temporary = client.create_index(
             api.CreateIndexRequest(
                 name="temporary",
@@ -364,13 +412,112 @@ def run(args):
             lambda: client.get_status(api.GetStatusRequest()).management_ready,
             process=mongot,
         )
-        wait_for("offline recovered index", lambda: local_ready(local.index_id))
+        wait_for("offline recovered index", lambda: local_ready(local.index_id, 2))
         assert len(local_results(local.index_id, "offline")) == 1
         mongod.start()
         wait_for("source recovery", lambda: native_results("concurrent"))
         collection.insert_one({"_id": "remote-three", "title": "replicated resumed"})
         wait_for("resumed replication", lambda: native_results("resumed"))
+
+        print(
+            "Checking local bootstrap recovery and data failure isolation with replication",
+            flush=True,
+        )
+        probes = {}
+        for name in ("interrupted-bootstrap", "damaged-ready"):
+            probe = client.create_index(
+                api.CreateIndexRequest(
+                    name=name,
+                    type=api.INDEX_TYPE_SEARCH,
+                    definition_bson=encode_bson(
+                        {"numPartitions": 2, "mappings": {"fields": {"title": {"type": "string"}}}}
+                    ),
+                )
+            )
+            wait_for(name, lambda index_id=probe.index_id: local_ready(index_id))
+            probes[name] = probe.index_id
+        client.upsert(
+            probes["damaged-ready"], {"_id": "kept", "title": "retained"}, concern="committed"
+        )
+        mongot.stop()
+        catalog_file = search_data / "indexes.json"
+        catalog = json_util.loads(catalog_file.read_text())
+        assert catalog["catalogVersion"] == 4
+        bootstrap = next(
+            entry
+            for entry in catalog["initializations"]
+            if str(entry["definition"]["indexID"]) == probes["interrupted-bootstrap"]
+        )
+        bootstrap["state"] = "INITIALIZING"
+        catalog_file.write_text(json_util.dumps(catalog))
+        probe_paths = {}
+        for name, index_id in probes.items():
+            paths = [path for path in search_data.glob(index_id + "*") if path.is_dir()]
+            assert len(paths) == 1, paths
+            probe_paths[name] = paths[0]
+            next((paths[0] / "0").glob("segments_*")).unlink()
+        mongot.start()
+        wait_for(
+            "resumed authorized bootstrap", lambda: local_ready(probes["interrupted-bootstrap"])
+        )
+        wait_for(
+            "isolated missing local commit",
+            lambda: (
+                client.get_index(
+                    api.GetIndexRequest(index_id=probes["damaged-ready"])
+                ).lifecycle_state
+                == "FAILED"
+            ),
+        )
+        assert all(
+            list((probe_paths["interrupted-bootstrap"] / str(part)).glob("segments_*"))
+            for part in (0, 1)
+        )
+        assert not list((probe_paths["damaged-ready"] / "0").glob("segments_*"))
+        assert client.get_status(api.GetStatusRequest()).management_ready
+        wait_for("replication after isolated local failure", lambda: native_results("resumed"))
+        assert len(local_results(local.index_id, "offline")) == 1
+        for index_id in probes.values():
+            client.drop_index(api.DropIndexRequest(index_id=index_id, expected_revision=1))
         assert len(client.list_indexes(api.ListIndexesRequest()).indexes) == 1
+
+        print("Rejecting unreadable local journal metadata before native cleanup", flush=True)
+        mongot.stop()
+        journal_file = search_data / "configJournal.json"
+        original_journal = journal_file.read_bytes()
+        journal = json_util.loads(original_journal)
+        local_entry = next(
+            entry
+            for entry in journal["indexes"]
+            if str(entry["index"]["indexID"]) == local.index_id
+        )
+        local_entry["futureProperty"] = True
+        journal_file.write_text(json_util.dumps(journal))
+
+        def local_data_hashes():
+            files = [journal_file, search_data / "indexes.json"]
+            for path in search_data.glob(local.index_id + "*"):
+                if path.is_dir():
+                    files.extend(file for file in path.rglob("*") if file.is_file())
+            return {
+                str(file.relative_to(search_data)): hashlib.sha256(file.read_bytes()).hexdigest()
+                for file in files
+            }
+
+        before_rejection = local_data_hashes()
+        mongot.start()
+        assert mongot.process.wait(timeout=60) != 0
+        assert "Unreadable local index journal entry" in mongot.logfile.read_text()
+        assert local_data_hashes() == before_rejection
+        journal_file.write_bytes(original_journal)
+        mongot.start()
+        wait_for(
+            "local data after journal repair",
+            lambda: local_ready(local.index_id, 2),
+            process=mongot,
+        )
+        assert len(local_results(local.index_id, "offline")) == 1
+        wait_for("replication after journal repair", lambda: native_results("resumed"))
         native_wire(
             dict(
                 management_base,
@@ -378,7 +525,7 @@ def run(args):
             )
         )
         assert len(local_results(local.index_id, "offline")) == 1
-        client.drop_index(api.DropIndexRequest(index_id=local.index_id, expected_revision=1))
+        client.drop_index(api.DropIndexRequest(index_id=local.index_id, expected_revision=2))
         success = True
         print(
             "PASS: native commands, existing-data adoption, source isolation, writes, outages and restart",

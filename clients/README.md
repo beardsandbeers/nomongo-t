@@ -3,8 +3,14 @@
 Java, Rust, Python and TypeScript clients share the
 [protobuf API](../src/proto/standalone/v1/standalone.proto). Create an index using the normal
 mongot schema, then upsert BSON directly into that index. There is no collection creation,
-source document store, durable retry identity or automatic backfill. Schema updates create an
-empty generation; reingest from your own source.
+source document store, durable retry identity or automatic backfill. Compatible search mapping
+additions and query analyzer changes preserve the physical index, writer, generation ID, and
+existing cursors. Only the schema revision advances. Writes remain admitted and may briefly queue
+during publication. New fields require new writes or complete-document upserts to populate; they
+are not backfilled. Schema updates do not refresh or commit pending document writes.
+Use `INDEX_UPDATE_MODE_REQUIRE_PRESERVE` to reject updates requiring an empty rebuild, or
+`INDEX_UPDATE_MODE_REBUILD_EMPTY` to reset explicitly. Equivalent updates retain their revision.
+See [mapping updates](../docs/standalone-mongot.md#mapping-changes-and-index-lifecycle).
 
 Versions 0.3.0 and later use the push API, which is incompatible with collection-backed 0.2.x clients.
 Use matching server and client versions. Each wrapper provides TLS/bearer authentication,
@@ -319,7 +325,7 @@ bash clients/check.sh --launcher /path/to/mongot-standalone
 
 This builds all clients and runs each RPC over TLS against an isolated real server. Pass
 `--plaintext` for local plaintext verification. The suite checks direct writes, index isolation,
-empty mapping rebuilds, cursor behavior and restart persistence. It never uses MongoDB.
+explicit empty mapping rebuilds, cursor behavior and restart persistence. It never uses MongoDB.
 Environment overrides: `MONGOT_PYTHON`, `MONGOT_MVN`, and per-language `MONGOT_*_COMMAND`.
 
 Release packaging remains in `scripts/standalone/package_release.py`; verification installs

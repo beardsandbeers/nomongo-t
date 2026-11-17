@@ -59,6 +59,16 @@ public class MeteredIndexWriter implements IndexWriter {
   }
 
   @Override
+  public void validateCommittedData() throws IOException {
+    this.indexWriter.validateCommittedData();
+  }
+
+  @Override
+  public void copyCommittedData(java.nio.file.Path destination) throws IOException {
+    this.indexWriter.copyCommittedData(destination);
+  }
+
+  @Override
   public Optional<ExceededLimitsException> exceededLimits() {
     return this.indexWriter.exceededLimits();
   }

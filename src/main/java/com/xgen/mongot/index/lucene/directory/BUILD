@@ -6,6 +6,7 @@ java_library(
         "ByteReadCollector.java",
         "CacheWarmerTimer.java",
         "EnvironmentVariantPerfConfig.java",
+        "ExistingIndexDirectory.java",
         "FileSystemDirectory.java",
         "IndexDirectoryFactory.java",
         "IndexDirectoryHelper.java",

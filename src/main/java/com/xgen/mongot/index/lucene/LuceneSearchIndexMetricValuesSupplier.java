@@ -63,11 +63,14 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
 
   private final SearchIndexReader indexReader;
   private final boolean hasEmbeddedFields;
-  private final SearchFieldDefinitionResolver resolver;
-  private final Set<String> autocompleteLikeCustomAnalyzerNames;
-  private final AtomicReference<Map<FieldName.TypeField, Double>> cachedNumFieldsPerDatatype =
-      new AtomicReference<>(Collections.emptyMap());
-  private final Supplier<Void> numFieldsRefreshTrigger;
+  private final Duration numFieldsCacheDuration;
+  private final Executor asyncRefreshExecutor;
+  private volatile FieldCountCache fieldCountCache;
+
+  // Each schema owns its cache and refresh interval. Late tasks only update the retired cache.
+  private record FieldCountCache(
+      AtomicReference<Map<FieldName.TypeField, Double>> counts, Supplier<Void> refreshTrigger) {}
+
   private final DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry;
   private final Supplier<TokenFacetsStateCache.Snapshot> tokenFacetsCacheSnapshot;
 
@@ -94,50 +97,62 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
 
     this.indexReader = searchIndexReader;
     this.hasEmbeddedFields = hasEmbeddedFields;
-    this.resolver = resolver;
-    this.autocompleteLikeCustomAnalyzerNames =
-        getAutocompleteLikeCustomAnalyzerNames(customAnalyzerDefinitions);
+    this.numFieldsCacheDuration = numFieldsCacheDuration;
+    this.asyncRefreshExecutor = asyncRefreshExecutor;
     this.dynamicFeatureFlagRegistry = dynamicFeatureFlagRegistry;
     this.tokenFacetsCacheSnapshot =
         Suppliers.memoizeWithExpiration(
             this::loadTokenFacetsStateCacheSnapshot,
             TOKEN_FACETS_CACHE_SNAPSHOT_TTL.toMillis(),
             TimeUnit.MILLISECONDS);
-    if (!this.dynamicFeatureFlagRegistry.evaluateClusterInvariant(
-        DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC.getName(),
-        DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC.getFallback())) {
-      this.numFieldsRefreshTrigger = () -> null;
-    } else {
-      @Var Duration effectiveDuration = numFieldsCacheDuration;
-      if (numFieldsCacheDuration.isNegative() || numFieldsCacheDuration.isZero()) {
-        FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
-            "numFieldsCacheDuration must be positive, got %s; using default %s",
-            numFieldsCacheDuration, DEFAULT_NUM_FIELDS_CACHE_DURATION);
-        effectiveDuration = DEFAULT_NUM_FIELDS_CACHE_DURATION;
-      }
-      Objects.requireNonNull(asyncRefreshExecutor, "asyncRefreshExecutor must not be null");
-      this.numFieldsRefreshTrigger =
-          Suppliers.memoizeWithExpiration(
-              () -> {
-                try {
-                  asyncRefreshExecutor.execute(
-                      () -> {
-                        try {
-                          this.cachedNumFieldsPerDatatype.set(computeNumFieldsPerDatatype());
-                        } catch (Exception e) {
-                          FLOGGER.atWarning().atMostEvery(5, TimeUnit.MINUTES).withCause(e).log(
-                              "Failed to compute numFieldsPerDatatype metric");
-                        }
-                      });
-                } catch (Exception e) {
-                  FLOGGER.atWarning().atMostEvery(5, TimeUnit.MINUTES).withCause(e).log(
-                      "Failed to submit async numFieldsPerDatatype refresh task");
-                }
-                return null;
-              },
-              effectiveDuration.toMillis(),
-              TimeUnit.MILLISECONDS);
+    this.fieldCountCache = createFieldCountCache(resolver, customAnalyzerDefinitions);
+  }
+
+  /**
+   * Prepares classification and an empty cache; publication does no scanning or task submission.
+   */
+  Runnable prepareSchemaUpdate(
+      SearchFieldDefinitionResolver resolver, List<CustomAnalyzerDefinition> analyzers) {
+    var next = createFieldCountCache(resolver, analyzers);
+    return () -> this.fieldCountCache = next;
+  }
+
+  private FieldCountCache createFieldCountCache(
+      SearchFieldDefinitionResolver resolver, List<CustomAnalyzerDefinition> analyzers) {
+    var counts = new AtomicReference<Map<FieldName.TypeField, Double>>(Collections.emptyMap());
+    // The getter checks the current feature flag. Do not freeze its value during preparation.
+    @Var Duration effectiveDuration = this.numFieldsCacheDuration;
+    if (effectiveDuration.isNegative() || effectiveDuration.isZero()) {
+      FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
+          "numFieldsCacheDuration must be positive, got %s; using default %s",
+          effectiveDuration, DEFAULT_NUM_FIELDS_CACHE_DURATION);
+      effectiveDuration = DEFAULT_NUM_FIELDS_CACHE_DURATION;
     }
+    Objects.requireNonNull(this.asyncRefreshExecutor, "asyncRefreshExecutor must not be null");
+    var autocompleteLikeAnalyzerNames = getAutocompleteLikeCustomAnalyzerNames(analyzers);
+    Supplier<Void> refresh =
+        Suppliers.memoizeWithExpiration(
+            () -> {
+              try {
+                this.asyncRefreshExecutor.execute(
+                    () -> {
+                      try {
+                        counts.set(
+                            computeNumFieldsPerDatatype(resolver, autocompleteLikeAnalyzerNames));
+                      } catch (Exception e) {
+                        FLOGGER.atWarning().atMostEvery(5, TimeUnit.MINUTES).withCause(e).log(
+                            "Failed to compute numFieldsPerDatatype metric");
+                      }
+                    });
+              } catch (Exception e) {
+                FLOGGER.atWarning().atMostEvery(5, TimeUnit.MINUTES).withCause(e).log(
+                    "Failed to submit async numFieldsPerDatatype refresh task");
+              }
+              return null;
+            },
+            effectiveDuration.toMillis(),
+            TimeUnit.MILLISECONDS);
+    return new FieldCountCache(counts, refresh);
   }
 
   /** Static factory method that constructs the supplier and registers all gauges. */
@@ -350,8 +365,9 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
         DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC.getFallback())) {
       return Collections.emptyMap();
     }
-    this.numFieldsRefreshTrigger.get();
-    return this.cachedNumFieldsPerDatatype.get();
+    var cache = this.fieldCountCache;
+    cache.refreshTrigger().get();
+    return cache.counts().get();
   }
 
   /**
@@ -364,7 +380,8 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
    * partitions. Since all partitions have the same field definitions, we only process the first
    * partition's fields.
    */
-  private Map<FieldName.TypeField, Double> computeNumFieldsPerDatatype() {
+  private Map<FieldName.TypeField, Double> computeNumFieldsPerDatatype(
+      SearchFieldDefinitionResolver resolver, Set<String> autocompleteLikeAnalyzerNames) {
     try {
       List<FieldInfos> fieldInfosList = this.indexReader.getFieldInfos();
       if (fieldInfosList.isEmpty()) {
@@ -377,7 +394,9 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
       FieldInfos fieldInfos = fieldInfosList.get(0);
       StreamSupport.stream(fieldInfos.spliterator(), false)
           .filter(this::isDatatypeField)
-          .map(fieldInfo -> classifyFieldType(fieldInfo.name))
+          .map(
+              fieldInfo ->
+                  classifyFieldType(fieldInfo.name, resolver, autocompleteLikeAnalyzerNames))
           .flatMap(Optional::stream)
           .forEach(
               typeField -> counts.merge(typeField, 1.0, (existing, increment) -> existing + 1.0));
@@ -405,14 +424,18 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
    * Classifies a Lucene field name into its TypeField. String fields configured with
    * autocomplete-like custom analyzers are classified as AUTOCOMPLETE.
    */
-  private Optional<FieldName.TypeField> classifyFieldType(String luceneFieldName) {
+  private Optional<FieldName.TypeField> classifyFieldType(
+      String luceneFieldName,
+      SearchFieldDefinitionResolver resolver,
+      Set<String> autocompleteLikeAnalyzerNames) {
     try {
       FieldName.Components components = FieldName.extractFieldNameComponents(luceneFieldName);
 
       // For STRING fields when we have autocomplete-like analyzers, check if the field uses one
-      if (!this.autocompleteLikeCustomAnalyzerNames.isEmpty()
+      if (!autocompleteLikeAnalyzerNames.isEmpty()
           && components.typeField() == FieldName.TypeField.STRING) {
-        return classifyStringFieldForAutocompleteLikeAnalyzer(components);
+        return classifyStringFieldForAutocompleteLikeAnalyzer(
+            components, resolver, autocompleteLikeAnalyzerNames);
       }
 
       return Optional.of(components.typeField());
@@ -433,9 +456,11 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
    *     uses a regular analyzer, or empty if the field should be skipped
    */
   private Optional<FieldName.TypeField> classifyStringFieldForAutocompleteLikeAnalyzer(
-      FieldName.Components components) {
+      FieldName.Components components,
+      SearchFieldDefinitionResolver resolver,
+      Set<String> autocompleteLikeAnalyzerNames) {
     Optional<FieldDefinition> fieldDefinitionOpt =
-        this.resolver.getFieldDefinition(components.fieldPath(), components.embeddedRoot());
+        resolver.getFieldDefinition(components.fieldPath(), components.embeddedRoot());
     if (fieldDefinitionOpt.isEmpty()) {
       // If we have autocomplete-like analyzers but can't find field definition, skip the field
       return Optional.empty();
@@ -469,8 +494,7 @@ public final class LuceneSearchIndexMetricValuesSupplier extends LuceneIndexMetr
         .ifPresent(referencedAnalyzers::add);
 
     // Check if any referenced analyzer is autocomplete-like
-    if (!Sets.intersection(referencedAnalyzers, this.autocompleteLikeCustomAnalyzerNames)
-        .isEmpty()) {
+    if (!Sets.intersection(referencedAnalyzers, autocompleteLikeAnalyzerNames).isEmpty()) {
       return Optional.of(FieldName.TypeField.AUTOCOMPLETE);
     }
 

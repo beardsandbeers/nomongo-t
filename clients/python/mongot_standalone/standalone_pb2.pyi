@@ -1,13 +1,9 @@
-from collections.abc import Iterable as _Iterable
-from collections.abc import Mapping as _Mapping
-from typing import ClassVar as _ClassVar
-from typing import Optional as _Optional
-from typing import Union as _Union
-
-from google.protobuf import descriptor as _descriptor
-from google.protobuf import message as _message
 from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import message as _message
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -16,6 +12,12 @@ class IndexType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     INDEX_TYPE_UNSPECIFIED: _ClassVar[IndexType]
     INDEX_TYPE_SEARCH: _ClassVar[IndexType]
     INDEX_TYPE_VECTOR_SEARCH: _ClassVar[IndexType]
+
+class IndexUpdateMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    INDEX_UPDATE_MODE_AUTO: _ClassVar[IndexUpdateMode]
+    INDEX_UPDATE_MODE_REQUIRE_PRESERVE: _ClassVar[IndexUpdateMode]
+    INDEX_UPDATE_MODE_REBUILD_EMPTY: _ClassVar[IndexUpdateMode]
 
 class MeasurementMethod(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -52,6 +54,9 @@ class ExplainVerbosity(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
 INDEX_TYPE_UNSPECIFIED: IndexType
 INDEX_TYPE_SEARCH: IndexType
 INDEX_TYPE_VECTOR_SEARCH: IndexType
+INDEX_UPDATE_MODE_AUTO: IndexUpdateMode
+INDEX_UPDATE_MODE_REQUIRE_PRESERVE: IndexUpdateMode
+INDEX_UPDATE_MODE_REBUILD_EMPTY: IndexUpdateMode
 MEASUREMENT_METHOD_UNAVAILABLE: MeasurementMethod
 MEASUREMENT_METHOD_FILE_RANGE: MeasurementMethod
 MEASUREMENT_METHOD_RESOURCE_ACCOUNTING: MeasurementMethod
@@ -86,18 +91,21 @@ class CreateIndexRequest(_message.Message):
     ) -> None: ...
 
 class UpdateIndexRequest(_message.Message):
-    __slots__ = ("index_id", "expected_revision", "definition_bson")
+    __slots__ = ("index_id", "expected_revision", "definition_bson", "update_mode")
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     EXPECTED_REVISION_FIELD_NUMBER: _ClassVar[int]
     DEFINITION_BSON_FIELD_NUMBER: _ClassVar[int]
+    UPDATE_MODE_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     expected_revision: int
     definition_bson: bytes
+    update_mode: IndexUpdateMode
     def __init__(
         self,
         index_id: _Optional[str] = ...,
         expected_revision: _Optional[int] = ...,
         definition_bson: _Optional[bytes] = ...,
+        update_mode: _Optional[_Union[IndexUpdateMode, str]] = ...,
     ) -> None: ...
 
 class DropIndexRequest(_message.Message):

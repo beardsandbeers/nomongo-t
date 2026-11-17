@@ -40,6 +40,7 @@ import org.slf4j.LoggerFactory;
 public class LuceneSearchIndex implements SearchIndex {
   private static final Logger LOG = LoggerFactory.getLogger(LuceneSearchIndex.class);
   private final SearchIndexDefinition definition;
+  private volatile @org.jetbrains.annotations.Nullable LiveSearchSchema liveSchema;
   private final AtomicReference<IndexStatus> statusRef;
   private final SearchIndexProperties searchIndexProperties;
   private volatile boolean closed;
@@ -242,7 +243,25 @@ public class LuceneSearchIndex implements SearchIndex {
 
   @Override
   public SearchIndexDefinition getDefinition() {
-    return this.definition;
+    var schema = this.liveSchema;
+    return schema == null ? this.definition : schema.current().definition();
+  }
+
+  LiveSearchSchema enableSchemaUpdates() {
+    if (this.liveSchema != null) {
+      return this.liveSchema;
+    }
+    var schema =
+        new LiveSearchSchema(
+            this.definition,
+            this.searchIndexProperties.analyzerRegistry,
+            this.searchIndexProperties.indexFormatVersion);
+    this.liveSchema = schema;
+    return schema;
+  }
+
+  Optional<LiveSearchSchema> liveSchema() {
+    return Optional.ofNullable(this.liveSchema);
   }
 
   @Override

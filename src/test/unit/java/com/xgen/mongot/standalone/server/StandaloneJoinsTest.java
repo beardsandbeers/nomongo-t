@@ -93,6 +93,110 @@ public class StandaloneJoinsTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
   @Test
+  public void search_inPlaceUpdateWithoutCopyHeadroom_keepsMetadataAndForeignJoinsReadable()
+      throws Exception {
+    String foreign;
+    String local;
+    try (var seed = new Fixture(data(), List.of())) {
+      foreign = seed.create("foreign", MAPPING);
+      local = seed.create("local", MAPPING);
+      seed.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      seed.upsert(local, "{_id:'matched',parent:'a'}");
+    }
+
+    try (var f = new Fixture(data(), List.of(), Long.MAX_VALUE / 2)) {
+      f.ready(foreign, 1);
+      f.ready(local, 1);
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(foreign)
+              .setExpectedRevision(1)
+              .setDefinitionBson(
+                  bson(MAPPING.replace("title:{", "category:{type:'token'},title:{")))
+              .build());
+      f.ready(foreign, 2);
+
+      var meta =
+          f.queries.searchMeta(
+              SearchMetaRequest.newBuilder()
+                  .setIndexId(foreign)
+                  .setQueryBson(
+                      bson(
+                          "{index:'foreign',equals:{path:'office',value:'Berlin'},"
+                              + "count:{type:'total'}}"))
+                  .build());
+      assertThat(
+              new RawBsonDocument(meta.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getNumber("total")
+                  .longValue())
+          .isEqualTo(1);
+      assertThat(
+              ids(
+                  f.search(
+                      foreign,
+                      "{equals:{path:'office',value:'Berlin'},returnStoredSource:true}",
+                      100)))
+          .containsExactly("p");
+      assertThat(ids(f.search(local, JOIN, 100))).containsExactly("matched");
+      assertThat(f.runtime.describeIndex(foreign).getActiveRevision()).isEqualTo(2);
+      assertThat(f.runtime.describeIndex(foreign).getDesiredRevision()).isEqualTo(2);
+      assertThrows(StatusRuntimeException.class, () -> f.upsert(foreign, "{_id:'new',key:'b'}"));
+    }
+  }
+
+  @Test
+  public void getMore_delayedForeignPublication_keepsCursorDependingOnNewGeneration()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      f.upsert(local, "{_id:'first',parent:'a'}");
+      f.upsert(local, "{_id:'second',parent:'a'}");
+      var oldCursor = f.search(local, JOIN, 1);
+      String oldGeneration = f.ready(foreign, 1).getGenerationId();
+
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(foreign)
+              .setExpectedRevision(1)
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
+              .setDefinitionBson(
+                  bson(
+                      MAPPING.replace(
+                          "title:{type:'string'}",
+                          "title:{type:'string'},category:{type:'token'}")))
+              .build());
+      f.ready(foreign, 2);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      var current = f.search(local, JOIN, 1);
+      String retired = oldGeneration;
+
+      assertThat(retired).isEqualTo(oldGeneration);
+      f.server.generationRetired(retired);
+
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(oldCursor.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      assertThat(
+              ids(
+                  f.queries.getMore(
+                      GetMoreRequest.newBuilder().setCursorId(current.getCursorId()).build())))
+          .hasSize(1);
+    }
+  }
+
+  @Test
   public void searchMeta_partitionedJoin_returnsCountAndExplainAndReleasesDependencies()
       throws Exception {
     try (var f = new Fixture(data(), List.of())) {
@@ -1017,6 +1121,8 @@ public class StandaloneJoinsTest {
 
       f.catalog.updateIndex(
           UpdateIndexRequest.newBuilder()
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
               .setIndexId(foreign)
               .setExpectedRevision(1)
               .setDefinitionBson(bson(MAPPING))
@@ -1673,6 +1779,11 @@ public class StandaloneJoinsTest {
     private final QueryServiceGrpc.QueryServiceBlockingStub queries;
 
     private Fixture(Path data, List<StandaloneConfig.Principal> principals) throws Exception {
+      this(data, principals, StandaloneConfig.development(data, 0).minFreeDiskBytes());
+    }
+
+    private Fixture(Path data, List<StandaloneConfig.Principal> principals, long minFreeDiskBytes)
+        throws Exception {
       var base = StandaloneConfig.development(data, 0);
       var config =
           new StandaloneConfig(
@@ -1681,7 +1792,7 @@ public class StandaloneJoinsTest {
               base.documentLimits(),
               base.maxInFlightRequests(),
               base.maxInFlightBytes(),
-              base.minFreeDiskBytes(),
+              minFreeDiskBytes,
               base.commitInterval(),
               base.refreshInterval(),
               base.maxRpcDuration(),
