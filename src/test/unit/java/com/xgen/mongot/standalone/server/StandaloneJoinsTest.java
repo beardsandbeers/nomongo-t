@@ -1636,7 +1636,7 @@ public class StandaloneJoinsTest {
       assertThat(ids(first)).containsExactly("first");
       assertThat(first.getCursorId()).isNotEqualTo(0L);
       assertThat(reservedBytes(f)).isGreaterThan(0.0);
-      assertThat(reservedBytes(f)).isLessThan(100_000.0);
+      assertThat(reservedBytes(f)).isLessThan(1024 * 1024.0);
       var next =
           f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
       assertThat(ids(next)).containsExactly("second");
@@ -1662,9 +1662,8 @@ public class StandaloneJoinsTest {
   }
 
   @Test
-  public void search_largerConfiguredQueryBudget_acceptsMembershipAboveDefaultLimit()
-      throws Exception {
-    try (var f = new Fixture(data(), List.of(), new MemoryLimits(67108864L, 134217728L))) {
+  public void search_largerHeapBudget_acceptsMembershipAboveSmallerHeapLimit() throws Exception {
+    try (var f = new Fixture(data(), List.of(), MemoryLimits.fromHeapBytes(4L << 30))) {
       String foreign = f.create("foreign", MAPPING);
       String local = f.create("local", MAPPING);
       f.upsert(foreign, keyDocument(120, 7000));
@@ -1683,7 +1682,7 @@ public class StandaloneJoinsTest {
               .getDocument("preparation");
       var limits = preparation.getDocument("limits");
       assertThat(limits.getInt64("memoryBytes").getValue()).isEqualTo(67108864L);
-      assertThat(limits.getInt64("concurrentMemoryBytes").getValue()).isEqualTo(134217728L);
+      assertThat(limits.getInt64("concurrentMemoryBytes").getValue()).isEqualTo(536870912L);
       assertThat(preparation.getInt64("reservedBytes").getValue()).isGreaterThan(33554432L);
       assertThat(reservedBytes(f)).isEqualTo(0.0);
     }
@@ -2082,7 +2081,8 @@ public class StandaloneJoinsTest {
 
     private Fixture(Path data, List<StandaloneConfig.Principal> principals, long minFreeDiskBytes)
         throws Exception {
-      this(data, principals, minFreeDiskBytes, MemoryLimits.defaults());
+      // Keep admission tests independent of the JVM heap chosen by the test runner.
+      this(data, principals, minFreeDiskBytes, MemoryLimits.fromHeapBytes(2L << 30));
     }
 
     private Fixture(

@@ -628,36 +628,52 @@ The server applies these admission limits by default:
 | Independent predicates per query | 8 |
 | Distinct hash keys across predicates | 100,000 |
 | Distinct ordinal keys across predicates | 1,000,000 |
-| Estimated build/retained memory per query | 32 MiB |
-| Estimated memory across concurrent joins and their cursors | 256 MiB |
+| Estimated build/retained memory per query | One eighth of the effective shared join pool |
+| Estimated memory across concurrent joins and their cursors | One eighth of the JVM maximum heap |
 | Join preparation work checkpoints across predicates | 10,000,000 |
 
-Configure the memory limits at startup in standalone YAML:
+The pool is derived once at startup from the JVM maximum heap, leaving most of the heap
+for other query work, indexing, caches, and runtime overhead. These limits govern join
+admission; they are not a global memory budget for every search/indexing allocation.
+The default per-query allowance follows the effective pool, including an explicit pool
+override. Integer divisions round down with a minimum of one byte. Instantaneous free
+heap does not change admission capacity; outstanding reservations determine availability.
+
+Optionally override the memory limits at startup in standalone YAML:
 
 ```yaml
 querying:
   joins:
+    # Omit these settings to use automatic heap-relative limits.
     maxQueryBytes: 33554432
     maxConcurrentBytes: 268435456
 ```
 
 With a MongoDB `syncSource`, put the same `querying.joins` block under `standalone`
 (`standalone.querying.joins`). Both APIs then use these limits and share the process
-reservation counter. `maxConcurrentBytes` includes membership retained by idle cursors.
+reservation counter. `maxConcurrentBytes` includes membership and execution allowances
+reserved by idle cursors.
 
 `MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES` override their
 respective YAML values. Each setting is optional and must be a positive integer
-byte count within the signed 64-bit range. Omitted values retain the defaults above.
+byte count within the signed 64-bit range. An omitted `maxConcurrentBytes` uses the
+heap-derived pool; an omitted `maxQueryBytes` uses one eighth of the effective pool after
+YAML and environment overrides. An explicit per-query setting remains independent; the
+shared pool is always an additional ceiling. Key-count and work limits remain independent
+of heap size.
 Changes require a restart. Explain reports the effective limits in
 `joins.preparation.limits`; memory-limit errors include the limit, currently
 reserved bytes, and the requested additional reservation.
 
 Admission estimates account for query metadata and prepared membership. The hash
 path includes pooled keys, foreign deduplication, probe state, and term-query
-copies per partition and facet. The ordinal path budgets local bitmaps, scorer
-overhead, and temporary dictionary work. These estimates are independent of JVM
-heap or RSS measurements. Cursor-retained membership keeps its
-reservation until exhaustion, kill, invalidation, expiry, or shutdown. Deadline
+copies per partition and facet. The ordinal path reserves local bitmaps and a conservative
+dictionary-buffer/scorer allowance for every local leaf and collector copy for the cursor's
+lifetime. DocValues opens these dictionary buffers even when the scorer only reads ordinals.
+Foreign dictionaries, foreign bitmaps, and extra translation scratch are released from the
+reservation after preparation. Estimates describe admitted allocations, rather than measured
+JVM heap or RSS. Cursor-held reservations are released on exhaustion, kill, invalidation,
+expiry, or shutdown. Deadline
 and cancellation checks run during foreign collection and local Lucene execution;
 each `GetMore` installs its current invocation's cancellation context.
 
@@ -996,10 +1012,12 @@ the capability use hash. The selection stays in the shared planner and the
 query factory creates a scorer for the prepared representation. Existing
 collectors consume either scorer for filtering, sorting and pagination.
 
-Before ordinal preparation, reserve local bitmap and scorer memory plus scratch
-space for both sides of the dictionary merge. If the reservation cannot be
-made, try hash. Release scratch on success and keep local membership reserved
-until cursor close. Release the entire plan on failure. The shared work limit
+Before ordinal preparation, reserve local bitmaps, dictionary buffers for each leaf and
+collector copy, and scorer overhead, plus foreign dictionary/bitmap and translation scratch.
+The local execution allowance also covers the local dictionary merge during preparation.
+If the reservation cannot be made, try hash. Release preparation-only scratch on success
+and keep local membership and execution buffers reserved until cursor close, including idle
+cursors and repeated `GetMore` batches. Release the entire plan on failure. The shared work limit
 charges bitmap preparation as well as hash collection. Ordinal domains have a
 separate cumulative distinct-key cap. Both strategies preserve exact matches.
 Explain reports `ordinalBitmap` and the selection reason for ordinal queries.

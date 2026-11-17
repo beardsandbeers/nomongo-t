@@ -255,7 +255,12 @@ public record StandaloneConfig(
         or(raw.ingestion(), new Ingestion(null, null, null, null, null, null, null, null));
     var querying = or(raw.querying(), new Querying(null, null));
     var joins = or(querying.joins(), new Joins(null, null));
-    var defaultJoinLimits = MemoryLimits.defaults();
+    long maxConcurrentJoinBytes =
+        memoryLimit(
+            environment,
+            "MONGOT_JOIN_MAX_CONCURRENT_BYTES",
+            or(joins.maxConcurrentBytes(), MemoryLimits.defaults().maxConcurrentBytes()));
+    var defaultJoinLimits = MemoryLimits.fromConcurrentBytes(maxConcurrentJoinBytes);
     return new StandaloneConfig(
         resolve(base, storage.dataPath()),
         address,
@@ -278,10 +283,7 @@ public record StandaloneConfig(
                 environment,
                 "MONGOT_JOIN_MAX_QUERY_BYTES",
                 or(joins.maxQueryBytes(), defaultJoinLimits.maxQueryBytes())),
-            memoryLimit(
-                environment,
-                "MONGOT_JOIN_MAX_CONCURRENT_BYTES",
-                or(joins.maxConcurrentBytes(), defaultJoinLimits.maxConcurrentBytes()))));
+            maxConcurrentJoinBytes));
   }
 
   private static long memoryLimit(Map<String, String> environment, String name, long fallback) {

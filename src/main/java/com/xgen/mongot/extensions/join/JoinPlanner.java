@@ -30,6 +30,7 @@ import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
 import com.xgen.mongot.index.query.operators.Operator;
 import com.xgen.mongot.index.query.operators.VectorSearchOperator;
 import com.xgen.mongot.index.version.GenerationId;
+import com.xgen.mongot.util.Runtime;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -50,6 +51,7 @@ public class JoinPlanner {
   public static final int MAX_ORDINAL_KEYS = 1_000_000;
   private static final int ORDINAL_EXHAUSTIVE_THRESHOLD = 50_000;
   private static final int ORDINAL_FIRST_PAGE_THRESHOLD = 250_000;
+  // Retained for callers explicitly using the legacy limits. Defaults scale with the JVM heap.
   public static final long MAX_QUERY_BYTES = 32L * 1024 * 1024;
   public static final long MAX_CONCURRENT_BYTES = 256L * 1024 * 1024;
   public static final long MAX_FOREIGN_WORK = 10_000_000;
@@ -63,7 +65,20 @@ public class JoinPlanner {
     }
 
     public static MemoryLimits defaults() {
-      return new MemoryLimits(MAX_QUERY_BYTES, MAX_CONCURRENT_BYTES);
+      return fromHeapBytes(Runtime.INSTANCE.getMaxHeapSize().toBytes());
+    }
+
+    /** Leaves most of the heap available to other search, indexing and runtime allocations. */
+    public static MemoryLimits fromHeapBytes(long maxHeapBytes) {
+      if (maxHeapBytes <= 0) {
+        throw new IllegalArgumentException("JVM maximum heap must be a positive byte count");
+      }
+      return fromConcurrentBytes(Math.max(1, maxHeapBytes / 8));
+    }
+
+    /** A query may reserve one eighth of the shared pool unless explicitly overridden. */
+    public static MemoryLimits fromConcurrentBytes(long maxConcurrentBytes) {
+      return new MemoryLimits(Math.max(1, maxConcurrentBytes / 8), maxConcurrentBytes);
     }
   }
 
@@ -370,14 +385,19 @@ public class JoinPlanner {
     if (firstRelevancePage && !exhaustive(query) && !aboveHashCap && local.leaves() > 16) {
       return Optional.empty();
     }
-    // Account for both bitmaps, cursors and DocValues dictionary blocks during translation.
-    // Local scorer state can be recreated independently by each collector.
+    // Each local DocValues scorer eagerly allocates dictionary buffers even when it only reads
+    // ordinals. Keep an allowance for every leaf and collector copy until the cursor closes.
+    // ConcurrentIndexSearcher assigns each leaf to one slice, so parallelism across leaves is
+    // covered by this sum. The same allowance covers the local dictionaries during preparation.
     long retained =
-        local.bitmapBytes() + 8192 + local.leaves() * (128L + plan.localQueryCopies * 2048L);
+        local.bitmapBytes()
+            + local.dictionaryBytes() * plan.localQueryCopies
+            + 8192
+            + local.leaves() * (128L + plan.localQueryCopies * 2048L);
+    // Foreign dictionaries/bitmaps and the extra local DocValues view are preparation-only.
     long scratch =
         source.bitmapBytes()
             + source.dictionaryBytes()
-            + local.dictionaryBytes()
             + OrdinalJoinPreparation.dictionaryBytes(field.type(), local.largestDictionary());
     if (!plan.tryReserveBytes(retained + scratch)) {
       return Optional.empty();

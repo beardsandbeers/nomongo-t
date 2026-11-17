@@ -3,6 +3,7 @@ package com.xgen.mongot.standalone.config;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.xgen.mongot.extensions.join.JoinPlanner.MemoryLimits;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,13 +26,54 @@ public class StandaloneConfigTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
   @Test
-  public void fromText_omittedJoinMemoryLimits_preservesDefaults() throws Exception {
+  public void fromText_omittedJoinMemoryLimits_usesRuntimeHeap() throws Exception {
     var parsed =
         StandaloneConfig.fromText(
             "storage: {dataPath: data}", Path.of("standalone.yaml"), false, Map.of());
 
-    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(33554432L);
-    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(268435456L);
+    assertThat(parsed.joinMemoryLimits())
+        .isEqualTo(MemoryLimits.fromHeapBytes(Runtime.getRuntime().maxMemory()));
+  }
+
+  @Test
+  public void fromText_onlyConcurrentYamlLimit_derivesQueryAllowance() throws Exception {
+    var parsed =
+        StandaloneConfig.fromText(
+            "storage: {dataPath: data}\nquerying: {joins: {maxConcurrentBytes: 536870912}}",
+            Path.of("standalone.yaml"),
+            false,
+            Map.of());
+
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(67108864L);
+  }
+
+  @Test
+  public void fromText_concurrentEnvironmentOverride_derivesQueryFromEffectivePool()
+      throws Exception {
+    var parsed =
+        StandaloneConfig.fromText(
+            "storage: {dataPath: data}\nquerying: {joins: {maxConcurrentBytes: 268435456}}",
+            Path.of("standalone.yaml"),
+            false,
+            Map.of("MONGOT_JOIN_MAX_CONCURRENT_BYTES", "536870912"));
+
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(67108864L);
+  }
+
+  @Test
+  public void fromText_concurrentEnvironmentOverride_preservesExplicitQueryLimit()
+      throws Exception {
+    var parsed =
+        StandaloneConfig.fromText(
+            "storage: {dataPath: data}\nquerying: {joins: {maxQueryBytes: 12345678}}",
+            Path.of("standalone.yaml"),
+            false,
+            Map.of("MONGOT_JOIN_MAX_CONCURRENT_BYTES", "536870912"));
+
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(12345678L);
   }
 
   @Test

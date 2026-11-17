@@ -37,14 +37,14 @@ ingestion:
   commitIntervalMillis: 1000
 querying:
   refreshIntervalMillis: 1000
-  joins:
-    maxQueryBytes: 33554432
-    maxConcurrentBytes: 268435456
 ```
 
-The join memory limits are estimated bytes per query and across all retained join cursors.
+Join memory admission defaults to one eighth of the JVM maximum heap across queries and
+cursors, with one eighth of that pool available to each query. Set
+`querying.joins.maxConcurrentBytes` to override the pool; an omitted `maxQueryBytes` derives
+its allowance from that effective pool. Both fields also accept explicit byte limits.
 `MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES` override the respective
-YAML values at startup. Values must be positive integer byte counts; see
+YAML values at startup. Explicit limits must be positive integer byte counts; see
 [join limits and errors](join-design-guide.md#limits-and-errors).
 
 Non-loopback listeners require TLS and bearer authentication. Paths resolve relative to the YAML file.
