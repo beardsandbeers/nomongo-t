@@ -188,6 +188,11 @@ public class MeteredSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
+    public void disableQueryCache() {
+      this.snapshot.disableQueryCache();
+    }
+
+    @Override
     public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
       return this.snapshot.joinFields(path);
     }

@@ -35,6 +35,44 @@ public class StandaloneSchemaUpdatesTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
   @Test
+  public void isGenerationReady_unpublishedCompatibleSchema_preservesLeaseUntilRebuild()
+      throws Exception {
+    try (var runtime = new StandaloneRuntime(config())) {
+      String id = create(runtime, "pending-schema");
+      try (var lease = runtime.reads().acquire(id, "")) {
+        var generation = lease.index().getGenerationId();
+        runtime
+            .updatesForTesting()
+            .atCheckpoint(
+                point -> {
+                  if (point == StandaloneIndexUpdates.Checkpoint.ACCEPTED) {
+                    throw new IllegalStateException("Publication has not completed");
+                  }
+                });
+
+        assertThrows(
+            IllegalStateException.class, () -> runtime.updateIndex(update(id, 1, UPDATED)));
+
+        assertThat(runtime.catalog().getIndex(id).getDesiredRevision()).isEqualTo(2);
+        assertThat(lease.retired()).isFalse();
+        assertThat(runtime.reads().isGenerationReady(generation)).isTrue();
+        assertThat(
+                assertThrows(StatusRuntimeException.class, () -> runtime.reads().acquire(id, ""))
+                    .getStatus()
+                    .getCode())
+            .isEqualTo(Status.Code.UNAVAILABLE);
+
+        runtime.updateIndex(
+            update(id, 2, UPDATED).toBuilder()
+                .setUpdateMode(IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
+                .build());
+
+        assertThat(runtime.reads().isGenerationReady(generation)).isFalse();
+      }
+    }
+  }
+
+  @Test
   public void update_concurrentSchemasAndWrites_keepsPhysicalIdentityAndAllAcceptedWrites()
       throws Exception {
     try (var runtime = new StandaloneRuntime(config());

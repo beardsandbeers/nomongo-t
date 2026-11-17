@@ -568,6 +568,23 @@ public final class LocalIndexCatalog implements Closeable {
     return require(id);
   }
 
+  /** Existing readers may finish through schema publication, but not a drop or rebuild. */
+  public synchronized boolean permitsReadContinuation(
+      GenerationId generation, long activeRevision) {
+    String id = generation.indexId.toHexString();
+    var desired = this.indexes.get(id);
+    if (desired == null) {
+      return false;
+    }
+    if (desired.getDefinitionVersion().orElse(1L) == activeRevision) {
+      return true;
+    }
+    var schema = this.schemas.get(id);
+    return schema != null
+        && schema.target().getGenerationId().equals(generation)
+        && schema.target().getIndexDefinition().equals(desired);
+  }
+
   /** Resolves an instance-wide name once; callers retain the returned stable identity. */
   public synchronized IndexDescription getIndexByName(String name) {
     return this.indexes.values().stream()

@@ -4,6 +4,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.catalog.IndexCatalog;
 import com.xgen.mongot.config.backup.JournalEntryIdentity;
 import com.xgen.mongot.config.manager.DefaultConfigManager;
 import com.xgen.mongot.config.manager.QuarantinedIndex;
@@ -12,7 +13,11 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
+import com.xgen.mongot.index.BatchProducer;
 import com.xgen.mongot.index.IndexMetricValuesSupplier;
+import com.xgen.mongot.index.SearchIndexReader;
+import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot;
+import com.xgen.mongot.index.SearchIndexReader.SearchProducerAndMetaResults;
 import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.vector.Similarity;
@@ -45,6 +50,7 @@ import com.xgen.mongot.standalone.grpc.StatsCollectionState;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
+import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -53,17 +59,26 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
+import org.apache.lucene.search.IndexSearcher;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.mockito.AdditionalAnswers;
+import org.mockito.ArgumentMatchers;
+import org.mockito.Mockito;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
@@ -3428,6 +3443,344 @@ public class StandaloneGrpcServerTest {
       assertThrows(
           IOException.class, () -> new StandaloneRuntime(StandaloneConfig.development(data, 0)));
     }
+  }
+
+  @Test
+  public void getMore_compatiblePublicationDuringReadinessCheck_preservesCursor() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("readiness-race", "{mappings:{fields:{title:{type:'string'}}}}");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var cursor =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      assertThat(cursor.getCursorId()).isNotEqualTo(0);
+      var live = f.runtime.liveIndexes();
+      var interleaved = Mockito.mock(IndexCatalog.class, AdditionalAnswers.delegatesTo(live));
+      var publish = new AtomicBoolean(true);
+      Mockito.doAnswer(
+              call -> {
+                var captured = live.getIndexById(call.getArgument(0));
+                if (publish.compareAndSet(true, false)) {
+                  f.runtime.updateIndex(
+                      UpdateIndexRequest.newBuilder()
+                          .setIndexId(id)
+                          .setExpectedRevision(1)
+                          .setDefinitionBson(
+                              bson(
+                                  "{mappings:{fields:{title:{type:'string'},tag:{type:'token'}}}}"))
+                          .build());
+                  assertThat(f.runtime.describeIndex(id).getGenerationId())
+                      .isEqualTo(cursor.getGenerationId());
+                  assertThat(f.runtime.describeIndex(id).getActiveRevision()).isEqualTo(2);
+                }
+                return captured;
+              })
+          .when(interleaved)
+          .getIndexById(ArgumentMatchers.any());
+      var field = f.runtime.reads().getClass().getDeclaredField("live");
+      field.setAccessible(true);
+      field.set(f.runtime.reads(), interleaved);
+
+      var more =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(cursor.getCursorId()).build());
+
+      assertThat(new RawBsonDocument(more.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+    }
+  }
+
+  @Test
+  public void search_serialSinglePartition_cachesOrdinaryQueriesOnly() throws Exception {
+    assertQueryCaching(1, false);
+  }
+
+  @Test
+  public void search_concurrentSinglePartition_cachesOrdinaryQueriesOnly() throws Exception {
+    assertQueryCaching(1, true);
+  }
+
+  @Test
+  public void search_serialMultiplePartitions_cachesOrdinaryQueriesOnly() throws Exception {
+    assertQueryCaching(2, false);
+  }
+
+  @Test
+  public void search_concurrentMultiplePartitions_cachesOrdinaryQueriesOnly() throws Exception {
+    assertQueryCaching(2, true);
+  }
+
+  private void assertQueryCaching(int partitions, boolean concurrent) throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "query-cache",
+              "{numPartitions:"
+                  + partitions
+                  + ",mappings:{fields:{title:{type:'string'},key:{type:'token'}}}}");
+      f.upsert(id, "{_id:'a',title:'coffee',key:'a'}");
+      var captured = captureSnapshot(f, id);
+      var plain = bson("{text:{path:'title',query:'coffee'},concurrent:" + concurrent + "}");
+      var join =
+          bson(
+              "{compound:{filter:[{join:{localField:'key',foreignField:'key',"
+                  + "operator:{exists:{path:'title'}}}}]},concurrent:"
+                  + concurrent
+                  + "}");
+
+      f.queries.search(QueryRequest.newBuilder().setIndexId(id).setQueryBson(plain).build());
+      var caches =
+          snapshotSearchers(captured.get().actual(), partitions).stream()
+              .map(IndexSearcher::getQueryCache)
+              .toList();
+      assertThat(caches).hasSize(partitions);
+      assertThat(caches).doesNotContain(null);
+
+      f.queries.search(QueryRequest.newBuilder().setIndexId(id).setQueryBson(join).build());
+      assertThat(
+              snapshotSearchers(captured.get().actual(), partitions).stream()
+                  .map(IndexSearcher::getQueryCache)
+                  .toList())
+          .containsExactlyElementsIn(Collections.nCopies(partitions, null));
+
+      f.queries.searchMeta(
+          SearchMetaRequest.newBuilder().setTargetIndexId(id).setQueryBson(plain).build());
+      assertThat(
+              snapshotSearchers(captured.get().actual(), partitions).stream()
+                  .map(IndexSearcher::getQueryCache)
+                  .toList())
+          .containsExactlyElementsIn(caches)
+          .inOrder();
+
+      f.queries.searchMeta(
+          SearchMetaRequest.newBuilder().setTargetIndexId(id).setQueryBson(join).build());
+      assertThat(
+              snapshotSearchers(captured.get().actual(), partitions).stream()
+                  .map(IndexSearcher::getQueryCache)
+                  .toList())
+          .containsExactlyElementsIn(Collections.nCopies(partitions, null));
+    }
+  }
+
+  private static List<IndexSearcher> snapshotSearchers(QuerySnapshot snapshot, int partitions)
+      throws Exception {
+    var wrapped = snapshot.getClass().getDeclaredField("snapshot");
+    wrapped.setAccessible(true);
+    var pinned = wrapped.get(snapshot);
+    List<?> snapshots;
+    if (partitions == 1) {
+      snapshots = List.of(pinned);
+    } else {
+      var children = pinned.getClass().getDeclaredField("snapshots");
+      children.setAccessible(true);
+      snapshots = (List<?>) children.get(pinned);
+    }
+    var searchers = new ArrayList<IndexSearcher>();
+    for (var child : snapshots) {
+      var referenceField = child.getClass().getDeclaredField("reference");
+      referenceField.setAccessible(true);
+      var reference = referenceField.get(child);
+      var getSearcher = reference.getClass().getDeclaredMethod("getIndexSearcher");
+      getSearcher.setAccessible(true);
+      searchers.add((IndexSearcher) getSearcher.invoke(reference));
+    }
+    return searchers;
+  }
+
+  @Test
+  public void search_deadlineBeforeLuceneWork_abortsScan() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("cancel-probe");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var finished = new CountDownLatch(1);
+      var completedUnderCancelledContext = new AtomicBoolean();
+      captureSnapshot(
+          f,
+          id,
+          (actual, observed) -> {
+            Mockito.doAnswer(
+                    call -> {
+                      var context = Context.current();
+                      var cancelled = new CountDownLatch(1);
+                      context.addListener(unused -> cancelled.countDown(), Runnable::run);
+                      try {
+                        assertThat(cancelled.await(5, TimeUnit.SECONDS)).isTrue();
+                        var result =
+                            actual.query(
+                                call.getArgument(0),
+                                call.getArgument(1),
+                                call.getArgument(2),
+                                call.getArgument(3));
+                        completedUnderCancelledContext.set(context.isCancelled());
+                        return result;
+                      } finally {
+                        finished.countDown();
+                      }
+                    })
+                .when(observed)
+                .query(
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any());
+          });
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries
+                      .withDeadlineAfter(1, TimeUnit.SECONDS)
+                      .search(
+                          QueryRequest.newBuilder()
+                              .setIndexId(id)
+                              .setQueryBson(
+                                  bson("{text:{path:'title',query:'coffee'},count:{type:'total'}}"))
+                              .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.DEADLINE_EXCEEDED);
+      assertThat(finished.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(completedUnderCancelledContext.get()).isFalse();
+    }
+  }
+
+  @Test
+  public void getMore_completedSearchAndExpiredGetMore_useCurrentRpcCancellation()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("get-more-cancellation");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      f.upsert(id, "{_id:'c',title:'coffee'}");
+      var searchFinished = new CountDownLatch(1);
+      var scanFinished = new CountDownLatch(1);
+      var expire = new AtomicBoolean();
+      var scannedAfterCancellation = new AtomicBoolean();
+      captureSnapshot(
+          f,
+          id,
+          (actual, observed) -> {
+            Mockito.doAnswer(
+                    call -> {
+                      Context.current()
+                          .addListener(unused -> searchFinished.countDown(), Runnable::run);
+                      var result =
+                          actual.query(
+                              call.getArgument(0),
+                              call.getArgument(1),
+                              call.getArgument(2),
+                              call.getArgument(3));
+                      var producer =
+                          Mockito.mock(
+                              BatchProducer.class,
+                              AdditionalAnswers.delegatesTo(result.searchBatchProducer));
+                      var searcher = snapshotSearchers(actual, 1).getFirst();
+                      Mockito.doAnswer(
+                              batch -> {
+                                if (!expire.get()) {
+                                  // Exercise the actual Lucene callback even when this small
+                                  // fixture has buffered hits.
+                                  searcher.getTimeout().shouldExit();
+                                  result.searchBatchProducer.execute(
+                                      batch.getArgument(0), batch.getArgument(1));
+                                  return null;
+                                }
+                                var cancelled = new CountDownLatch(1);
+                                Context.current()
+                                    .addListener(unused -> cancelled.countDown(), Runnable::run);
+                                try {
+                                  assertThat(cancelled.await(5, TimeUnit.SECONDS)).isTrue();
+                                  searcher.getTimeout().shouldExit();
+                                  scannedAfterCancellation.set(true);
+                                  result.searchBatchProducer.execute(
+                                      batch.getArgument(0), batch.getArgument(1));
+                                  return null;
+                                } finally {
+                                  scanFinished.countDown();
+                                }
+                              })
+                          .when(producer)
+                          .execute(ArgumentMatchers.any(), ArgumentMatchers.any());
+                      return new SearchProducerAndMetaResults(producer, result.metaResults);
+                    })
+                .when(observed)
+                .query(
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any(),
+                    ArgumentMatchers.any());
+          });
+      var first =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      assertThat(searchFinished.await(5, TimeUnit.SECONDS)).isTrue();
+
+      var request =
+          GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).setBatchSize(1).build();
+      var second = f.queries.getMore(request);
+      assertThat(new RawBsonDocument(second.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(second.getCursorId()).isEqualTo(first.getCursorId());
+      expire.set(true);
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () -> f.queries.withDeadlineAfter(1, TimeUnit.SECONDS).getMore(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.DEADLINE_EXCEEDED);
+      assertThat(scanFinished.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(scannedAfterCancellation.get()).isFalse();
+      assertThat(
+              assertThrows(StatusRuntimeException.class, () -> f.queries.getMore(request))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+    }
+  }
+
+  private interface SnapshotObserver {
+    void accept(QuerySnapshot actual, QuerySnapshot observed) throws Exception;
+  }
+
+  private record CapturedSnapshot(QuerySnapshot actual, QuerySnapshot observed) {}
+
+  private static AtomicReference<CapturedSnapshot> captureSnapshot(Fixture f, String id)
+      throws Exception {
+    return captureSnapshot(f, id, (actual, observed) -> {});
+  }
+
+  private static AtomicReference<CapturedSnapshot> captureSnapshot(
+      Fixture f, String id, SnapshotObserver observer) throws Exception {
+    var captured = new AtomicReference<CapturedSnapshot>();
+    try (var lease = f.runtime.reads().acquire(id, "")) {
+      var initialized = lease.index();
+      var reader = (SearchIndexReader) lease.reader();
+      var observedReader =
+          Mockito.mock(SearchIndexReader.class, AdditionalAnswers.delegatesTo(reader));
+      Mockito.doAnswer(
+              call -> {
+                var actual = reader.acquireQuerySnapshot(call.getArgument(0));
+                var observed =
+                    Mockito.mock(QuerySnapshot.class, AdditionalAnswers.delegatesTo(actual));
+                observer.accept(actual, observed);
+                captured.set(new CapturedSnapshot(actual, observed));
+                return observed;
+              })
+          .when(observedReader)
+          .acquireQuerySnapshot(ArgumentMatchers.anyBoolean());
+      var readerField = initialized.getClass().getDeclaredField("reader");
+      readerField.setAccessible(true);
+      readerField.set(initialized, observedReader);
+    }
+    return captured;
   }
 
   private Path data() {
