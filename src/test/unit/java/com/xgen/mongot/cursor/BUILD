@@ -4,6 +4,7 @@ java_test_suite(
     name = "cursor",
     srcs = [
         "CursorConfigTest.java",
+        "CursorFactoryTest.java",
         "CursorIdSupplierTest.java",
         "IndexCursorManagerImplTest.java",
         "MongotCursorManagerImplTest.java",

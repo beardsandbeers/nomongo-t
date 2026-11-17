@@ -638,6 +638,120 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void search_autoNumCandidatesDisabled_matchesSearchMetaValidation() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "default",
+              "{mappings:{dynamic:false,fields:{embedding:"
+                  + "{type:'vector',numDimensions:3,similarity:'cosine'}}}}");
+      f.upsert(id, "{_id:'near',embedding:[1.0,0.0,0.0]}");
+      var body = bson("{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],limit:1}}");
+
+      var metaError =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(SearchMetaRequest.newBuilder().setQueryBson(body).build()));
+      var searchError =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.search(
+                      QueryRequest.newBuilder().setIndexId(id).setQueryBson(body).build()));
+
+      assertThat(metaError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(searchError.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(searchError.getStatus().getDescription())
+          .isEqualTo(metaError.getStatus().getDescription());
+      assertThat(searchError).hasMessageThat().contains("numCandidates is required");
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_autoNumCandidatesDisabled_validatesBeforeIndexLookup() throws Exception {
+    try (var f = new Fixture(data())) {
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      metaRequest(
+                          "{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],limit:1}}")));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error).hasMessageThat().contains("numCandidates is required");
+    }
+  }
+
+  @Test
+  public void searchMeta_exactVectorSearchAcrossPartitions_returnsCountAndExplainWithoutCursor()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "default",
+              "{numPartitions:2,mappings:{dynamic:false,fields:{embedding:"
+                  + "{type:'vector',numDimensions:3,similarity:'cosine'}}}}");
+      f.upsert(id, "{_id:'near',embedding:[1.0,0.0,0.0]}");
+      f.upsert(id, "{_id:'far',embedding:[0.0,1.0,0.0]}");
+      f.upsert(id, "{_id:'missing'}");
+      String body =
+          "{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],exact:true,limit:2},"
+              + "count:{type:'total'}}";
+      var expected =
+          f.queries.search(
+              QueryRequest.newBuilder().setIndexId(id).setQueryBson(bson(body)).build());
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest(body).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(metadata(response))
+          .isEqualTo(new RawBsonDocument(expected.getMetadataBson().toByteArray()));
+      assertThat(metadata(response).getDocument("count").getInt64("total").getValue()).isEqualTo(2);
+      assertThat(response.getExplainBson()).isNotEmpty();
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_autoNumCandidatesEnabled_acceptsOmittedNumCandidates() throws Exception {
+    Similarity.load();
+    var flags =
+        FeatureFlags.withDefaults()
+            .enable(Feature.INDEX_FEATURE_VERSION_FOUR)
+            .enable(Feature.AUTO_NUM_CANDIDATES)
+            .build();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            flags,
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id =
+          f.create(
+              "default",
+              "{mappings:{dynamic:false,fields:{embedding:"
+                  + "{type:'vector',numDimensions:3,similarity:'cosine'}}}}");
+      f.upsert(id, "{_id:'near',embedding:[1.0,0.0,0.0]}");
+
+      var response =
+          f.queries.searchMeta(
+              metaRequest("{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],limit:1}}"));
+
+      assertThat(metadata(response))
+          .isEqualTo(BsonDocument.parse("{count:{lowerBound:{$numberLong:'1'}}}"));
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
   public void searchMeta_retainedCursorCapacityFull_stillSucceeds() throws Exception {
     try (var f = new Fixture(data())) {
       String id = f.create("default");

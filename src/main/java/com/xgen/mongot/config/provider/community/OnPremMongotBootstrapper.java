@@ -330,10 +330,6 @@ public class OnPremMongotBootstrapper {
                                 meterAndFtdcRegistry)));
     IndexCatalog nativeIndexes =
         coexistence.<IndexCatalog>map(extension -> extension.nativeIndexes()).orElse(indexCatalog);
-    MongotCursorManager nativeCursors =
-        coexistence
-            .<MongotCursorManager>map(extension -> extension.nativeCursors())
-            .orElse(cursorManager);
 
     var diskMonitorConfig = config.diskMonitorConfig();
     var diskMonitor =
@@ -416,6 +412,26 @@ public class OnPremMongotBootstrapper {
                 .ifThrowsExceptionOrError(() -> extension.attach(configManager)));
     ConfigManager nativeConfig =
         coexistence.<ConfigManager>map(extension -> extension.nativeConfig()).orElse(configManager);
+
+    java.util.function.Supplier<com.xgen.mongot.config.manager.ConfigState.SyncSourceSnapshot>
+        joinSource;
+    synchronized (configManager) {
+      joinSource = configManager.configState.syncSourceSnapshotSupplier();
+    }
+    var coupledJoins =
+        new com.xgen.mongot.standalone.coexistence.CoupledJoinService(
+            nativeIndexes,
+            initializedIndexCatalog,
+            mongodTopologyMonitor,
+            coexistence
+                .<QuarantinedIndexLookup>map(
+                    extension -> extension.nativeQuarantine(incompatibleIndexes))
+                .orElse(incompatibleIndexes),
+            syncSourceConfig,
+            joinSource,
+            meterRegistry);
+    MongotCursorManager nativeCursors =
+        new com.xgen.mongot.standalone.coexistence.NativeCursorManager(cursorManager, coupledJoins);
 
     var metadataUpdater =
         metadataUpdater(
@@ -506,6 +522,7 @@ public class OnPremMongotBootstrapper {
         metadataService::close,
         initialSyncHostProvider::close,
         mongodTopologyMonitor::close,
+        coupledJoins::close,
         // Flush and stop tracing before the logger is closed so buffered traces are not lost.
         () -> tracingProcessor.ifPresent(OnPremMongotBootstrapper::flushAndShutdownTracing),
         Logging::shutdown);

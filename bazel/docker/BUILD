@@ -1,7 +1,2 @@
-load("@rules_python//python:defs.bzl", "py_binary")
-
-py_binary(
-    name = "mongodb_versions",
-    srcs = ["mongodb_versions.py"],
-    python_version = "PY3",
-)
+# Docker dependencies are declared in this module; image versions are pinned by their consumers.
+exports_files(["docker.MODULE.bazel"])

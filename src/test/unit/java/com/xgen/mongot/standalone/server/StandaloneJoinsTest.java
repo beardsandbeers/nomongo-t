@@ -419,6 +419,7 @@ public class StandaloneJoinsTest {
       assertThat(preparation.getDocument("timing").getDouble("millisElapsed").getValue())
           .isAtLeast(0.0);
       var source = preparation.getArray("sources").getFirst().asDocument();
+      assertThat(source.getString("from").getValue()).isEqualTo("foreign");
       assertThat(source.getString("foreignIndexId").getValue()).isEqualTo(foreign);
       assertThat(source.getString("foreignGeneration").getValue()).startsWith(foreign);
       assertThat(source.getBoolean("selfJoin").getValue()).isFalse();

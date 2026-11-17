@@ -9,6 +9,7 @@ java_test_suite(
     ],
     tags = ["unit"],
     deps = [
+        "//src/main/java/com/xgen/mongot/extensions/join",
         "//src/main/java/com/xgen/mongot/featureflag",
         "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/metrics",

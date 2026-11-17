@@ -598,7 +598,10 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     if (query.returnScope().isEmpty()
         && query.returnStoredSource()
         && this.indexDefinition.getStoredSource().isAllExcluded()) {
-      throw new InvalidQueryException("storedSource is not configured for this index");
+      throw new InvalidQueryException(
+          "storedSource is not configured for this index. "
+              + "For queries on 'embeddedDocument' fields with 'storedSource', "
+              + "the 'returnScope' option must be populated");
     }
   }
 
@@ -609,14 +612,7 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
       BatchSizeStrategy batchSizeStrategy,
       QueryOptimizationFlags queryOptimizationFlags)
       throws IOException, InvalidQueryException, InterruptedException {
-    if (query.returnScope().isEmpty()
-        && query.returnStoredSource()
-        && this.indexDefinition.getStoredSource().isAllExcluded()) {
-      throw new InvalidQueryException(
-          "storedSource is not configured for this index. "
-              + "For queries on 'embeddedDocument' fields with 'storedSource', "
-              + "the 'returnScope' option must be populated");
-    }
+    validateStoredSource(query);
     try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
       ensureOpen("query");
       var searcherReference = createSearcherReference(query.concurrent());

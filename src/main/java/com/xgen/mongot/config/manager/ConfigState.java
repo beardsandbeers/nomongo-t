@@ -64,6 +64,15 @@ import org.slf4j.LoggerFactory;
  * members and the persisted config journal.
  */
 public class ConfigState {
+  /** Lock-free query source identity. Replication host selection does not change the epoch. */
+  public record SyncSourceSnapshot(long epoch, Optional<SyncSourceConfig> config) {}
+
+  private volatile SyncSourceSnapshot syncSourceSnapshot;
+
+  public Supplier<SyncSourceSnapshot> syncSourceSnapshotSupplier() {
+    return () -> this.syncSourceSnapshot;
+  }
+
   private Optional<Executor> retirementExecutor = Optional.empty();
   private final ConcurrentHashMap<GenerationId, IndexGeneration> retiring =
       new ConcurrentHashMap<>();
@@ -207,6 +216,7 @@ public class ConfigState {
 
     this.cursorManager = cursorManager;
     this.lifecycleManager = lifecycleManager;
+    this.syncSourceSnapshot = new SyncSourceSnapshot(0, lifecycleManager.getSyncSourceConfig());
     this.indexFactory = indexFactory;
     this.materializedViewIndexFactory = materializedViewIndexFactory;
     this.metricsFactory = metricsFactory;
@@ -253,10 +263,32 @@ public class ConfigState {
     return configState;
   }
 
+  /**
+   * Updates replication configuration, invalidating pinned queries only for logical source changes.
+   */
   public void updateSyncSource(SyncSourceConfig syncSourceConfig) {
+    // Single-host replication URIs change during SDAM discovery, outages, and failover. They
+    // do not retarget the metadata client or the pinned readers of an existing query.
+    boolean sameQuerySource =
+        this.syncSourceSnapshot
+            .config()
+            .filter(
+                previous ->
+                    previous.isSharded == syncSourceConfig.isSharded
+                        && previous.mongodClusterReadWriteUri.equals(
+                            syncSourceConfig.mongodClusterReadWriteUri)
+                        && previous.mongosClusterReadWriteUri.equals(
+                            syncSourceConfig.mongosClusterReadWriteUri))
+            .isPresent();
+    long epoch = this.syncSourceSnapshot.epoch() + (sameQuerySource ? 0 : 1);
+    if (!sameQuerySource) {
+      // Invalidate before a logical source change, including one that subsequently fails.
+      this.syncSourceSnapshot = new SyncSourceSnapshot(epoch, Optional.empty());
+    }
     this.lifecycleManager.updateSyncSource(syncSourceConfig);
     this.materializedViewIndexFactory.ifPresent(f -> f.updateSyncSource(syncSourceConfig));
     resetUnresolvedAutoEmbeddingIndexes();
+    this.syncSourceSnapshot = new SyncSourceSnapshot(epoch, Optional.of(syncSourceConfig));
   }
 
   /** This method is called when the {@link ConfigState} is initialized from the config journal. */

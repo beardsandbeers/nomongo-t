@@ -182,6 +182,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                 expression,
                 QueryOptimizationFlags.DEFAULT_OPTIONS,
                 this.runtime.searchQueryParseOptions());
+        this.runtime.validateSearchQuery(parsed);
         if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(parsed))) {
           joinPlan = this.joinPlanner.prepare(parsed, generation.getGenerationId());
           query = new CursorQuery.Search(joinPlan.query(), Optional.of(joinPlan.snapshot()));
@@ -266,7 +267,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     synchronized (lease) {
       try (var unused =
           Explain.setup(this.runtime.cursors().getExplainQueryState(request.getCursorId()))) {
-        lease.joinPlan.ifPresent(plan -> plan.activate(Context.current()));
+        var context = Context.current();
+        lease.joinPlan.ifPresent(
+            plan -> plan.activate(() -> StandaloneJoinPlanner.checkCancellation(context)));
         var batch =
             this.runtime
                 .cursors()

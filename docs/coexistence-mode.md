@@ -201,3 +201,7 @@ failure after replacement. This gate does not claim compatibility with every his
 The `community-compatible` Docker target matches the official image's root user and default
 `/mongot-community/config.default.yml` path so existing root-owned data remains readable. The
 standalone Docker target retains its non-root user and generated TLS/bearer configuration.
+
+Coupled inline joins through mongod are documented in [Joins through MongoDB](coupled-joins.md),
+including the accepted foreign-collection authorization caveat. The live integer join fixture now
+compares inline coupled queries as well as standalone joins with the MongoDB lookup oracle.

@@ -20,6 +20,7 @@ import tempfile
 import time
 import uuid
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 
 import bson
@@ -565,6 +566,96 @@ def exercise_delete_by_query(client, index):
     )
 
 
+def exercise_search_meta_facets(client, name):
+    index = client.call(
+        "CreateIndex",
+        {
+            "name": name + "-facets",
+            "type": "INDEX_TYPE_SEARCH",
+            "definitionBson": encoded(
+                {
+                    "numPartitions": 2,
+                    "mappings": {
+                        "dynamic": False,
+                        "fields": {
+                            "title": {"type": "string"},
+                            "brand": {"type": "token"},
+                            "created": {"type": "date"},
+                        },
+                    },
+                }
+            ),
+        },
+    )
+    index = ready(client, index["indexId"])
+    try:
+        documents = [
+            {
+                "_id": "a",
+                "title": "coffee",
+                "brand": ["Acme", "Acme"],
+                "created": datetime(2024, 1, 2),
+            },
+            {"_id": "b", "title": "coffee", "brand": "Acme", "created": datetime(2024, 1, 3)},
+            {"_id": "c", "title": "coffee", "brand": "Brew", "created": datetime(2024, 2, 2)},
+            {"_id": "d", "title": "tea", "brand": "Other", "created": datetime(2024, 2, 3)},
+        ]
+        client.call(
+            "Upsert",
+            {"indexId": index["indexId"], "documentsBson": [encoded(d) for d in documents]},
+        )
+        # This is the unchanged body of a coupled $searchMeta stage, including BSON dates.
+        stage_body = {
+            "index": index["name"],
+            "facet": {
+                "operator": {"text": {"path": "title", "query": "coffee"}},
+                "facets": {
+                    "brands": {"type": "string", "path": "brand", "numBuckets": 2},
+                    "dates": {
+                        "type": "date",
+                        "path": "created",
+                        "boundaries": [
+                            datetime(2024, 1, 1),
+                            datetime(2024, 2, 1),
+                            datetime(2024, 3, 1),
+                        ],
+                    },
+                },
+            },
+            "count": {"type": "total"},
+        }
+        response = client.call("SearchMeta", {"queryBson": encoded(stage_body)})
+        metadata = decoded(response["metadataBson"])
+        check(
+            metadata
+            == {
+                "count": {"total": Int64(3)},
+                "facet": {
+                    "brands": {
+                        "buckets": [
+                            {"_id": "Acme", "count": Int64(2)},
+                            {"_id": "Brew", "count": Int64(1)},
+                        ]
+                    },
+                    "dates": {
+                        "buckets": [
+                            {"_id": datetime(2024, 1, 1), "count": Int64(2)},
+                            {"_id": datetime(2024, 2, 1), "count": Int64(1)},
+                        ]
+                    },
+                },
+            },
+            f"SearchMeta returned the wrong partitioned facets: {metadata}",
+        )
+        check(isinstance(metadata["count"]["total"], Int64), "SearchMeta lost the BSON count type")
+        check(response["generationId"] == index["generationId"], "SearchMeta changed generations")
+    finally:
+        client.call(
+            "DropIndex",
+            {"indexId": index["indexId"], "expectedRevision": index["desiredRevision"]},
+        )
+
+
 def exercise(client):
     checks = []
     name = client.language + "-" + uuid.uuid4().hex
@@ -615,6 +706,10 @@ def exercise(client):
     )
     check(meta["generationId"] == text["generationId"], "SearchMeta used the wrong generation")
     checks.append("metadata-only search with unchanged stage syntax and identity fence")
+    exercise_search_meta_facets(client, name)
+    checks.append(
+        "metadata-only partitioned string/date facets with BSON types and no stored source"
+    )
     exercise_delete_by_query(client, other)
     checks.append("delete-by-query preview, visible deletion, and preservation of nonmatches")
     verify_explain(

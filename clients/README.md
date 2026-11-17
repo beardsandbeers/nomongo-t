@@ -331,6 +331,24 @@ Environment overrides: `MONGOT_PYTHON`, `MONGOT_MVN`, and per-language `MONGOT_*
 Release packaging remains in `scripts/standalone/package_release.py`; verification installs
 artifacts independently using `scripts/standalone/verify_release.py`. Neither publishes artifacts.
 
+Compare an actual MongoDB `$searchMeta` pipeline with the standalone RPC using the same engine
+build, data, mappings, and Community feature defaults:
+
+```sh
+clients/python/.venv/bin/python clients/tests/search_meta_parity.py \
+  --package /path/to/extracted/mongot-standalone \
+  --runtime-image mongot-standalone:local \
+  --mongodb-image mongo:8.3.17-noble --mongodb-version 8.3.17 \
+  --output /tmp/search-meta-parity-results
+```
+
+Both images must already exist locally. The runtime image supplies system libraries; its engine
+is replaced by the extracted package. The suite checks engine bytecode identity and the MongoDB
+version, and records image IDs. It compares BSON types, bucket ordering, absent metadata, accepted
+and rejected syntax, and query-error messages over 1/2/4 partitions, plus explain modes and empty
+indexes. It creates a private Docker network and volumes, uses random localhost ports and bounded
+CPU/memory, and removes only its own resources. The output directory must be new.
+
 ## Delete by query
 
 ```python
