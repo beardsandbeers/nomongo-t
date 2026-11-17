@@ -5,7 +5,11 @@ import org.bson.BsonValue;
 
 /** Internal binary membership and execution hints. Neither is serialized into a request. */
 public record MaterializedJoinOperator(
-    JoinOperator join, JoinField field, JoinKeySet keys, boolean exhaustive, int countThreshold)
+    JoinOperator join,
+    JoinField field,
+    JoinMembership membership,
+    boolean exhaustive,
+    int countThreshold)
     implements Operator {
 
   @Override

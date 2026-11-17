@@ -37,7 +37,7 @@ Full-text search, vector search, mappings, and analyzers build on the upstream e
 | Dual ingestion | Configure `syncSource.replicaSet` to run MongoDB replication alongside direct gRPC writes into separate standalone indexes in one process. See [configuration](docs/coexistence-mode.md). |
 | Standalone indexes | Run without MongoDB. Create independent named indexes and write BSON directly through gRPC `Upsert` and `Delete`. Each index owns its content and lifecycle. |
 | Delete by query | `DeleteByQuery` exhausts matching roots in pinned readers, with parallel segment collection, native bulk deletes, dry runs, and no client-supplied document limit. See the [API guide](docs/standalone-mongot.md#delete-by-query). |
-| Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. See [join examples](#join-searches-across-indexes). |
+| Inline `join` search predicate | Filter or exclude local documents using matching keys from another index or the same index, while retaining local relevance, sorting, counts, and facets. Eligible string and ObjectId joins retry with ordinal bitmaps when hash membership reaches a key or memory limit, including keys spread across segments. Memory admission scales with the JVM heap and is shared across both APIs. See [join examples](#join-searches-across-indexes), [strategy selection](docs/join-design-guide.md#adaptive-choice-during-join-preparation), and [memory limits](docs/join-design-guide.md#limits-and-errors). |
 | Coupled joins through MongoDB | Source builds support inline joins in `$search` and `$searchMeta` over replicated indexes in the same database and non-sharded mongot deployment. See [syntax, limits, and the authorization caveat](docs/coupled-joins.md). |
 | Public gRPC API and four clients | Manage indexes, ingest documents, search, and page results from Python, Rust, Java, and TypeScript, with TLS and bearer tokens restricted by role and index. See the [client guide](clients/README.md). |
 | Concurrent gRPC ingestion | Apply batches concurrently to the same or different indexes. Writes default to `INDEXED`; background reader refresh and commits default to one second. Request `VISIBLE` or `COMMITTED` when needed. See [write behavior](#write-behavior-and-persistence). |
@@ -456,7 +456,8 @@ docker run --detach --name nomongo-t \
 
 `--config` selects your YAML file instead of automatic credential generation. The
 `MONGOT_CONTROL_*` variables configure `mongotctl` and Docker's health check; the server itself
-reads its settings from YAML.
+reads its settings from YAML, with optional environment overrides for
+[join memory limits](docs/join-design-guide.md#limits-and-errors).
 
 For a certificate issued only to a service hostname such as `search.example.com`, replace the
 control address above and add a container-local hostname mapping:
@@ -504,6 +505,15 @@ ingestion:
 querying:
   refreshIntervalMillis: 1000
 ```
+
+Join memory defaults to one eighth of the JVM maximum heap for the shared process pool
+and one eighth of that pool per query. `querying.joins.maxConcurrentBytes` overrides the
+pool; an omitted `maxQueryBytes` follows the effective pool size. Set `maxQueryBytes`
+explicitly to override the per-query allowance. `MONGOT_JOIN_MAX_QUERY_BYTES` and
+`MONGOT_JOIN_MAX_CONCURRENT_BYTES` override the respective YAML settings. With a MongoDB
+`syncSource`, configure them under `standalone.querying.joins`. Both APIs share the pool,
+including cursor-held reservations for local dictionary buffers. See
+[join limits](docs/join-design-guide.md#limits-and-errors) for scope and examples.
 
 See the [operating guide](docs/standalone-mongot.md) for all settings and index-level permissions.
 

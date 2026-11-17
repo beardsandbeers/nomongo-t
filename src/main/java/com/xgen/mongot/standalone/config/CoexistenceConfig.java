@@ -54,7 +54,7 @@ public final class CoexistenceConfig {
     var fields = extension.fieldNames();
     while (fields.hasNext()) {
       String field = fields.next();
-      if (!Set.of("grpc", "ingestion").contains(field)) {
+      if (!Set.of("grpc", "ingestion", "querying").contains(field)) {
         throw new IOException(
             "Unknown standalone configuration field: "
                 + field

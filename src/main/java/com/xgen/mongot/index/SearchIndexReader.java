@@ -13,8 +13,10 @@ import com.xgen.mongot.util.FieldPath;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Consumer;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.search.Collector;
 import org.apache.lucene.util.BytesRef;
 
 public interface SearchIndexReader extends IndexReader {
@@ -23,6 +25,19 @@ public interface SearchIndexReader extends IndexReader {
   interface QuerySnapshot extends Closeable {
     default int partitions() {
       return 1;
+    }
+
+    /** The caller must use the partition views before closing or transferring this snapshot. */
+    default Optional<List<OrdinalJoinPartition>> ordinalJoinPartitions() {
+      return Optional.empty();
+    }
+
+    record OrdinalJoinPartition(org.apache.lucene.index.IndexReader reader, ForeignSearch search) {}
+
+    @FunctionalInterface
+    interface ForeignSearch {
+      void collect(Operator predicate, Collector collector, Runnable checkWork)
+          throws IOException, InvalidQueryException;
     }
 
     void setCancellationCheck(Runnable check);

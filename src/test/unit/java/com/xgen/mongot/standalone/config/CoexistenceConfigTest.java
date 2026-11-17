@@ -3,6 +3,7 @@ package com.xgen.mongot.standalone.config;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.xgen.mongot.extensions.join.JoinPlanner.MemoryLimits;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.file.Files;
@@ -22,6 +23,8 @@ public class CoexistenceConfigTest {
     var parsed = CoexistenceConfig.fromFile(Optional.of(file), data(), address(), false);
 
     assertThat(parsed).isPresent();
+    assertThat(parsed.orElseThrow().joinMemoryLimits())
+        .isEqualTo(MemoryLimits.fromHeapBytes(Runtime.getRuntime().maxMemory()));
   }
 
   @Test
@@ -34,6 +37,32 @@ public class CoexistenceConfigTest {
     assertThat(parsed.address()).isEqualTo(address());
     assertThat(parsed.dataPath()).isEqualTo(data().toAbsolutePath());
     assertThat(parsed.documentLimits()).isEqualTo(StandaloneConfig.Limits.defaults());
+  }
+
+  @Test
+  public void fromFile_joinMemoryLimits_preservesSharedPlannerConfiguration() throws Exception {
+    var file =
+        config(
+            "standalone:\n"
+                + "  querying:\n"
+                + "    joins: {maxQueryBytes: 67108864, maxConcurrentBytes: 536870912}\n");
+
+    var parsed =
+        CoexistenceConfig.fromFile(Optional.of(file), data(), address(), false).orElseThrow();
+
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(67108864L);
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+  }
+
+  @Test
+  public void fromFile_onlyConcurrentJoinLimit_derivesSharedQueryAllowance() throws Exception {
+    var file = config("standalone: {querying: {joins: {maxConcurrentBytes: 536870912}}}\n");
+
+    var parsed =
+        CoexistenceConfig.fromFile(Optional.of(file), data(), address(), false).orElseThrow();
+
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(67108864L);
   }
 
   @Test

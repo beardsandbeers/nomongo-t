@@ -1,0 +1,46 @@
+{
+  "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.43",
+  "cpu_count": 4,
+  "revision": "191743b502ff66328a9ee6714f981b910db933f5",
+  "dirty": true,
+  "forks": 2,
+  "warmups_per_shape_and_strategy": 10,
+  "samples_per_shape_and_strategy_and_fork": 20,
+  "scan_before_seek": 4,
+  "shapes": [
+    "selectiveTop10",
+    "broadCount"
+  ],
+  "cases": {
+    "low-overlap": {
+      "kind": "objectId",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 1000000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "sparse-objectid": {
+      "kind": "objectId",
+      "foreign-keys": 1000000,
+      "selected-keys": 10000,
+      "local-docs": 2000000,
+      "local-keys": 1000000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    }
+  },
+  "cache": "query caches disabled; warm FSDirectory readers; no transport or production admission",
+  "memory": {
+    "allocated": "ThreadMXBean thread allocation delta over preparation plus search",
+    "retained": "Lucene RamUsageTester graph size of prepared membership query; excludes readers",
+    "peak_membership": "owned membership structures during preparation; hash+current seen set sampled at leaf boundaries/every 4096 documents, or sum of foreign/local ordinal bitmaps; excludes iterators, reallocation overlap, and query rewrite; not JVM heap high-water mark"
+  },
+  "elapsed_seconds": 74.20026858290657,
+  "java_runtime": "21.0.11",
+  "lucene_fork": "10.4.0-5",
+  "heap": "-Xms768m -Xmx1536m"
+}

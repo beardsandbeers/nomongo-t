@@ -1,6 +1,7 @@
 load("//bazel/java:test.bzl", "java_test_suite", "mongot_java_unit_test_suite")
 
 _TEST_DEPS = [
+    "//src/test/bench/java/com/xgen/mongot/index/lucene/query:ordinal_join_prototype",
     "//src/main/java/com/xgen/mongot/index/lucene/explain/joins",
     "//src/main/java/com/xgen/mongot/featureflag",
     "//src/main/java/com/xgen/mongot/featureflag/dynamic",
@@ -122,7 +123,10 @@ mongot_java_unit_test_suite(
     name = "lib",
     exclude_files = glob(
         ["*.java"],
-        exclude = ["AdaptiveJoinQueryTest.java"],
+        exclude = [
+            "AdaptiveJoinQueryTest.java",
+            "OrdinalJoinQueryTest.java",
+        ],
     ),
     deps = _TEST_DEPS,  # keep: shared with the separate custom test suite
 )

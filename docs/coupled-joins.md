@@ -57,9 +57,18 @@ existing dependency grants and direct query access.
 
 ## Bounds and implementation
 
-Both APIs share the planner and one retained-memory budget: eight predicates, 100,000 distinct keys,
-32 MiB estimated memory per query, 256 MiB estimated retained memory per process, and 10,000,000
-foreign-work checkpoints. Reservations live until cursor close, exhaustion, expiry, or failure.
+Both APIs share the planner and one retained-memory budget. Defaults are eight predicates,
+100,000 distinct hash keys, 1,000,000 distinct ordinal keys, and 10,000,000 preparation work
+checkpoints. The shared join memory pool defaults to one eighth of the JVM maximum heap;
+the default per-query allowance is one eighth of the effective pool. Local ordinal dictionary
+buffers remain reserved for the cursor's lifetime, alongside membership and scorer state.
+The planner may use ordinal bitmaps for large string or ObjectId joins with a foreign `exists`
+predicate on the join key. Cursor reservations live until close, exhaustion, expiry, or failure.
+
+Configure memory at startup with `standalone.querying.joins.maxQueryBytes` and
+`standalone.querying.joins.maxConcurrentBytes` in YAML, or override them with
+`MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES`. Values are positive integer
+byte counts. See [limits and errors](join-design-guide.md#limits-and-errors) for details.
 
 Coupled preparation admits four requests at a time and rejects overload. Its separate four-connection
 metadata pool does not use replication connections. Each lookup has a two-second operation timeout,

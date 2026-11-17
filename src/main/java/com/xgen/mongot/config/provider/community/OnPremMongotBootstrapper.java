@@ -429,7 +429,8 @@ public class OnPremMongotBootstrapper {
                 .orElse(incompatibleIndexes),
             syncSourceConfig,
             joinSource,
-            meterRegistry);
+            meterRegistry,
+            standaloneConfig.orElseThrow().joinMemoryLimits());
     MongotCursorManager nativeCursors =
         new com.xgen.mongot.standalone.coexistence.NativeCursorManager(cursorManager, coupledJoins);
 

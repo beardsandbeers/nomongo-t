@@ -4,7 +4,9 @@ import com.xgen.mongot.index.lucene.explain.joins.JoinFeatureExplainer;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.query.custom.NumericJoinQuery;
 import com.xgen.mongot.index.query.operators.JoinField;
+import com.xgen.mongot.index.query.operators.JoinKeySet;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
+import com.xgen.mongot.index.query.operators.OrdinalJoinMembership;
 import java.util.Optional;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
@@ -21,19 +23,25 @@ final class JoinQueryFactory {
     String field = typeField.getLuceneFieldName(operator.join().localField(), Optional.empty());
     var explain =
         JoinFeatureExplainer.forJoin(
-            operator.keys(),
+            operator.membership(),
             field,
             operator.field().type().name(),
             operator.exhaustive(),
             operator.countThreshold());
-    if (operator.keys().size() == 0) {
+    if (operator.membership().size() == 0) {
       explain.ifPresent(trace -> trace.strategy("empty", "noForeignKeys"));
       return new MatchNoDocsQuery("No foreign join keys");
     }
-    if (operator.field().type() == JoinField.Type.INT64) {
-      return new NumericJoinQuery(field, operator.keys(), explain);
-    }
-    return new AdaptiveJoinQuery(
-        field, operator.keys(), operator.exhaustive(), operator.countThreshold(), explain);
+    return switch (operator.membership()) {
+      case OrdinalJoinMembership ordinals -> {
+        explain.ifPresent(trace -> trace.strategy("ordinalBitmap", ordinals.selectionReason()));
+        yield new OrdinalJoinQuery(field, ordinals, explain);
+      }
+      case JoinKeySet keys ->
+          operator.field().type() == JoinField.Type.INT64
+              ? new NumericJoinQuery(field, keys, explain)
+              : new AdaptiveJoinQuery(
+                  field, keys, operator.exhaustive(), operator.countThreshold(), explain);
+    };
   }
 }

@@ -58,6 +58,7 @@ public final class CoupledJoinService implements AutoCloseable {
   private final SyncSourceConfig configuredSource;
   private final MongoClient metadata;
   private final MeterRegistry metrics;
+  private final JoinPlanner.MemoryLimits memoryLimits;
   private final Semaphore preparation = new Semaphore(4);
 
   /** Creates a bounded metadata pool isolated from replication and ordinary queries. */
@@ -68,7 +69,8 @@ public final class CoupledJoinService implements AutoCloseable {
       QuarantinedIndexLookup quarantine,
       SyncSourceConfig configuredSource,
       Supplier<SyncSourceSnapshot> source,
-      MeterRegistry metrics) {
+      MeterRegistry metrics,
+      JoinPlanner.MemoryLimits memoryLimits) {
     this(
         indexes,
         initialized,
@@ -77,6 +79,7 @@ public final class CoupledJoinService implements AutoCloseable {
         configuredSource,
         source,
         metrics,
+        memoryLimits,
         createMetadataClient(configuredSource));
   }
 
@@ -88,8 +91,10 @@ public final class CoupledJoinService implements AutoCloseable {
       SyncSourceConfig configuredSource,
       Supplier<SyncSourceSnapshot> source,
       MeterRegistry metrics,
+      JoinPlanner.MemoryLimits memoryLimits,
       MongoClient metadata) {
     this.metrics = metrics;
+    this.memoryLimits = memoryLimits;
     metrics.gauge("coupled.joins.reservedBytes", this, ignored -> JoinPlanner.retainedBytes());
     this.indexes = indexes;
     this.initialized = initialized;
@@ -264,7 +269,9 @@ public final class CoupledJoinService implements AutoCloseable {
               return new Failure(message);
             }
           };
-      var plan = new JoinPlanner(environment).prepare(query, outer.get().getGenerationId());
+      var plan =
+          new JoinPlanner(environment, this.memoryLimits)
+              .prepare(query, outer.get().getGenerationId());
       var prepared = new Prepared(plan, outer.get().getGenerationId());
       prepared.validateInitial =
           () -> {

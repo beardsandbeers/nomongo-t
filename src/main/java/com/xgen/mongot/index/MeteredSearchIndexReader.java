@@ -193,6 +193,11 @@ public class MeteredSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
+    public Optional<List<OrdinalJoinPartition>> ordinalJoinPartitions() {
+      return this.snapshot.ordinalJoinPartitions();
+    }
+
+    @Override
     public void collectKeys(
         Operator operator,
         FieldPath path,

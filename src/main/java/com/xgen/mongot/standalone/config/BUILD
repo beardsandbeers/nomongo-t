@@ -8,6 +8,7 @@ java_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        "//src/main/java/com/xgen/mongot/extensions/join",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "@maven//:com_fasterxml_jackson_core_jackson_core",
         "@maven//:com_fasterxml_jackson_core_jackson_databind",

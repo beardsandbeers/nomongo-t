@@ -359,6 +359,19 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
+    public Optional<List<OrdinalJoinPartition>> ordinalJoinPartitions() {
+      List<OrdinalJoinPartition> partitions = new ArrayList<>();
+      for (var snapshot : this.snapshots) {
+        var views = snapshot.ordinalJoinPartitions();
+        if (views.isEmpty()) {
+          return Optional.empty();
+        }
+        partitions.addAll(views.get());
+      }
+      return Optional.of(List.copyOf(partitions));
+    }
+
+    @Override
     public void collectKeys(
         Operator operator,
         FieldPath path,

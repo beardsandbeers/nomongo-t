@@ -23,7 +23,7 @@ final class StandaloneJoinPlanner extends JoinPlanner {
   private final StandaloneRuntime runtime;
 
   StandaloneJoinPlanner(StandaloneRuntime runtime) {
-    super(new DirectEnvironment(runtime, Map.of()));
+    super(new DirectEnvironment(runtime, Map.of()), runtime.config().joinMemoryLimits());
     this.runtime = runtime;
     runtime.metrics().gauge("joins.reservedBytes", runtime, ignored -> JoinPlanner.retainedBytes());
   }
@@ -46,7 +46,9 @@ final class StandaloneJoinPlanner extends JoinPlanner {
       StandaloneAuthInterceptor.requireIndex(binding.getIndexId());
     }
     // Resolution state belongs to this plan, including bindings and acquired generation leases.
-    return new JoinPlanner(new DirectEnvironment(this.runtime, Map.copyOf(bound)))
+    return new JoinPlanner(
+            new DirectEnvironment(this.runtime, Map.copyOf(bound)),
+            this.runtime.config().joinMemoryLimits())
         .prepare(query, localGeneration);
   }
 

@@ -7,6 +7,7 @@ import com.google.protobuf.ByteString;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.batch.BatchCursorOptions;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
+import com.xgen.mongot.extensions.join.JoinPlanner.MemoryLimits;
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.lucene.explain.information.JoinExplainInformation;
 import com.xgen.mongot.index.query.OperatorQuery;
@@ -1580,6 +1581,198 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_denseJoin_choosesOrdinalsForTotalAndHashForFirstPage() throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(1L << 28, 1L << 29))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(52_000, 1));
+      f.upsert(local, "{_id:'first',parent:'x0'}");
+      f.upsert(local, "{_id:'second',parent:'x51999'}");
+      f.upsert(local, "{_id:'miss',parent:'absent'}");
+      String total = JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}");
+      String firstPage = total.replace("type:'total'", "type:'lowerBound'");
+      var totalRequest =
+          request(local, total, 100).toBuilder()
+              .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+              .build();
+
+      var ordinal = f.queries.search(totalRequest);
+      var hash =
+          f.queries.search(
+              totalRequest.toBuilder()
+                  .setQueryBson(request(local, firstPage, 100).getQueryBson())
+                  .build());
+
+      assertThat(ids(ordinal)).containsExactly("first", "second");
+      assertThat(
+              new RawBsonDocument(ordinal.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getNumber("total")
+                  .longValue())
+          .isEqualTo(2);
+      assertThat(ids(hash)).containsExactlyElementsIn(ids(ordinal));
+      assertJoinStrategy(ordinal, "ordinalBitmap");
+      assertJoinStrategy(hash, "adaptive");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_segmentedFirstPageAboveHashCap_retriesOrdinalsAndPreservesCursor()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(1L << 28, 1L << 29))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(75_000, 1));
+      var secondForeign = BsonDocument.parse(keyDocument(75_000, 2));
+      secondForeign.put("_id", new org.bson.BsonString("q"));
+      f.upsert(foreign, secondForeign.toJson());
+      f.upsert(local, "{_id:'first',parent:'x0'}");
+      f.upsert(local, "{_id:'second',parent:'xx74999'}");
+      f.upsert(local, "{_id:'miss',parent:'absent'}");
+      String firstPage =
+          JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}")
+              .replace("type:'total'", "type:'lowerBound'");
+
+      var first =
+          f.queries.search(
+              request(local, firstPage, 1).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertJoinStrategy(first, "ordinalBitmap");
+      var explain = new RawBsonDocument(first.getExplainBson().toByteArray());
+      assertThat(
+              explain
+                  .getDocument("joins")
+                  .getDocument("preparation")
+                  .getInt32("keyCount")
+                  .getValue())
+          .isEqualTo(150_000);
+      assertThat(
+              explain
+                  .getArray("indexPartitionExplain")
+                  .getFirst()
+                  .asDocument()
+                  .getDocument("joins")
+                  .getArray("execution")
+                  .getFirst()
+                  .asDocument()
+                  .getString("selectionReason")
+                  .getValue())
+          .isEqualTo("hashAdmissionLimitExceeded");
+      assertThat(first.getCursorId()).isNotEqualTo(0L);
+      assertThat(reservedBytes(f)).isGreaterThan(0.0);
+      assertThat(reservedBytes(f)).isLessThan(1024 * 1024.0);
+      var next =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
+      var allIds = new java.util.ArrayList<>(ids(first));
+      allIds.addAll(ids(next));
+      assertThat(allIds).containsExactly("first", "second");
+      assertThat(next.getCursorId()).isEqualTo(0L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_denseJoinAboveHashCap_preservesSortedCursorAndReleasesMemory()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(100_001, 1));
+      f.upsert(local, "{_id:'first',key:'a',parent:'x100000'}");
+      f.upsert(local, "{_id:'second',key:'b',parent:'x0'}");
+      f.upsert(local, "{_id:'miss',key:'0',parent:'absent'}");
+      String sorted =
+          JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}")
+              .replace("count:{type:'total'}", "count:{type:'lowerBound'},sort:{key:1}");
+
+      var first = f.search(local, sorted, 1);
+
+      assertThat(ids(first)).containsExactly("first");
+      assertThat(first.getCursorId()).isNotEqualTo(0L);
+      assertThat(reservedBytes(f)).isGreaterThan(0.0);
+      assertThat(reservedBytes(f)).isLessThan(1024 * 1024.0);
+      var next =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
+      assertThat(ids(next)).containsExactly("second");
+      assertThat(next.getCursorId()).isEqualTo(0L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  private static void assertJoinStrategy(QueryResponse response, String strategy) {
+    var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+    for (var partition : explain.getArray("indexPartitionExplain")) {
+      assertThat(
+              partition
+                  .asDocument()
+                  .getDocument("joins")
+                  .getArray("execution")
+                  .getFirst()
+                  .asDocument()
+                  .getString("strategy")
+                  .getValue())
+          .isEqualTo(strategy);
+    }
+  }
+
+  @Test
+  public void search_largerHeapBudget_acceptsMembershipAboveSmallerHeapLimit() throws Exception {
+    try (var f = new Fixture(data(), List.of(), MemoryLimits.fromHeapBytes(4L << 30))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(120, 7000));
+      f.upsert(local, "{_id:'match',parent:'" + "x".repeat(7000) + "0'}");
+
+      var response =
+          f.queries.search(
+              request(local, JOIN, 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(ids(response)).containsExactly("match");
+      var preparation =
+          new RawBsonDocument(response.getExplainBson().toByteArray())
+              .getDocument("joins")
+              .getDocument("preparation");
+      var limits = preparation.getDocument("limits");
+      assertThat(limits.getInt64("memoryBytes").getValue()).isEqualTo(67108864L);
+      assertThat(limits.getInt64("concurrentMemoryBytes").getValue()).isEqualTo(536870912L);
+      assertThat(preparation.getInt64("reservedBytes").getValue()).isGreaterThan(33554432L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_configuredConcurrentBudget_rejectsUntilRetainedCursorCloses()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(300000L, 300000L))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      f.upsert(local, "{_id:'first',parent:'a'}");
+      f.upsert(local, "{_id:'second',parent:'a'}");
+      var first = f.search(local, JOIN, 1);
+      double reserved = reservedBytes(f);
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(error.getStatus().getDescription())
+          .contains("Concurrent join-memory limit exceeded (limit: 300000 bytes, reserved: ");
+      assertThat(error.getStatus().getDescription()).contains("bytes, requested: ");
+      assertThat(reservedBytes(f)).isEqualTo(reserved);
+
+      f.queries.killCursor(KillCursorRequest.newBuilder().setCursorId(first.getCursorId()).build());
+
+      assertThat(ids(f.search(local, JOIN, 100))).containsExactly("first", "second");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
   public void search_repeatedMemoryBudgetFailures_releasesReservationsForLaterQueries()
       throws Exception {
     try (var f = new Fixture(data(), List.of())) {
@@ -1610,6 +1803,9 @@ public class StandaloneJoinsTest {
     for (int attempt = 0; attempt < 10; attempt++) {
       var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
       assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(error.getStatus().getDescription())
+          .contains("Join query-memory limit exceeded (limit: 33554432 bytes, reserved: ");
+      assertThat(error.getStatus().getDescription()).contains("bytes, requested: ");
     }
   }
 
@@ -1942,6 +2138,22 @@ public class StandaloneJoinsTest {
 
     private Fixture(Path data, List<StandaloneConfig.Principal> principals, long minFreeDiskBytes)
         throws Exception {
+      // Keep admission tests independent of the JVM heap chosen by the test runner.
+      this(data, principals, minFreeDiskBytes, MemoryLimits.fromHeapBytes(2L << 30));
+    }
+
+    private Fixture(
+        Path data, List<StandaloneConfig.Principal> principals, MemoryLimits memoryLimits)
+        throws Exception {
+      this(data, principals, 0, memoryLimits);
+    }
+
+    private Fixture(
+        Path data,
+        List<StandaloneConfig.Principal> principals,
+        long minFreeDiskBytes,
+        MemoryLimits memoryLimits)
+        throws Exception {
       var base = StandaloneConfig.development(data, 0);
       var config =
           new StandaloneConfig(
@@ -1955,7 +2167,9 @@ public class StandaloneJoinsTest {
               base.refreshInterval(),
               base.maxRpcDuration(),
               base.tls(),
-              principals);
+              principals,
+              false,
+              memoryLimits);
       this.runtime = new StandaloneRuntime(config);
       this.server = new StandaloneGrpcServer(this.runtime).start();
       this.channel =

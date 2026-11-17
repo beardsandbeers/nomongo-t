@@ -10,7 +10,7 @@ import com.xgen.mongot.index.lucene.explain.information.SearchExplainInformation
 import com.xgen.mongot.index.lucene.explain.timing.QueryExecutionArea;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.explain.tracing.FeatureExplainer;
-import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.index.query.operators.JoinMembership;
 import com.xgen.mongot.util.timers.InvocationCountingTimer;
 import com.xgen.mongot.util.timers.ThreadSafeInvocationCountingTimer;
 import java.util.IdentityHashMap;
@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.LongAdder;
 /** Query-scoped join preparation and partition-scoped execution, retained across cursor batches. */
 public final class JoinFeatureExplainer implements FeatureExplainer {
   private final boolean executionStats;
-  private final Map<JoinKeySet, Integer> ids = new IdentityHashMap<>();
+  private final Map<JoinMembership, Integer> ids = new IdentityHashMap<>();
   private final Map<Integer, JoinSourceInformation> sources = new TreeMap<>();
   private final Map<Integer, Execution> executions = new TreeMap<>();
   private Optional<JoinPreparationInformation> preparation = Optional.empty();
@@ -44,7 +44,7 @@ public final class JoinFeatureExplainer implements FeatureExplainer {
   }
 
   public static Optional<Execution> forJoin(
-      JoinKeySet keys, String field, String keyType, boolean exhaustive, int countThreshold) {
+      JoinMembership keys, String field, String keyType, boolean exhaustive, int countThreshold) {
     return Explain.getQueryInfo()
         .map(
             info -> {
@@ -56,7 +56,7 @@ public final class JoinFeatureExplainer implements FeatureExplainer {
             });
   }
 
-  public synchronized int register(JoinKeySet keys) {
+  public synchronized int register(JoinMembership keys) {
     return this.ids.computeIfAbsent(keys, ignored -> this.ids.size());
   }
 
