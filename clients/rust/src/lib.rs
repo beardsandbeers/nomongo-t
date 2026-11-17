@@ -164,14 +164,33 @@ impl Client {
         &mut self,
         message: ListIndexesRequest,
     ) -> Result<ListIndexesResponse, Status> {
+        let requires_contract =
+            message.ownership != 0 || message.page_size != 0 || !message.page_token.is_empty();
         let mut request = Request::new(message);
+        if requires_contract {
+            request.metadata_mut().insert(
+                "mongot-direct-read-contract",
+                "all-index-reads-v1".parse().unwrap(),
+            );
+        }
         request.set_timeout(self.timeout);
-        Ok(self
+        let response = self
             .catalog
             .list_indexes(request)
             .await
-            .map_err(normalize_status)?
-            .into_inner())
+            .map_err(normalize_status)?;
+        if requires_contract
+            && response
+                .metadata()
+                .get("mongot-direct-read-contract")
+                .and_then(|value| value.to_str().ok())
+                != Some("all-index-reads-v1")
+        {
+            return Err(Status::failed_precondition(
+                "Server does not support the all-index direct read contract",
+            ));
+        }
+        Ok(response.into_inner())
     }
     pub async fn get_index_mappings(
         &mut self,
@@ -223,37 +242,108 @@ impl Client {
             .into_inner())
     }
     pub async fn search(&mut self, message: QueryRequest) -> Result<QueryResponse, Status> {
+        let requires_contract = !message.join_indexes.is_empty();
         let mut request = Request::new(message);
+        if requires_contract {
+            request.metadata_mut().insert(
+                "mongot-direct-read-contract",
+                "all-index-reads-v1".parse().unwrap(),
+            );
+        }
         request.set_timeout(self.timeout);
-        Ok(self
+        let response = self
             .queries
             .search(request)
             .await
-            .map_err(normalize_status)?
-            .into_inner())
+            .map_err(normalize_status)?;
+        if requires_contract
+            && response
+                .metadata()
+                .get("mongot-direct-read-contract")
+                .and_then(|value| value.to_str().ok())
+                != Some("all-index-reads-v1")
+        {
+            if response.get_ref().cursor_id != 0 {
+                let mut cleanup = Request::new(KillCursorRequest {
+                    cursor_id: response.get_ref().cursor_id,
+                });
+                cleanup.set_timeout(self.timeout.min(Duration::from_secs(5)));
+                // Keep the contract error even if the legacy server cannot release its cursor.
+                let _ = self.queries.kill_cursor(cleanup).await;
+            }
+            return Err(Status::failed_precondition(
+                "Server does not support the all-index direct read contract",
+            ));
+        }
+        Ok(response.into_inner())
     }
     pub async fn search_meta(
         &mut self,
         message: SearchMetaRequest,
     ) -> Result<SearchMetaResponse, Status> {
+        let requires_contract =
+            !message.target_index_id.is_empty() || !message.join_indexes.is_empty();
         let mut request = Request::new(message);
+        if requires_contract {
+            request.metadata_mut().insert(
+                "mongot-direct-read-contract",
+                "all-index-reads-v1".parse().unwrap(),
+            );
+        }
         request.set_timeout(self.timeout);
-        Ok(self
+        let response = self
             .queries
             .search_meta(request)
             .await
-            .map_err(normalize_status)?
-            .into_inner())
+            .map_err(normalize_status)?;
+        if requires_contract
+            && response
+                .metadata()
+                .get("mongot-direct-read-contract")
+                .and_then(|value| value.to_str().ok())
+                != Some("all-index-reads-v1")
+        {
+            return Err(Status::failed_precondition(
+                "Server does not support the all-index direct read contract",
+            ));
+        }
+        Ok(response.into_inner())
     }
     pub async fn vector_search(&mut self, message: QueryRequest) -> Result<QueryResponse, Status> {
+        let requires_contract = !message.join_indexes.is_empty();
         let mut request = Request::new(message);
+        if requires_contract {
+            request.metadata_mut().insert(
+                "mongot-direct-read-contract",
+                "all-index-reads-v1".parse().unwrap(),
+            );
+        }
         request.set_timeout(self.timeout);
-        Ok(self
+        let response = self
             .queries
             .vector_search(request)
             .await
-            .map_err(normalize_status)?
-            .into_inner())
+            .map_err(normalize_status)?;
+        if requires_contract
+            && response
+                .metadata()
+                .get("mongot-direct-read-contract")
+                .and_then(|value| value.to_str().ok())
+                != Some("all-index-reads-v1")
+        {
+            if response.get_ref().cursor_id != 0 {
+                let mut cleanup = Request::new(KillCursorRequest {
+                    cursor_id: response.get_ref().cursor_id,
+                });
+                cleanup.set_timeout(self.timeout.min(Duration::from_secs(5)));
+                // Keep the contract error even if the legacy server cannot release its cursor.
+                let _ = self.queries.kill_cursor(cleanup).await;
+            }
+            return Err(Status::failed_precondition(
+                "Server does not support the all-index direct read contract",
+            ));
+        }
+        Ok(response.into_inner())
     }
     pub async fn get_more(&mut self, message: GetMoreRequest) -> Result<QueryResponse, Status> {
         let mut request = Request::new(message);

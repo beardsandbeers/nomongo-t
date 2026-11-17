@@ -30,6 +30,9 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
   private static final Context.Key<String> OPERATION = Context.key("standalone-operation");
   private static final Metadata.Key<String> AUTHORIZATION =
       Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
+  private static final Metadata.Key<String> READ_CONTRACT =
+      Metadata.Key.of("mongot-direct-read-contract", Metadata.ASCII_STRING_MARSHALLER);
+  private static final String READ_CONTRACT_VERSION = "all-index-reads-v1";
   private static final Principal LOCAL =
       new Principal("local", new byte[0], Set.of(Role.values()), Set.of("*"));
   private final StandaloneConfig config;
@@ -76,6 +79,12 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
     Principal principal;
     try {
       principal = authenticate(call, headers);
+      String contract = headers.get(READ_CONTRACT);
+      if (contract != null && !contract.equals(READ_CONTRACT_VERSION)) {
+        throw Status.FAILED_PRECONDITION
+            .withDescription("Unsupported direct read contract")
+            .asRuntimeException();
+      }
       String service = call.getMethodDescriptor().getServiceName();
       Role role =
           service != null
@@ -112,9 +121,17 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
             context.cancel(null);
           }
         };
+    var acknowledged =
+        new io.grpc.ForwardingServerCall.SimpleForwardingServerCall<ReqT, RespT>(call) {
+          @Override
+          public void sendHeaders(Metadata responseHeaders) {
+            responseHeaders.put(READ_CONTRACT, READ_CONTRACT_VERSION);
+            super.sendHeaders(responseHeaders);
+          }
+        };
     try {
       return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(
-          Contexts.interceptCall(context, call, headers, next)) {
+          Contexts.interceptCall(context, acknowledged, headers, next)) {
         @Override
         public void onComplete() {
           try {

@@ -2,12 +2,27 @@ package com.xgen.mongot.standalone.runtime;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.catalog.InitializedIndexCatalog;
+import com.xgen.mongot.config.manager.DefaultConfigManager;
+import com.xgen.mongot.embedding.config.MaterializedViewCollectionMetadata.MaterializedViewSchemaMetadata;
+import com.xgen.mongot.index.IndexGeneration;
+import com.xgen.mongot.index.autoembedding.AutoEmbeddingCompositeIndex;
+import com.xgen.mongot.index.autoembedding.AutoEmbeddingIndexGeneration;
+import com.xgen.mongot.index.autoembedding.InitializedMaterializedViewIndex;
+import com.xgen.mongot.index.autoembedding.UnresolvedAutoEmbeddingIndexGeneration;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.VectorSimilarity;
+import com.xgen.mongot.index.definition.quantization.VectorAutoEmbedQuantization;
+import com.xgen.mongot.index.lucene.vector.Similarity;
 import com.xgen.mongot.index.statistics.IndexStatistics;
 import com.xgen.mongot.index.statistics.LuceneStatisticsCollector;
 import com.xgen.mongot.index.statistics.LuceneStatisticsSnapshot;
+import com.xgen.mongot.index.status.IndexStatus;
+import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
@@ -15,17 +30,23 @@ import com.xgen.mongot.standalone.grpc.DocumentWriteConcern;
 import com.xgen.mongot.standalone.grpc.GetIndexFieldStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexStatsRequest;
 import com.xgen.mongot.standalone.grpc.IndexFieldStatsResponse;
+import com.xgen.mongot.standalone.grpc.IndexOwnership;
 import com.xgen.mongot.standalone.grpc.IndexStats;
 import com.xgen.mongot.standalone.grpc.IndexType;
 import com.xgen.mongot.standalone.grpc.StatsCollectionState;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
+import com.xgen.mongot.util.FieldPath;
+import com.xgen.testing.mongot.index.definition.VectorIndexDefinitionBuilder;
+import com.xgen.testing.mongot.index.definition.VectorIndexDefinitionGenerationBuilder;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -44,6 +65,177 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneIndexStatisticsTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void fields_offlineAutoEmbedding_reportsCostsOnLogicalField() throws Exception {
+    assertAutoEmbeddingFieldStatistics(false, 1);
+  }
+
+  @Test
+  public void fields_resolvedAutoEmbedding_reportsCostsAcrossPartitions() throws Exception {
+    assertAutoEmbeddingFieldStatistics(true, 2);
+  }
+
+  private void assertAutoEmbeddingFieldStatistics(boolean resolved, int partitions)
+      throws Exception {
+    Similarity.load();
+    try (var fixture = new Fixture()) {
+      String id =
+          fixture
+              .runtime
+              .catalog()
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("derived-vector")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{numPartitions:"
+                                  + partitions
+                                  + ",fields:[{type:'vector',path:'_autoEmbed.title',"
+                                  + "numDimensions:3,"
+                                  + "similarity:'cosine'}]}"))
+                      .build())
+              .getIndexId();
+      fixture.runtime.catalogChanged();
+      fixture.ready(id, 1);
+      fixture.write(id, "{_id:'a',_autoEmbed:{title:[1.0,0.0,0.0]}}");
+      fixture.write(id, "{_id:'b',_autoEmbed:{title:[0.0,1.0,0.0]}}");
+      fixture.stopReconciliation();
+      var physical = fixture.runtime.liveIndexes().getIndexById(new ObjectId(id)).orElseThrow();
+      var logical =
+          VectorIndexDefinitionBuilder.builder()
+              .indexId(new ObjectId(id))
+              .name("derived-vector")
+              .numPartitions(partitions)
+              .withDefinitionVersion(Optional.of(1L))
+              .withAutoEmbedField(
+                  "title",
+                  "voyage-3-large",
+                  3,
+                  VectorAutoEmbedQuantization.FLOAT,
+                  VectorSimilarity.COSINE)
+              .build();
+      var rawGeneration =
+          VectorIndexDefinitionGenerationBuilder.builder()
+              .definition(logical)
+              .generation(physical.getGenerationId().generation)
+              .build();
+      var manager = fixture.configManager();
+      var initialized = fixture.initializedIndexes();
+      var derived = initialized.getIndex(physical.getGenerationId()).orElseThrow();
+      var mapping = Map.of(FieldPath.parse("title"), FieldPath.parse("_autoEmbed.title"));
+      IndexGeneration logicalGeneration;
+      if (resolved) {
+        // The external materialized-view metadata is the only mocked resource; the reader is real.
+        var view = mock(InitializedMaterializedViewIndex.class);
+        when(view.isCompatibleWith(logical)).thenReturn(true);
+        when(view.getDefinition()).thenReturn(logical);
+        when(view.getStatus()).thenReturn(IndexStatus.steady());
+        when(view.isCurrentVersionQueryablePerLease()).thenReturn(true);
+        when(view.getSchemaMetadata()).thenReturn(new MaterializedViewSchemaMetadata(1L, mapping));
+        logicalGeneration =
+            new AutoEmbeddingIndexGeneration(
+                new AutoEmbeddingCompositeIndex(
+                    view, physical.getIndex(), () -> Optional.of(derived)),
+                rawGeneration,
+                physical.getDefinitionGeneration());
+      } else {
+        logicalGeneration =
+            UnresolvedAutoEmbeddingIndexGeneration.createStale(rawGeneration, derived, mapping);
+      }
+      var remote =
+          new DirectReadCatalog.RemoteDefinitions() {
+            @Override
+            public List<IndexDefinition> snapshot() {
+              return List.of(logical);
+            }
+
+            @Override
+            public Optional<IndexDefinition> get(ObjectId key) {
+              return key.toHexString().equals(id) ? Optional.of(logical) : Optional.empty();
+            }
+          };
+      try (var local = new LocalIndexCatalog(this.folder.newFolder().toPath())) {
+        synchronized (manager) {
+          fixture.runtime.liveIndexes().addIndex(logicalGeneration);
+        }
+        var reads =
+            new DirectReadCatalog(
+                local, manager, fixture.runtime.liveIndexes(), initialized, remote, new Object());
+        assertThat(reads.describe(id).getOwnership())
+            .isEqualTo(IndexOwnership.INDEX_OWNERSHIP_REPLICATED);
+        try (var stats =
+            new StandaloneIndexStatistics(
+                reads, Duration.ofSeconds(5), StandaloneMetrics.disabled())) {
+          var full =
+              readyFields(stats, GetIndexFieldStatsRequest.newBuilder().setIndexId(id).build());
+          var selected =
+              readyFields(
+                  stats,
+                  GetIndexFieldStatsRequest.newBuilder().setIndexId(id).addPaths("title").build());
+          var physicalSelection =
+              readyFields(
+                  stats,
+                  GetIndexFieldStatsRequest.newBuilder()
+                      .setIndexId(id)
+                      .addPaths("_autoEmbed.title")
+                      .build());
+          assertThat(full.getFieldsList()).hasSize(1);
+          assertThat(selected.getFieldsList()).containsExactlyElementsIn(full.getFieldsList());
+          assertThat(physicalSelection.getFieldsList()).isEmpty();
+          var field = selected.getFields(0);
+          assertThat(field.getPath()).isEqualTo("title");
+          assertThat(field.getConfigured()).isTrue();
+          assertThat(field.getObserved()).isTrue();
+          assertThat(field.getAttributedDiskBytes().getValue()).isGreaterThan(0);
+          assertThat(field.getDesiredVectorOffHeapBytes().getValue()).isGreaterThan(0);
+          assertThat(
+                  field.getRepresentationsList().stream()
+                      .map(value -> value.getPhysicalName())
+                      .toList())
+              .containsExactly("$type:knnVector/_autoEmbed.title");
+          assertThat(field.getAttributedDiskBytes().getValue())
+              .isEqualTo(full.getTotalAttributedDiskBytes());
+          assertThat(
+                  full.getTotalAttributedDiskBytes()
+                      + full.getSharedDiskBytes()
+                      + full.getUnattributedDiskBytes())
+              .isEqualTo(full.getIndexStats().getIndexSizeBytes());
+          assertThat(full.getIndexStats().getDocumentCount()).isEqualTo(2);
+          assertThat(full.getIndexStats().getGenerationId())
+              .isEqualTo(physical.getGenerationId().uniqueString());
+          assertThat(
+                  full.getStorageBucketsList().stream()
+                      .flatMap(bucket -> bucket.getOwnersList().stream())
+                      .toList())
+              .doesNotContain("_autoEmbed.title");
+          assertThat(
+                  full.getMemoryBucketsList().stream()
+                      .flatMap(bucket -> bucket.getOwnersList().stream())
+                      .toList())
+              .doesNotContain("_autoEmbed.title");
+        } finally {
+          synchronized (manager) {
+            fixture.runtime.liveIndexes().addIndex(physical);
+          }
+        }
+      }
+    }
+  }
+
+  private static IndexFieldStatsResponse readyFields(
+      StandaloneIndexStatistics stats, GetIndexFieldStatsRequest request) throws Exception {
+    long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (System.nanoTime() < until) {
+      var response = stats.fields(request, "reader");
+      if (response.getState() == StatsCollectionState.STATS_COLLECTION_STATE_READY) {
+        return response;
+      }
+      Thread.sleep(10);
+    }
+    throw new AssertionError("Field statistics did not finish");
+  }
 
   @Test
   public void summary_cacheAndRefresh_observesWritesAfterCacheExpiry() throws Exception {
@@ -213,10 +405,9 @@ public class StandaloneIndexStatisticsTest {
       assertThat(blocker.calls.get()).isEqualTo(2);
       first.cancel(false);
       assertThat(duplicate.isDone()).isFalse();
-      var generation =
-          fixture.runtime.liveIndexes().getIndexById(new ObjectId(ids.get(0))).orElseThrow();
-      fixture.runtime.ingestion().dropIndex(generation.getGenerationId()).get(5, TimeUnit.SECONDS);
-      assertThrows(CompletionException.class, duplicate::join);
+      fixture.runtime.reads().invalidate(ids.get(0));
+      assertThrows(
+          CompletionException.class, () -> duplicate.orTimeout(5, TimeUnit.SECONDS).join());
       cancel(queued);
       blocker.release.countDown();
       assertThat(second.get(5, TimeUnit.SECONDS).getDocumentCount()).isEqualTo(0);
@@ -241,7 +432,8 @@ public class StandaloneIndexStatisticsTest {
         IndexDefinition definition,
         boolean detailed,
         OptionalLong writerHeap,
-        BooleanSupplier cancelled)
+        BooleanSupplier cancelled,
+        Map<FieldPath, FieldPath> logicalToPhysical)
         throws IOException {
       this.calls.incrementAndGet();
       this.started.countDown();
@@ -256,7 +448,7 @@ public class StandaloneIndexStatisticsTest {
         throw new CancellationException();
       }
       return LuceneStatisticsCollector.collect(
-          snapshot, definition, detailed, writerHeap, cancelled);
+          snapshot, definition, detailed, writerHeap, cancelled, logicalToPhysical);
     }
   }
 
@@ -276,13 +468,31 @@ public class StandaloneIndexStatisticsTest {
                   StandaloneIndexStatisticsTest.this.folder.newFolder().toPath(), 0));
       this.statistics =
           new StandaloneIndexStatistics(
-              this.runtime.catalog(),
-              this.runtime.liveIndexes(),
-              this.runtime.ingestion(),
+              this.runtime.reads(),
               Duration.ofMinutes(1),
               StandaloneMetrics.disabled(),
               this.time::get,
               collector);
+    }
+
+    private void stopReconciliation() throws Exception {
+      var field = StandaloneRuntime.class.getDeclaredField("reconciler");
+      field.setAccessible(true);
+      var reconciler = (java.util.concurrent.ScheduledThreadPoolExecutor) field.get(this.runtime);
+      reconciler.shutdown();
+      assertThat(reconciler.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+    }
+
+    private DefaultConfigManager configManager() throws Exception {
+      var field = StandaloneRuntime.class.getDeclaredField("configManager");
+      field.setAccessible(true);
+      return (DefaultConfigManager) field.get(this.runtime);
+    }
+
+    private InitializedIndexCatalog initializedIndexes() throws Exception {
+      var field = StandaloneRuntime.class.getDeclaredField("initializedIndexes");
+      field.setAccessible(true);
+      return (InitializedIndexCatalog) field.get(this.runtime);
     }
 
     private String create(String name) throws Exception {

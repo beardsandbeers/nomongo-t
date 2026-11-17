@@ -206,6 +206,11 @@ public final class LocalIndexCatalog implements Closeable {
     return describe(require(id));
   }
 
+  /** Resolves desired state without rendering a public metadata response. */
+  public synchronized IndexDefinition getDefinition(String id) {
+    return require(id);
+  }
+
   /** Resolves an instance-wide name once; callers retain the returned stable identity. */
   public synchronized IndexDescription getIndexByName(String name) {
     return this.indexes.values().stream()
@@ -288,6 +293,12 @@ public final class LocalIndexCatalog implements Closeable {
         .setIndexId(definition.getIndexId().toHexString())
         .setName(definition.getName())
         .setType(type(definition))
+        .setOwnership(com.xgen.mongot.standalone.grpc.IndexOwnership.INDEX_OWNERSHIP_STANDALONE)
+        .setDesiredVersion(
+            com.xgen.mongot.standalone.grpc.IndexVersion.newBuilder()
+                .setDomain(
+                    com.xgen.mongot.standalone.grpc.IndexVersion.Domain.DOMAIN_STANDALONE_REVISION)
+                .setDefinitionVersion(definition.getDefinitionVersion().orElse(1L)))
         .setDesiredRevision(definition.getDefinitionVersion().orElse(1L))
         .setDesiredDefinitionBson(
             ByteString.copyFrom(StandaloneDefinitionValidator.normalize(definition)))

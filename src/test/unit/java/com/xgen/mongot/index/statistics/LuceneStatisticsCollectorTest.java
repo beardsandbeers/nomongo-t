@@ -55,6 +55,76 @@ public class LuceneStatisticsCollectorTest {
   }
 
   @Test
+  public void collect_derivedVectorAndLexicalSource_mergesLogicalCostsAndPreservesTotals()
+      throws Exception {
+    try (var directory = FSDirectory.open(this.folder.getRoot().toPath());
+        var writer = new IndexWriter(directory, config())) {
+      writer.addDocument(document("a"));
+      writer.addDocument(document("b"));
+      try (var reader = DirectoryReader.open(writer);
+          var snapshot = LuceneStatisticsSnapshot.retain(reader, 27)) {
+        var original =
+            LuceneStatisticsCollector.collect(
+                snapshot,
+                SearchIndexDefinitionBuilder.VALID_INDEX,
+                true,
+                OptionalLong.empty(),
+                () -> false);
+
+        var mapped =
+            LuceneStatisticsCollector.collect(
+                snapshot,
+                SearchIndexDefinitionBuilder.VALID_INDEX,
+                true,
+                OptionalLong.empty(),
+                () -> false,
+                Map.of(FieldPath.parse("title"), FieldPath.parse("embedding")));
+
+        var logical =
+            mapped.fields().stream()
+                .filter(field -> field.path().equals("title"))
+                .findFirst()
+                .orElseThrow();
+        var vector =
+            original.fields().stream()
+                .filter(field -> field.path().equals("embedding"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(logical.observed()).isTrue();
+        assertThat(logical.disk().value().orElseThrow())
+            .isAtLeast(vector.disk().value().orElseThrow());
+        assertThat(logical.desiredVectorOffHeap()).isEqualTo(vector.desiredVectorOffHeap());
+        assertThat(logical.representations().stream().map(value -> value.physicalName()).toList())
+            .containsAtLeast("$type:string/title", "$type:knnVector/embedding");
+        assertThat(mapped.fields().stream().map(value -> value.path()).toList())
+            .doesNotContain("embedding");
+        assertThat(mapped.indexSizeBytes()).isEqualTo(original.indexSizeBytes());
+        assertThat(mapped.documentCount()).isEqualTo(original.documentCount());
+        assertThat(
+                mapped.attributedDiskBytes()
+                    + mapped.sharedDiskBytes()
+                    + mapped.unattributedDiskBytes())
+            .isEqualTo(mapped.indexSizeBytes());
+        assertThat(
+                mapped.fields().stream()
+                    .mapToLong(field -> field.disk().value().orElseThrow())
+                    .sum())
+            .isEqualTo(mapped.attributedDiskBytes());
+        assertThat(
+                mapped.storageBuckets().stream()
+                    .flatMap(bucket -> bucket.owners().stream())
+                    .toList())
+            .doesNotContain("embedding");
+        assertThat(
+                mapped.memoryBuckets().stream()
+                    .flatMap(bucket -> bucket.owners().stream())
+                    .toList())
+            .doesNotContain("embedding");
+      }
+    }
+  }
+
+  @Test
   public void collect_supportedCodecAndCompoundFiles_reconcilesStorageAndVectorMemory()
       throws Exception {
     try (var directory = FSDirectory.open(this.folder.getRoot().toPath());

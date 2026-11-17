@@ -56,6 +56,31 @@ class Client(DocumentCommandsMixin):
     def __exit__(self, *_):
         self.close()
 
+    def _read(self, method, request, timeout, requires_contract=False):
+        if not requires_contract:
+            return method(
+                request,
+                timeout=self.timeout if timeout is None else timeout,
+                metadata=self.metadata,
+            )
+        response, call = method.with_call(
+            request,
+            timeout=self.timeout if timeout is None else timeout,
+            metadata=self.metadata + (("mongot-direct-read-contract", "all-index-reads-v1"),),
+        )
+        if dict(call.initial_metadata()).get("mongot-direct-read-contract") != "all-index-reads-v1":
+            if isinstance(response, api.QueryResponse) and response.cursor_id:
+                try:
+                    self.queries.KillCursor(
+                        api.KillCursorRequest(cursor_id=response.cursor_id),
+                        timeout=min(self.timeout if timeout is None else timeout, 5),
+                        metadata=self.metadata,
+                    )
+                except grpc.RpcError:
+                    pass  # Preserve the contract error even if the server cannot release its cursor.
+            raise RuntimeError("Server does not support the all-index direct read contract")
+        return response
+
     def create_index(
         self, request: api.CreateIndexRequest, *, timeout=None
     ) -> api.IndexDescription:
@@ -91,10 +116,11 @@ class Client(DocumentCommandsMixin):
     def list_indexes(
         self, request: api.ListIndexesRequest, *, timeout=None
     ) -> api.ListIndexesResponse:
-        return self.catalog.ListIndexes(
+        return self._read(
+            self.catalog.ListIndexes,
             request,
-            timeout=self.timeout if timeout is None else timeout,
-            metadata=self.metadata,
+            timeout,
+            bool(request.ownership or request.page_size or request.page_token),
         )
 
     def get_index_mappings(
@@ -130,27 +156,20 @@ class Client(DocumentCommandsMixin):
         )
 
     def search(self, request: api.QueryRequest, *, timeout=None) -> api.QueryResponse:
-        return self.queries.Search(
-            request,
-            timeout=self.timeout if timeout is None else timeout,
-            metadata=self.metadata,
-        )
+        return self._read(self.queries.Search, request, timeout, bool(request.join_indexes))
 
     def search_meta(
         self, request: api.SearchMetaRequest, *, timeout=None
     ) -> api.SearchMetaResponse:
-        return self.queries.SearchMeta(
+        return self._read(
+            self.queries.SearchMeta,
             request,
-            timeout=self.timeout if timeout is None else timeout,
-            metadata=self.metadata,
+            timeout,
+            bool(request.target_index_id or request.join_indexes),
         )
 
     def vector_search(self, request: api.QueryRequest, *, timeout=None) -> api.QueryResponse:
-        return self.queries.VectorSearch(
-            request,
-            timeout=self.timeout if timeout is None else timeout,
-            metadata=self.metadata,
-        )
+        return self._read(self.queries.VectorSearch, request, timeout, bool(request.join_indexes))
 
     def get_more(self, request: api.GetMoreRequest, *, timeout=None) -> api.QueryResponse:
         return self.queries.GetMore(

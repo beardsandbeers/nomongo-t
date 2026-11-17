@@ -12,7 +12,8 @@
   },
   "scripts": {
     "generate": "node -e \"require('fs').rmSync('src/generated', {recursive:true, force:true})\" && proto-loader-gen-types --longs=String --enums=String --defaults --oneofs --grpcLib=@grpc/grpc-js --outDir=src/generated ../../src/proto/standalone/v1/standalone.proto",
-    "build": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && npm run generate && tsc && node -e \"require('fs').copyFileSync('../../src/proto/standalone/v1/standalone.proto', 'dist/standalone.proto')\""
+    "build": "node -e \"require('fs').rmSync('dist', {recursive:true, force:true})\" && npm run generate && tsc && node -e \"require('fs').copyFileSync('../../src/proto/standalone/v1/standalone.proto', 'dist/standalone.proto')\"",
+    "test": "npm run build && node --test test/*.test.cjs"
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.0",

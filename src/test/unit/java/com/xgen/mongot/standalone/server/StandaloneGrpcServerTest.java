@@ -4,12 +4,17 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.config.backup.JournalEntryIdentity;
+import com.xgen.mongot.config.manager.DefaultConfigManager;
+import com.xgen.mongot.config.manager.QuarantinedIndex;
 import com.xgen.mongot.featureflag.Feature;
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
+import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.lucene.vector.Similarity;
+import com.xgen.mongot.index.version.Generation;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
@@ -60,6 +65,321 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void vectorSearch_autoNumCandidatesDisabled_requiresExplicitCandidates() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id = f.createVector();
+      f.upsert(id, "{_id:'near',v:[1.0,0.0,0.0]}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(bson("{path:'v',queryVector:[1.0,0.0,0.0],limit:1}"))
+              .build();
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.queries.vectorSearch(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription())
+          .isEqualTo("numCandidates is required for approximate vector search");
+      assertThat(f.hasOpenCursors(id)).isFalse();
+      var response =
+          f.queries.vectorSearch(
+              request.toBuilder()
+                  .setQueryBson(
+                      bson("{path:'v',queryVector:[1.0,0.0,0.0],numCandidates:10,limit:1}"))
+                  .build());
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+    }
+  }
+
+  @Test
+  public void vectorSearch_autoNumCandidatesEnabled_acceptsOmittedCandidates() throws Exception {
+    Similarity.load();
+    var flags =
+        FeatureFlags.withDefaults()
+            .enable(Feature.INDEX_FEATURE_VERSION_FOUR)
+            .enable(Feature.AUTO_NUM_CANDIDATES)
+            .build();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            flags,
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.createVector();
+      f.upsert(id, "{_id:'near',v:[1.0,0.0,0.0]}");
+
+      var response =
+          f.queries.vectorSearch(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(bson("{path:'v',queryVector:[1.0,0.0,0.0],limit:1}"))
+                  .build());
+
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_quarantinedExplicitTarget_reportsIncompatibility() throws Exception {
+    try (var f = new Fixture(data())) {
+      var manager = f.stopReconciliation();
+      var id = new org.bson.types.ObjectId();
+      var identity =
+          new JournalEntryIdentity(
+              id, "database", java.util.UUID.randomUUID(), "unreadable", Generation.FIRST);
+      var quarantine =
+          new QuarantinedIndex(
+              identity,
+              IndexDefinitionGeneration.Type.SEARCH,
+              "Unsupported mapping",
+              new BsonDocument());
+      synchronized (manager) {
+        manager.configState.incompatibleIndexes.addLiveIndex(quarantine);
+      }
+      assertThat(
+              f.catalog
+                  .getIndex(GetIndexRequest.newBuilder().setIndexId(id.toHexString()).build())
+                  .getLifecycleState())
+          .isEqualTo("QUARANTINED");
+      var query = bson("{exists:{path:'title'},count:{type:'total'}}");
+      var search =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.search(
+                      QueryRequest.newBuilder()
+                          .setIndexId(id.toHexString())
+                          .setQueryBson(query)
+                          .build()));
+
+      var meta =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setTargetIndexId(id.toHexString())
+                          .setQueryBson(query)
+                          .build()));
+
+      assertThat(search.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(meta.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(meta.getStatus().getDescription()).isEqualTo(search.getStatus().getDescription());
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+    }
+  }
+
+  @Test
+  public void searchMeta_quarantinedReplacement_queriesHealthyActiveGeneration() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("healthy");
+      f.upsert(id, "{_id:1,title:'coffee'}");
+      var active = f.runtime.reads().resolve(id, "");
+      var definition = active.getDefinition();
+      var manager = f.stopReconciliation();
+      var identity =
+          new JournalEntryIdentity(
+              definition.getIndexId(),
+              definition.getDatabase(),
+              definition.getCollectionUuid(),
+              definition.getName(),
+              active.getGenerationId().generation.incrementUser());
+      var quarantine =
+          new QuarantinedIndex(
+              identity,
+              IndexDefinitionGeneration.Type.SEARCH,
+              "Unsupported replacement",
+              new BsonDocument());
+      synchronized (manager) {
+        manager.configState.incompatibleIndexes.addStagedIndex(quarantine);
+      }
+      var description = f.catalog.getIndex(GetIndexRequest.newBuilder().setIndexId(id).build());
+      assertThat(description.getLifecycleState()).isEqualTo("FAILED");
+      assertThat(description.getQueryable()).isTrue();
+
+      var response =
+          f.queries.searchMeta(
+              SearchMetaRequest.newBuilder()
+                  .setTargetIndexId(id)
+                  .setQueryBson(bson("{exists:{path:'title'},count:{type:'total'}}"))
+                  .build());
+
+      assertThat(response.getGenerationId()).isEqualTo(active.getGenerationId().uniqueString());
+      assertThat(metadata(response).getDocument("count").getInt64("total").getValue()).isEqualTo(1);
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_vectorIndex_rejectsTypeAndReleasesLease() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("vector")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      var manager = f.stopReconciliation();
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setTargetIndexId(id)
+                          .setQueryBson(bson("{exists:{path:'title'},count:{type:'total'}}"))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription())
+          .isEqualTo("SearchMeta requires a search index");
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void cursors_sameGeneration_isolatesNativeOriginAndDirectInvalidation() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("shared");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var direct =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      var nativeManager =
+          new com.xgen.mongot.standalone.coexistence.NativeCursorManager(f.runtime.cursors());
+      var generation = f.runtime.reads().resolve(id, "");
+      var definition = generation.getDefinition();
+      var nativeCursor =
+          nativeManager.newCursor(
+              definition.getDatabase(),
+              definition.getLastObservedCollectionName(),
+              definition.getCollectionUuid(),
+              Optional.empty(),
+              new com.xgen.mongot.cursor.CursorQuery.Search(
+                  com.xgen.mongot.index.query.SearchQuery.fromBson(
+                      BsonDocument.parse("{index:'shared',text:{path:'title',query:'coffee'}}"),
+                      com.xgen.mongot.index.query.QueryOptimizationFlags.DEFAULT_OPTIONS)),
+              com.xgen.mongot.cursor.batch.QueryCursorOptions.empty(),
+              com.xgen.mongot.index.query.QueryOptimizationFlags.DEFAULT_OPTIONS,
+              Optional.empty());
+
+      assertThrows(
+          com.xgen.mongot.cursor.MongotCursorNotFoundException.class,
+          () ->
+              nativeManager.getNextBatch(
+                  direct.getCursorId(),
+                  com.xgen.mongot.util.Bytes.ofMebi(1),
+                  com.xgen.mongot.cursor.batch.QueryCursorOptions.empty()));
+      nativeManager.killCursor(direct.getCursorId());
+      assertThat(f.runtime.cursors().isDirectCursor(direct.getCursorId())).isTrue();
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(nativeCursor.cursorId)
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      f.runtime.reads().invalidate(id);
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(direct.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      var nativeBatch =
+          nativeManager.getNextBatch(
+              nativeCursor.cursorId,
+              com.xgen.mongot.util.Bytes.ofMebi(1),
+              com.xgen.mongot.cursor.batch.QueryCursorOptions.empty());
+
+      assertThat(nativeBatch.batch.asArray().size()).isEqualTo(2);
+      nativeManager.killCursor(nativeCursor.cursorId);
+    }
+  }
+
+  @Test
+  public void searchMeta_explicitTarget_selectsNamedIndexAndPreservesLegacyDefault()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String local = f.create("default");
+      String selected = f.create("selected");
+      f.upsert(local, "{_id:'a',title:'coffee'}");
+      f.upsert(selected, "{_id:'a',title:'coffee'}");
+      f.upsert(selected, "{_id:'b',title:'coffee'}");
+      var query = metaRequest("{text:{path:'title',query:'coffee'},count:{type:'total'}}");
+
+      var legacy = f.queries.searchMeta(query);
+      var explicit = f.queries.searchMeta(query.toBuilder().setTargetIndexId(selected).build());
+
+      assertThat(metadata(legacy).getDocument("count").getInt64("total").getValue()).isEqualTo(1);
+      assertThat(metadata(explicit).getDocument("count").getInt64("total").getValue()).isEqualTo(2);
+      assertThat(f.hasOpenCursors(selected)).isFalse();
+    }
+  }
+
+  @Test
+  public void listIndexes_paginationAndOwnershipFilter_returnsCompleteDistinctPages()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String first = f.create("one");
+      String second = f.create("two");
+      var request =
+          com.xgen.mongot.standalone.grpc.ListIndexesRequest.newBuilder().setPageSize(1).build();
+
+      var page = f.catalog.listIndexes(request);
+      var next =
+          f.catalog.listIndexes(request.toBuilder().setPageToken(page.getNextPageToken()).build());
+      var remote =
+          f.catalog.listIndexes(
+              request.toBuilder()
+                  .setOwnership(
+                      com.xgen.mongot.standalone.grpc.IndexOwnership.INDEX_OWNERSHIP_REPLICATED)
+                  .build());
+
+      assertThat(java.util.Set.of(page.getIndexes(0).getIndexId(), next.getIndexes(0).getIndexId()))
+          .containsExactly(first, second);
+      assertThat(next.getNextPageToken()).isEmpty();
+      assertThat(remote.getIndexesList()).isEmpty();
+      assertThat(page.getIndexes(0).getOwnership())
+          .isEqualTo(com.xgen.mongot.standalone.grpc.IndexOwnership.INDEX_OWNERSHIP_STANDALONE);
+    }
+  }
 
   @Test
   public void searchMeta_unchangedDefaultIndexBody_returnsDefaultCountWithoutCursor()
@@ -2334,17 +2654,19 @@ public class StandaloneGrpcServerTest {
                           """))
                   .build());
       f.ready(vector.getIndexId(), 1);
+      var vectorMappings =
+          f.catalog.getIndexMappings(
+              GetIndexMappingsRequest.newBuilder().setIndexId(vector.getIndexId()).build());
+      assertThat(vectorMappings.getIndexType()).isEqualTo(IndexType.INDEX_TYPE_VECTOR_SEARCH);
       assertThat(
-              assertThrows(
-                      StatusRuntimeException.class,
-                      () ->
-                          f.catalog.getIndexMappings(
-                              GetIndexMappingsRequest.newBuilder()
-                                  .setIndexId(vector.getIndexId())
-                                  .build()))
-                  .getStatus()
-                  .getCode())
-          .isEqualTo(Status.Code.FAILED_PRECONDITION);
+              BsonDocument.parse("{fields:" + vectorMappings.getVectorFieldsJson() + "}")
+                  .getArray("fields")
+                  .get(0)
+                  .asDocument()
+                  .getString("path")
+                  .getValue())
+          .isEqualTo("v");
+      assertThat(vectorMappings.getMappingsJson()).isEmpty();
       f.catalog.dropIndex(
           DropIndexRequest.newBuilder().setIndexId(id).setExpectedRevision(1).build());
       assertThat(
@@ -2720,6 +3042,18 @@ public class StandaloneGrpcServerTest {
               .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers));
     }
 
+    private DefaultConfigManager stopReconciliation() throws Exception {
+      var reconcilerField = StandaloneRuntime.class.getDeclaredField("reconciler");
+      reconcilerField.setAccessible(true);
+      var reconciler =
+          (java.util.concurrent.ScheduledThreadPoolExecutor) reconcilerField.get(this.runtime);
+      reconciler.shutdown();
+      assertThat(reconciler.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      var managerField = StandaloneRuntime.class.getDeclaredField("configManager");
+      managerField.setAccessible(true);
+      return (DefaultConfigManager) managerField.get(this.runtime);
+    }
+
     private String create(String name) throws Exception {
       return create(name, "{mappings:{dynamic:true}}");
     }
@@ -2732,6 +3066,23 @@ public class StandaloneGrpcServerTest {
                       .setName(name)
                       .setType(IndexType.INDEX_TYPE_SEARCH)
                       .setDefinitionBson(bson(definition))
+                      .build())
+              .getIndexId();
+      ready(id, 1);
+      return id;
+    }
+
+    private String createVector() throws Exception {
+      String id =
+          this.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("vectors")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'}]}"))
                       .build())
               .getIndexId();
       ready(id, 1);

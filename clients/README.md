@@ -292,6 +292,9 @@ unattributed totals. These reconcile exactly with that summary's `index_size_byt
 (`paths=["title"]`) and pages select rows without changing global totals or coverage. Exclusive
 codec ranges are attributed; shared postings and compressed stored source are kept in named
 buckets. Each representation preserves its mapping type, multi-field name and embedded scope.
+Auto-embedding measurements and path filters use the public field path, such as `title`, while
+representation names preserve the derived Lucene path, such as `$type:knnVector/_autoEmbed.title`.
+Lexical and derived vector representations of the same public field share one row.
 
 Memory domains are separate: accounted reader heap, writer buffers, caches, and desired vector
 off-heap working set. Per-field heap is available only where ownership can be established. These
@@ -377,3 +380,38 @@ Use `client.search_meta(api.SearchMetaRequest(query_bson=encode_bson(stage_body)
 executed generation, and optional explain BSON; it has no hit batch or cursor. Planner-only
 explain omits metadata. See the [RPC guide](../docs/standalone-mongot-grpc-guide.md#metadata-only-search)
 for a facet example. This additive RPC requires a server built with SearchMeta support.
+
+
+### Verify reads across ownership types
+
+All client request types support ownership filters and pagination, SearchMeta `target_index_id`,
+and Search/SearchMeta `join_indexes`. The JSON CLIs accept the corresponding protobuf JSON fields
+(`ownership`, `pageSize`, `pageToken`, `targetIndexId`, and `joinIndexes`). Helpers verify the server's
+read-contract acknowledgment when using these additions; they fail instead of silently accepting
+legacy name lookup from an old server.
+
+If an unacknowledged Search or VectorSearch reply contains a cursor, clients attempt KillCursor
+before reporting the contract error. Cleanup uses the same connection and credentials, with a
+fresh timeout capped at five seconds. A cleanup failure preserves the original contract error.
+After building all four clients, verify this behavior against a local gRPC fixture with:
+
+```sh
+clients/python/.venv/bin/python clients/tests/read_contract.py
+```
+
+After building the clients and extracting the current `//deploy:mongot-standalone` package, run the
+live replication suite on Linux with existing Docker images:
+
+```sh
+clients/python/.venv/bin/python clients/tests/all_index_reads.py \
+  --package /absolute/path/to/extracted/package \
+  --runtime-image mybyte/nomongo-t:0.9.0 \
+  --mongodb-image mongo:8.3.17-noble \
+  --output /tmp/all-index-read-results
+```
+
+The suite creates isolated containers and volumes with ephemeral ports. It checks direct reads
+of genuinely replicated data, native SearchMeta parity, autocomplete, vector queries, mappings,
+statistics, pagination, all four join ownership combinations, mutation rejection, and native
+rebuild/drop cursor invalidation. It cleans up its containers and volumes and preserves logs and
+a result summary in the output directory.

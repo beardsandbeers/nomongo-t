@@ -169,6 +169,12 @@ public class DefaultConfigManager implements ConfigManager {
     SearchQueryFeaturePolicy.validateQuery(query, false, this.featureFlags);
   }
 
+  /** Validate vector candidate selection against the same configuration as native commands. */
+  public void validateVectorQuery(com.xgen.mongot.index.query.VectorSearchQuery query)
+      throws InvalidQueryException {
+    SearchQueryFeaturePolicy.validateVectorCriteria(query.criteria(), this.featureFlags);
+  }
+
   /** Read the readers' live feature configuration without waiting for config lifecycle work. */
   public SearchQueryParseOptions getSearchQueryParseOptions() {
     return SearchQueryFeaturePolicy.parseOptions(
@@ -554,49 +560,59 @@ public class DefaultConfigManager implements ConfigManager {
   }
 
   @Override
-  public synchronized void close() {
-    LOG.info("Shutting down.");
+  public void close() {
+    java.util.concurrent.CompletableFuture<Void> readDrain;
+    synchronized (this) {
+      this.closed = true;
+      readDrain = this.configState.readLeases.stop();
+    }
+    // Readers can need the manager monitor to finish dependency resolution before unwinding.
+    readDrain.orTimeout(30, java.util.concurrent.TimeUnit.SECONDS).join();
+    synchronized (this) {
+      LOG.info("Shutting down.");
 
-    this.closed = true;
-    this.configState.awaitRetirements();
-    this.configState.cursorManager.close();
+      this.closed = true;
+      this.configState.awaitRetirements();
+      this.configState.cursorManager.close();
 
-    shutdown();
+      shutdown();
 
-    CollectionUtils.concat(
-            this.configState.staged.getIndexes(),
-            this.configState.indexCatalog.getIndexes(),
-            this.configState.phasingOut.getIndexes())
-        .forEach(
-            indexGen ->
-                Crash.because("failed to close index")
-                    .ifThrows(
-                        () -> {
-                          synchronized (this) {
-                            var initializedIndex =
-                                this.configState.initializedIndexCatalog.getIndex(
-                                    indexGen.getGenerationId());
-                            if (initializedIndex.isPresent()) {
-                              initializedIndex.get().close();
-                            } else if (indexGen.getIndex()
-                                instanceof UnresolvedAutoEmbeddingIndex unresolved) {
-                              // An unresolved auto-embedding index that is not in the initialized
-                              // catalog (a failed generation retaining an unopened derived handle;
-                              // offline-serving ones register and are closed by the branch above)
-                              // may still hold a derived index handle, so close it here.
-                              unresolved.close();
-                            } else {
-                              GenerationId generationId = indexGen.getGenerationId();
-                              LOG.atWarn()
-                                  .addKeyValue("indexId", generationId.indexId)
-                                  .addKeyValue("generationId", generationId)
-                                  .log("Not closing initialized index, not yet initialized");
+      CollectionUtils.concat(
+              this.configState.staged.getIndexes(),
+              this.configState.indexCatalog.getIndexes(),
+              this.configState.phasingOut.getIndexes())
+          .forEach(
+              indexGen ->
+                  Crash.because("failed to close index")
+                      .ifThrows(
+                          () -> {
+                            synchronized (this) {
+                              var initializedIndex =
+                                  this.configState.initializedIndexCatalog.getIndex(
+                                      indexGen.getGenerationId());
+                              if (initializedIndex.isPresent()) {
+                                initializedIndex.get().close();
+                              } else if (indexGen.getIndex()
+                                  instanceof UnresolvedAutoEmbeddingIndex unresolved) {
+                                // An unresolved auto-embedding index that is not in the initialized
+                                // catalog (a failed generation retaining an unopened derived
+                                // handle;
+                                // offline-serving ones register and are closed by the branch above)
+                                // may still hold a derived index handle, so close it here.
+                                unresolved.close();
+                              } else {
+                                GenerationId generationId = indexGen.getGenerationId();
+                                LOG.atWarn()
+                                    .addKeyValue("indexId", generationId.indexId)
+                                    .addKeyValue("generationId", generationId)
+                                    .log("Not closing initialized index, not yet initialized");
+                              }
                             }
-                          }
-                        }));
+                          }));
 
-    this.configState.indexFactory.close();
-    this.configState.materializedViewIndexFactory.ifPresent(MaterializedViewIndexFactory::close);
+      this.configState.indexFactory.close();
+      this.configState.materializedViewIndexFactory.ifPresent(MaterializedViewIndexFactory::close);
+    }
   }
 
   @Override

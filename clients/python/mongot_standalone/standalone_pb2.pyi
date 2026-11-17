@@ -17,6 +17,12 @@ class IndexType(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     INDEX_TYPE_SEARCH: _ClassVar[IndexType]
     INDEX_TYPE_VECTOR_SEARCH: _ClassVar[IndexType]
 
+class IndexOwnership(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    INDEX_OWNERSHIP_UNSPECIFIED: _ClassVar[IndexOwnership]
+    INDEX_OWNERSHIP_STANDALONE: _ClassVar[IndexOwnership]
+    INDEX_OWNERSHIP_REPLICATED: _ClassVar[IndexOwnership]
+
 class MeasurementMethod(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     MEASUREMENT_METHOD_UNAVAILABLE: _ClassVar[MeasurementMethod]
@@ -52,6 +58,9 @@ class ExplainVerbosity(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
 INDEX_TYPE_UNSPECIFIED: IndexType
 INDEX_TYPE_SEARCH: IndexType
 INDEX_TYPE_VECTOR_SEARCH: IndexType
+INDEX_OWNERSHIP_UNSPECIFIED: IndexOwnership
+INDEX_OWNERSHIP_STANDALONE: IndexOwnership
+INDEX_OWNERSHIP_REPLICATED: IndexOwnership
 MEASUREMENT_METHOD_UNAVAILABLE: MeasurementMethod
 MEASUREMENT_METHOD_FILE_RANGE: MeasurementMethod
 MEASUREMENT_METHOD_RESOURCE_ACCOUNTING: MeasurementMethod
@@ -127,17 +136,32 @@ class GetIndexMappingsRequest(_message.Message):
     ) -> None: ...
 
 class GetIndexMappingsResponse(_message.Message):
-    __slots__ = ("index_id", "generation_id", "active_revision", "mappings_json", "definition_json")
+    __slots__ = (
+        "index_id",
+        "generation_id",
+        "active_revision",
+        "mappings_json",
+        "definition_json",
+        "index_type",
+        "vector_fields_json",
+        "active_version",
+    )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_REVISION_FIELD_NUMBER: _ClassVar[int]
     MAPPINGS_JSON_FIELD_NUMBER: _ClassVar[int]
     DEFINITION_JSON_FIELD_NUMBER: _ClassVar[int]
+    INDEX_TYPE_FIELD_NUMBER: _ClassVar[int]
+    VECTOR_FIELDS_JSON_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_VERSION_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     generation_id: str
     active_revision: int
     mappings_json: str
     definition_json: str
+    index_type: IndexType
+    vector_fields_json: str
+    active_version: IndexVersion
     def __init__(
         self,
         index_id: _Optional[str] = ...,
@@ -145,11 +169,97 @@ class GetIndexMappingsResponse(_message.Message):
         active_revision: _Optional[int] = ...,
         mappings_json: _Optional[str] = ...,
         definition_json: _Optional[str] = ...,
+        index_type: _Optional[_Union[IndexType, str]] = ...,
+        vector_fields_json: _Optional[str] = ...,
+        active_version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
+    ) -> None: ...
+
+class IndexNamespace(_message.Message):
+    __slots__ = ("database", "collection_uuid", "collection_name", "view_name")
+    DATABASE_FIELD_NUMBER: _ClassVar[int]
+    COLLECTION_UUID_FIELD_NUMBER: _ClassVar[int]
+    COLLECTION_NAME_FIELD_NUMBER: _ClassVar[int]
+    VIEW_NAME_FIELD_NUMBER: _ClassVar[int]
+    database: str
+    collection_uuid: str
+    collection_name: str
+    view_name: str
+    def __init__(
+        self,
+        database: _Optional[str] = ...,
+        collection_uuid: _Optional[str] = ...,
+        collection_name: _Optional[str] = ...,
+        view_name: _Optional[str] = ...,
+    ) -> None: ...
+
+class IndexVersion(_message.Message):
+    __slots__ = ("domain", "definition_version")
+    class Domain(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        DOMAIN_UNSPECIFIED: _ClassVar[IndexVersion.Domain]
+        DOMAIN_STANDALONE_REVISION: _ClassVar[IndexVersion.Domain]
+        DOMAIN_NATIVE_DEFINITION_VERSION: _ClassVar[IndexVersion.Domain]
+
+    DOMAIN_UNSPECIFIED: IndexVersion.Domain
+    DOMAIN_STANDALONE_REVISION: IndexVersion.Domain
+    DOMAIN_NATIVE_DEFINITION_VERSION: IndexVersion.Domain
+    DOMAIN_FIELD_NUMBER: _ClassVar[int]
+    DEFINITION_VERSION_FIELD_NUMBER: _ClassVar[int]
+    domain: IndexVersion.Domain
+    definition_version: int
+    def __init__(
+        self,
+        domain: _Optional[_Union[IndexVersion.Domain, str]] = ...,
+        definition_version: _Optional[int] = ...,
+    ) -> None: ...
+
+class IndexBuild(_message.Message):
+    __slots__ = ("generation_id", "version", "state", "definition_bson")
+    GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    DEFINITION_BSON_FIELD_NUMBER: _ClassVar[int]
+    generation_id: str
+    version: IndexVersion
+    state: str
+    definition_bson: bytes
+    def __init__(
+        self,
+        generation_id: _Optional[str] = ...,
+        version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
+        state: _Optional[str] = ...,
+        definition_bson: _Optional[bytes] = ...,
+    ) -> None: ...
+
+class JoinIndexBinding(_message.Message):
+    __slots__ = ("alias", "index_id", "generation_id")
+    ALIAS_FIELD_NUMBER: _ClassVar[int]
+    INDEX_ID_FIELD_NUMBER: _ClassVar[int]
+    GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
+    alias: str
+    index_id: str
+    generation_id: str
+    def __init__(
+        self,
+        alias: _Optional[str] = ...,
+        index_id: _Optional[str] = ...,
+        generation_id: _Optional[str] = ...,
     ) -> None: ...
 
 class ListIndexesRequest(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...
+    __slots__ = ("ownership", "page_size", "page_token")
+    OWNERSHIP_FIELD_NUMBER: _ClassVar[int]
+    PAGE_SIZE_FIELD_NUMBER: _ClassVar[int]
+    PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
+    ownership: IndexOwnership
+    page_size: int
+    page_token: str
+    def __init__(
+        self,
+        ownership: _Optional[_Union[IndexOwnership, str]] = ...,
+        page_size: _Optional[int] = ...,
+        page_token: _Optional[str] = ...,
+    ) -> None: ...
 
 class GetIndexStatsRequest(_message.Message):
     __slots__ = ("index_id", "generation_id", "refresh")
@@ -228,6 +338,7 @@ class IndexStats(_message.Message):
         "memory",
         "memory_sampled_at_unix_millis",
         "age_millis",
+        "active_version",
     )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
@@ -245,6 +356,7 @@ class IndexStats(_message.Message):
     MEMORY_FIELD_NUMBER: _ClassVar[int]
     MEMORY_SAMPLED_AT_UNIX_MILLIS_FIELD_NUMBER: _ClassVar[int]
     AGE_MILLIS_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_VERSION_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     generation_id: str
     active_revision: int
@@ -261,6 +373,7 @@ class IndexStats(_message.Message):
     memory: IndexMemoryStats
     memory_sampled_at_unix_millis: int
     age_millis: int
+    active_version: IndexVersion
     def __init__(
         self,
         index_id: _Optional[str] = ...,
@@ -279,6 +392,7 @@ class IndexStats(_message.Message):
         memory: _Optional[_Union[IndexMemoryStats, _Mapping]] = ...,
         memory_sampled_at_unix_millis: _Optional[int] = ...,
         age_millis: _Optional[int] = ...,
+        active_version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
     ) -> None: ...
 
 class GetIndexFieldStatsRequest(_message.Message):
@@ -499,11 +613,15 @@ class IndexFieldStatsResponse(_message.Message):
     ) -> None: ...
 
 class ListIndexesResponse(_message.Message):
-    __slots__ = ("indexes",)
+    __slots__ = ("indexes", "next_page_token")
     INDEXES_FIELD_NUMBER: _ClassVar[int]
+    NEXT_PAGE_TOKEN_FIELD_NUMBER: _ClassVar[int]
     indexes: _containers.RepeatedCompositeFieldContainer[IndexDescription]
+    next_page_token: str
     def __init__(
-        self, indexes: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...
+        self,
+        indexes: _Optional[_Iterable[_Union[IndexDescription, _Mapping]]] = ...,
+        next_page_token: _Optional[str] = ...,
     ) -> None: ...
 
 class IndexDescription(_message.Message):
@@ -517,6 +635,15 @@ class IndexDescription(_message.Message):
         "generation_id",
         "active_revision",
         "failure_message",
+        "ownership",
+        "namespace",
+        "queryable",
+        "active_definition_bson",
+        "read_capabilities",
+        "active_version",
+        "desired_version",
+        "build",
+        "source_status",
     )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
@@ -527,6 +654,15 @@ class IndexDescription(_message.Message):
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     ACTIVE_REVISION_FIELD_NUMBER: _ClassVar[int]
     FAILURE_MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    OWNERSHIP_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    QUERYABLE_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_DEFINITION_BSON_FIELD_NUMBER: _ClassVar[int]
+    READ_CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
+    ACTIVE_VERSION_FIELD_NUMBER: _ClassVar[int]
+    DESIRED_VERSION_FIELD_NUMBER: _ClassVar[int]
+    BUILD_FIELD_NUMBER: _ClassVar[int]
+    SOURCE_STATUS_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     name: str
     type: IndexType
@@ -536,6 +672,15 @@ class IndexDescription(_message.Message):
     generation_id: str
     active_revision: int
     failure_message: str
+    ownership: IndexOwnership
+    namespace: IndexNamespace
+    queryable: bool
+    active_definition_bson: bytes
+    read_capabilities: _containers.RepeatedScalarFieldContainer[str]
+    active_version: IndexVersion
+    desired_version: IndexVersion
+    build: IndexBuild
+    source_status: str
     def __init__(
         self,
         index_id: _Optional[str] = ...,
@@ -547,6 +692,15 @@ class IndexDescription(_message.Message):
         generation_id: _Optional[str] = ...,
         active_revision: _Optional[int] = ...,
         failure_message: _Optional[str] = ...,
+        ownership: _Optional[_Union[IndexOwnership, str]] = ...,
+        namespace: _Optional[_Union[IndexNamespace, _Mapping]] = ...,
+        queryable: _Optional[bool] = ...,
+        active_definition_bson: _Optional[bytes] = ...,
+        read_capabilities: _Optional[_Iterable[str]] = ...,
+        active_version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
+        desired_version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
+        build: _Optional[_Union[IndexBuild, _Mapping]] = ...,
+        source_status: _Optional[str] = ...,
     ) -> None: ...
 
 class UpsertRequest(_message.Message):
@@ -616,17 +770,26 @@ class DeleteResponse(_message.Message):
     ) -> None: ...
 
 class QueryRequest(_message.Message):
-    __slots__ = ("index_id", "query_bson", "batch_size", "generation_id", "explain_verbosity")
+    __slots__ = (
+        "index_id",
+        "query_bson",
+        "batch_size",
+        "generation_id",
+        "explain_verbosity",
+        "join_indexes",
+    )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     QUERY_BSON_FIELD_NUMBER: _ClassVar[int]
     BATCH_SIZE_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPLAIN_VERBOSITY_FIELD_NUMBER: _ClassVar[int]
+    JOIN_INDEXES_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     query_bson: bytes
     batch_size: int
     generation_id: str
     explain_verbosity: ExplainVerbosity
+    join_indexes: _containers.RepeatedCompositeFieldContainer[JoinIndexBinding]
     def __init__(
         self,
         index_id: _Optional[str] = ...,
@@ -634,6 +797,7 @@ class QueryRequest(_message.Message):
         batch_size: _Optional[int] = ...,
         generation_id: _Optional[str] = ...,
         explain_verbosity: _Optional[_Union[ExplainVerbosity, str]] = ...,
+        join_indexes: _Optional[_Iterable[_Union[JoinIndexBinding, _Mapping]]] = ...,
     ) -> None: ...
 
 class QueryResponse(_message.Message):
@@ -658,21 +822,34 @@ class QueryResponse(_message.Message):
     ) -> None: ...
 
 class SearchMetaRequest(_message.Message):
-    __slots__ = ("index_id", "query_bson", "generation_id", "explain_verbosity")
+    __slots__ = (
+        "index_id",
+        "query_bson",
+        "generation_id",
+        "explain_verbosity",
+        "target_index_id",
+        "join_indexes",
+    )
     INDEX_ID_FIELD_NUMBER: _ClassVar[int]
     QUERY_BSON_FIELD_NUMBER: _ClassVar[int]
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     EXPLAIN_VERBOSITY_FIELD_NUMBER: _ClassVar[int]
+    TARGET_INDEX_ID_FIELD_NUMBER: _ClassVar[int]
+    JOIN_INDEXES_FIELD_NUMBER: _ClassVar[int]
     index_id: str
     query_bson: bytes
     generation_id: str
     explain_verbosity: ExplainVerbosity
+    target_index_id: str
+    join_indexes: _containers.RepeatedCompositeFieldContainer[JoinIndexBinding]
     def __init__(
         self,
         index_id: _Optional[str] = ...,
         query_bson: _Optional[bytes] = ...,
         generation_id: _Optional[str] = ...,
         explain_verbosity: _Optional[_Union[ExplainVerbosity, str]] = ...,
+        target_index_id: _Optional[str] = ...,
+        join_indexes: _Optional[_Iterable[_Union[JoinIndexBinding, _Mapping]]] = ...,
     ) -> None: ...
 
 class SearchMetaResponse(_message.Message):

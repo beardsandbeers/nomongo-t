@@ -47,6 +47,7 @@ public final class CoexistenceRuntime {
   private final MongotCursorManagerImpl cursors;
   private final MeterAndFtdcRegistry metrics;
   private @Nullable IndexingWorkSchedulerFactory schedulers;
+  private Supplier<EmbeddingServiceManager> embedding = () -> null;
   private @Nullable ApiIngestionManager ingestion;
   private @Nullable LifecycleManager sourceLifecycle;
   private @Nullable ReplicationStateMonitor sourceMonitor;
@@ -120,6 +121,7 @@ public final class CoexistenceRuntime {
 
   public IndexingWorkSchedulerFactory createSchedulers(
       int threads, Supplier<EmbeddingServiceManager> embedding, boolean attributionEnabled) {
+    this.embedding = embedding;
     this.schedulers =
         IndexingWorkSchedulerFactory.create(
             threads,
@@ -184,7 +186,10 @@ public final class CoexistenceRuntime {
             Objects.requireNonNull(this.ingestion),
             manager,
             this.metrics,
-            this.coordinator::reconcileLocal);
+            this.coordinator::reconcileLocal,
+            this.coordinator,
+            this.coordinator);
+    this.runtime.setEmbeddingService(this.embedding);
     this.services = new StandaloneGrpcServer(this.runtime, true);
   }
 

@@ -49,7 +49,7 @@ message GetIndexMappingsRequest {
   string index_id = 1;
   string generation_id = 2; // Optional fence against a schema change.
 }
-// Search indexes only. Refreshes the reader before inspecting every partition's field metadata.
+// Search mappings or vector fields from one active generation. Search export refreshes readers.
 // Includes configured fields and observed dynamic types; dynamic is false at every document level.
 // Metadata can retain deleted fields until segment merges. Null-only fields, empty objects/arrays,
 // and values that never produced a typed Lucene field cannot be inferred from this snapshot.
@@ -59,10 +59,48 @@ message GetIndexMappingsResponse {
   uint64 active_revision = 3;
   string mappings_json = 4; // Public mappings object, including dynamic and fields.
   // Complete public definition with mappings replaced by mappings_json. Parse as Extended JSON,
-  // encode as BSON, and pass to CreateIndex/UpdateIndex; preserves analyzers and other options.
+  // encode as BSON. Native-only features may require adaptation before standalone creation.
   string definition_json = 5;
+  IndexType index_type = 6;
+  string vector_fields_json = 7;
+  IndexVersion active_version = 8;
 }
-message ListIndexesRequest {}
+enum IndexOwnership {
+  INDEX_OWNERSHIP_UNSPECIFIED = 0;
+  INDEX_OWNERSHIP_STANDALONE = 1;
+  INDEX_OWNERSHIP_REPLICATED = 2;
+}
+message IndexNamespace {
+  string database = 1;
+  string collection_uuid = 2;
+  string collection_name = 3;
+  string view_name = 4;
+}
+message IndexVersion {
+  enum Domain {
+    DOMAIN_UNSPECIFIED = 0;
+    DOMAIN_STANDALONE_REVISION = 1;
+    DOMAIN_NATIVE_DEFINITION_VERSION = 2;
+  }
+  Domain domain = 1;
+  optional uint64 definition_version = 2;
+}
+message IndexBuild {
+  string generation_id = 1;
+  IndexVersion version = 2;
+  string state = 3;
+  bytes definition_bson = 4;
+}
+message JoinIndexBinding {
+  string alias = 1;
+  string index_id = 2;
+  string generation_id = 3;
+}
+message ListIndexesRequest {
+  IndexOwnership ownership = 1; // Unspecified selects both owners.
+  uint32 page_size = 2; // Zero preserves unpaged behavior; maximum 500.
+  string page_token = 3;
+}
 
 // Statistics require catalog role and a grant for this index. Refresh is visible, not a commit.
 message GetIndexStatsRequest {
@@ -113,6 +151,7 @@ message IndexStats {
   IndexMemoryStats memory = 14;
   uint64 memory_sampled_at_unix_millis = 15;
   uint64 age_millis = 16;
+  IndexVersion active_version = 17;
 }
 message GetIndexFieldStatsRequest {
   string index_id = 1;
@@ -175,7 +214,10 @@ message IndexFieldStatsResponse {
   bool refresh_in_progress = 11;
   uint32 retry_after_millis = 12;
 }
-message ListIndexesResponse { repeated IndexDescription indexes = 1; }
+message ListIndexesResponse {
+  repeated IndexDescription indexes = 1;
+  string next_page_token = 2;
+}
 message IndexDescription {
   string index_id = 1;
   string name = 2;
@@ -186,6 +228,15 @@ message IndexDescription {
   string generation_id = 7;
   uint64 active_revision = 8;
   string failure_message = 9;
+  IndexOwnership ownership = 10;
+  IndexNamespace namespace = 11;
+  bool queryable = 12;
+  bytes active_definition_bson = 13;
+  repeated string read_capabilities = 14;
+  IndexVersion active_version = 15;
+  IndexVersion desired_version = 16;
+  IndexBuild build = 17;
+  string source_status = 18;
 }
 enum DocumentWriteConcern {
   // Successful completion means a fresh search can observe the writes.
@@ -230,6 +281,7 @@ message QueryRequest {
   string generation_id = 4;
   // QUERY_PLANNER returns no hits or live cursor. Execution levels page results normally.
   ExplainVerbosity explain_verbosity = 5;
+  repeated JoinIndexBinding join_indexes = 6;
 }
 message QueryResponse {
   uint64 cursor_id = 1;
@@ -247,6 +299,8 @@ message SearchMetaRequest {
   bytes query_bson = 2;
   string generation_id = 3;
   ExplainVerbosity explain_verbosity = 4;
+  string target_index_id = 5; // Explicit selector; legacy index_id remains a fence.
+  repeated JoinIndexBinding join_indexes = 6;
 }
 message SearchMetaResponse {
   // Complete coupled metadata document; absent for planner-only explain.

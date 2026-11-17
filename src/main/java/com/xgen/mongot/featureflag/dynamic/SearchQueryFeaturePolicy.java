@@ -7,6 +7,7 @@ import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.SearchQueryParseOptions;
 import com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria;
+import com.xgen.mongot.index.query.operators.VectorSearchCriteria;
 import com.xgen.mongot.index.query.operators.VectorSearchOperator;
 
 /** Shared query-language gates for coupled and standalone search entry points. */
@@ -25,8 +26,15 @@ public final class SearchQueryFeaturePolicy {
           "Pagination is not supported with the 'vectorSearch' operator. "
               + "Use $skip and $limit stages instead.");
     }
-    if (operatorQuery.operator() instanceof VectorSearchOperator vector
-        && vector.criteria() instanceof ApproximateVectorSearchCriteria approx
+    if (operatorQuery.operator() instanceof VectorSearchOperator vector) {
+      validateVectorCriteria(vector.criteria(), featureFlags);
+    }
+  }
+
+  /** Candidate selection policy shared by search operators and vector-search transports. */
+  public static void validateVectorCriteria(
+      VectorSearchCriteria criteria, FeatureFlags featureFlags) throws InvalidQueryException {
+    if (criteria instanceof ApproximateVectorSearchCriteria approx
         && approx.isAutoNumCandidates()
         && !featureFlags.isEnabled(Feature.AUTO_NUM_CANDIDATES)) {
       throw new InvalidQueryException("numCandidates is required for approximate vector search");

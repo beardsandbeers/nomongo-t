@@ -105,3 +105,67 @@ configured combined response-byte limit. It never retains a cursor, including on
 
 Client methods are `search_meta` in Python/Rust and `searchMeta` in Java/TypeScript. Older servers
 return `UNIMPLEMENTED`; clients do not silently fall back to fetching hits.
+
+
+## Reading replicated indexes
+
+In coexistence deployments the same CatalogService and QueryService serve both ownership types.
+ListIndexes returns granted indexes from both sources; set `ownership` to
+`INDEX_OWNERSHIP_STANDALONE` or `INDEX_OWNERSHIP_REPLICATED` to filter them. Use `page_size` (maximum
+500) and `next_page_token` for bounded discovery. A zero page size retains unpaged behavior within
+the response byte limit. Tokens expire after two minutes and bind the principal and list options.
+
+GetIndex describes desired and active definitions separately. `queryable` reports whether an
+active initialized reader can serve queries, even while a replacement is building or replication
+is recovering. Replicated native definition versions can be zero; `active_version` and
+`desired_version` distinguish a known zero from an absent version. They are not direct mutation
+revisions. The namespace identifies the source database, collection UUID, observed name, and view.
+
+If a replacement definition is quarantined, `build.state` is `QUARANTINED` and `build.generation_id`
+identifies that replacement. Its unreadable definition and unknown version are omitted. The
+summary reports `FAILED` while `queryable` and `source_status` continue to describe the active
+generation, which can remain available for queries.
+
+Use `index_id` for Search, VectorSearch, mappings, and statistics. Autocomplete remains a Search
+operator and requires the corresponding field mapping. Mapping export returns `mappings_json`
+for search indexes and `vector_fields_json` for vector indexes, plus the active public definition
+in `definition_json`. Native definitions can contain features that standalone creation does not
+support, such as MongoDB synonym sources; exporting one is not an ownership conversion.
+
+SearchMeta's existing `index_id` remains an optional identity fence on local name lookup. The new
+`target_index_id` selects either source directly, avoiding ambiguity between indexes with the
+same name in different collections. For example, with the Python client:
+
+```python
+from mongot_standalone import Client, api, encode_bson, decode_bson
+
+with Client("127.0.0.1:27028") as client:
+    page = client.list_indexes(api.ListIndexesRequest(
+        ownership=api.INDEX_OWNERSHIP_REPLICATED, page_size=100))
+    index = next(index for index in page.indexes if index.queryable)
+    result = client.search_meta(api.SearchMetaRequest(
+        target_index_id=index.index_id,
+        generation_id=index.generation_id,
+        query_bson=encode_bson({"exists": {"path": "title"}, "count": {"type": "total"}})))
+    print(decode_bson(result.metadata_bson))
+```
+
+`join_indexes` on Search and SearchMeta binds each join's `from` alias to an `index_id` and optional
+`generation_id`. Bindings can target either ownership type. Unbound names retain standalone
+lookup, and omitted `from` remains a self-join. All dependencies require index grants. These joins
+pin independent reader snapshots; they do not promise a common source transaction time.
+
+Updated client helpers send and verify `mongot-direct-read-contract: all-index-reads-v1` when
+using new target selectors, join bindings, owner filters, or pagination. Raw gRPC callers must
+perform the same check before accepting results from an older server that might ignore unknown
+protobuf fields. Legacy requests do not require this header.
+
+Direct GetMore and KillCursor accept only the requesting principal's direct cursors, including
+those querying replicated indexes. A rebuild or drop invalidates affected direct cursors and
+statistics continuations. Native cursors cannot be consumed through this API. Generation fences
+prevent a follow-up inspection from silently switching schemas.
+
+The direct API returns this process's indexed data and configured stored source. It does not fetch
+MongoDB documents or combine shard results. Direct writes and catalog mutations remain limited
+to standalone-owned indexes. Existing wildcard grants include replicated reads after upgrading;
+MongoDB user roles are not consulted by direct bearer authentication.

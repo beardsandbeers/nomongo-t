@@ -72,11 +72,28 @@ including protobuf overhead. Standalone admission bounds the number and bytes of
 requests, including requests whose clients disconnect while work drains. CPU, heap, disk, merge
 workers, and scheduler capacity are shared, so heavy ingestion can affect either workload.
 
-Native list/status/query commands see replicated indexes. Standalone list/status/query and management
-commands see standalone indexes. An index has one writer source for its entire lifetime. Delete it
-through its source's normal management interface; ownership conversion and detached replication
-are not supported. Local mapping updates continue to create an empty generation that must be
-reingested, as in standalone mode.
+Native list/status/query commands see replicated indexes. The direct gRPC API can discover,
+inspect, and query both standalone and replicated indexes. Descriptions include ownership,
+namespace, active and desired versions, build state, and queryability. Reads use the active
+local generation; stale or recovering replicated indexes remain readable while their engine
+status permits queries. Results cover this mongot instance, without cross-shard routing or
+MongoDB source-document lookup.
+
+Index management and document mutations remain source-specific. Direct CreateIndex creates a
+standalone index. Direct UpdateIndex, DropIndex, Upsert, Delete, and DeleteByQuery (including dry
+runs) reject replicated IDs with `NOT_FOUND`. An index has one writer source for its lifetime.
+Ownership conversion and detached replication are not supported. Local mapping updates continue
+to create an empty generation that must be reingested.
+
+Existing direct `*` grants now include replicated reads. Standalone bearer grants are independent
+of MongoDB collection permissions; review those grants when upgrading. The implicit loopback
+principal can read both ownership types. Transport requirements remain unchanged.
+
+Search and VectorSearch select either source by `index_id`. SearchMeta retains its legacy local
+name lookup; use `target_index_id` to select a replicated index explicitly. Join `from` aliases
+can be bound to exact IDs with `join_indexes`. Direct cursors are invalidated when their active
+generation is replaced or dropped; clients start a new query after `NOT_FOUND`. Native cursors
+retain their existing phase-out behavior. See the [gRPC read guide](standalone-mongot-grpc-guide.md#reading-replicated-indexes).
 
 ## Existing data and recovery
 

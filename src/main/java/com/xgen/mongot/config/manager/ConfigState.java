@@ -73,6 +73,7 @@ public class ConfigState {
     return () -> this.syncSourceSnapshot;
   }
 
+  public final GenerationReadLeases readLeases = new GenerationReadLeases();
   private Optional<Executor> retirementExecutor = Optional.empty();
   private final ConcurrentHashMap<GenerationId, IndexGeneration> retiring =
       new ConcurrentHashMap<>();
@@ -91,9 +92,12 @@ public class ConfigState {
   void deferRetirement(IndexGeneration index, Supplier<CompletableFuture<Void>> drop) {
     var id = index.getGenerationId();
     this.retiring.put(id, index);
+    // Attach the drain continuation here, before dispatching teardown. Dispatching a task that
+    // merely attaches a synchronous continuation would run teardown on the last reader's thread.
     var future =
-        CompletableFuture.supplyAsync(drop, this.retirementExecutor.orElseThrow())
-            .thenCompose(value -> value);
+        this.readLeases
+            .invalidate(id)
+            .thenComposeAsync(unused -> drop.get(), this.retirementExecutor.orElseThrow());
     this.retirements.put(id, future);
     future.whenComplete(
         (ignored, error) -> {

@@ -2,7 +2,6 @@ package com.xgen.mongot.standalone.runtime;
 
 import com.google.errorprone.annotations.Var;
 import com.google.protobuf.CodedOutputStream;
-import com.xgen.mongot.catalog.IndexCatalog;
 import com.xgen.mongot.index.IndexGeneration;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.definition.IndexDefinition;
@@ -10,15 +9,15 @@ import com.xgen.mongot.index.statistics.IndexStatistics;
 import com.xgen.mongot.index.statistics.LuceneStatisticsCollector;
 import com.xgen.mongot.index.statistics.LuceneStatisticsSnapshot;
 import com.xgen.mongot.index.statistics.StatisticsLimitException;
-import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
+import com.xgen.mongot.server.command.search.SearchAutoEmbeddingHelper;
 import com.xgen.mongot.standalone.grpc.GetIndexFieldStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexStatsRequest;
 import com.xgen.mongot.standalone.grpc.IndexFieldStats;
 import com.xgen.mongot.standalone.grpc.IndexFieldStatsResponse;
 import com.xgen.mongot.standalone.grpc.IndexStats;
 import com.xgen.mongot.standalone.grpc.StatsCollectionState;
-import com.xgen.mongot.standalone.ingestion.ApiIngestionManager;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
+import com.xgen.mongot.util.FieldPath;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.io.IOException;
@@ -43,7 +42,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
-import org.bson.types.ObjectId;
 import org.jetbrains.annotations.Nullable;
 
 /** Bounded, generation-fenced diagnostics. Cached pages own values, never Lucene references. */
@@ -55,9 +53,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
   private static final long MAX_CACHE_BYTES = 64L * 1024 * 1024;
   private static final int MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
   private static final int MAX_TOKENS = 4096;
-  private final LocalIndexCatalog catalog;
-  private final IndexCatalog indexes;
-  private final ApiIngestionManager ingestion;
+  private final DirectReadCatalog reads;
   private final StandaloneMetrics metrics;
   private final long collectionBudgetNanos;
   private final LongSupplier ticker;
@@ -77,7 +73,8 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
         IndexDefinition definition,
         boolean detailed,
         OptionalLong writerHeap,
-        BooleanSupplier cancelled)
+        BooleanSupplier cancelled,
+        Map<FieldPath, FieldPath> logicalToPhysical)
         throws IOException;
   }
 
@@ -110,9 +107,10 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
       long expiresAt) {}
 
   private record Capture(
-      ApiIngestionManager.IndexLease lease,
+      com.xgen.mongot.config.manager.GenerationReadLeases.Lease lease,
       LuceneStatisticsSnapshot readers,
-      OptionalLong writerHeap)
+      OptionalLong writerHeap,
+      Map<FieldPath, FieldPath> logicalToPhysical)
       implements AutoCloseable {
     @Override
     public void close() throws IOException {
@@ -125,42 +123,25 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
   }
 
   public StandaloneIndexStatistics(
-      LocalIndexCatalog catalog,
-      IndexCatalog indexes,
-      ApiIngestionManager ingestion,
-      Duration collectionBudget,
-      StandaloneMetrics metrics) {
-    this(catalog, indexes, ingestion, collectionBudget, metrics, System::nanoTime);
+      DirectReadCatalog reads, Duration collectionBudget, StandaloneMetrics metrics) {
+    this(reads, collectionBudget, metrics, System::nanoTime);
   }
 
   StandaloneIndexStatistics(
-      LocalIndexCatalog catalog,
-      IndexCatalog indexes,
-      ApiIngestionManager ingestion,
+      DirectReadCatalog reads,
       Duration collectionBudget,
       StandaloneMetrics metrics,
       LongSupplier ticker) {
-    this(
-        catalog,
-        indexes,
-        ingestion,
-        collectionBudget,
-        metrics,
-        ticker,
-        LuceneStatisticsCollector::collect);
+    this(reads, collectionBudget, metrics, ticker, LuceneStatisticsCollector::collect);
   }
 
   StandaloneIndexStatistics(
-      LocalIndexCatalog catalog,
-      IndexCatalog indexes,
-      ApiIngestionManager ingestion,
+      DirectReadCatalog reads,
       Duration collectionBudget,
       StandaloneMetrics metrics,
       LongSupplier ticker,
       Collector collector) {
-    this.catalog = catalog;
-    this.indexes = indexes;
-    this.ingestion = ingestion;
+    this.reads = reads;
     this.metrics = metrics;
     this.collectionBudgetNanos = collectionBudget.toNanos();
     this.ticker = ticker;
@@ -184,32 +165,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
   }
 
   private IndexGeneration resolve(String index, String requestedGeneration) {
-    return this.ingestion.coordinate(
-        () -> {
-          var desired = this.catalog.getIndex(index);
-          var generation =
-              this.indexes
-                  .getIndexById(new ObjectId(index))
-                  .filter(value -> this.ingestion.isGenerationReady(value.getGenerationId()))
-                  .orElseThrow(
-                      () ->
-                          Status.UNAVAILABLE
-                              .withDescription("Index is not ready")
-                              .asRuntimeException());
-          if (!requestedGeneration.isEmpty()
-              && !generation.getGenerationId().uniqueString().equals(requestedGeneration)) {
-            throw Status.FAILED_PRECONDITION
-                .withDescription("Requested generation is no longer live")
-                .asRuntimeException();
-          }
-          if (generation.getDefinition().getDefinitionVersion().orElse(1L)
-              != desired.getDesiredRevision()) {
-            throw Status.UNAVAILABLE
-                .withDescription("Index schema is changing")
-                .asRuntimeException();
-          }
-          return generation;
-        });
+    return this.reads.resolve(index, requestedGeneration);
   }
 
   public CompletableFuture<IndexStats> summary(GetIndexStatsRequest request) {
@@ -483,58 +439,60 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
       return StandaloneIndexStatistics.this.closed
           || this.cancelled.get()
           || StandaloneIndexStatistics.this.ticker.getAsLong() - this.deadline >= 0
-          || !StandaloneIndexStatistics.this.ingestion.isGenerationReady(
+          || !StandaloneIndexStatistics.this.reads.isGenerationReady(
               this.generation.getGenerationId());
     }
 
     private Capture capture() {
-      return StandaloneIndexStatistics.this.ingestion.coordinate(
-          () -> {
-            long barrierStarted = System.nanoTime();
+
+      long barrierStarted = System.nanoTime();
+      try {
+        if (stopped()) {
+          throw new CancellationException();
+        }
+        resolve(
+            this.generation.getGenerationId().indexId.toHexString(),
+            this.generation.getGenerationId().uniqueString());
+        var lease = StandaloneIndexStatistics.this.reads.acquire(this.generation.getGenerationId());
+        lease.onInvalidated(() -> this.cancelled.set(true));
+        try {
+          var index = lease.index();
+          index.getReader().refresh();
+          var readers = index.getReader().acquireStatisticsSnapshot();
+          try {
+            var writerHeap = index.getWriter().getBufferHeapBytes();
+            this.capturedAt = StandaloneIndexStatistics.this.ticker.getAsLong();
+            this.capturedAtMillis = System.currentTimeMillis();
+            return new Capture(
+                lease,
+                readers,
+                writerHeap,
+                Map.copyOf(
+                    SearchAutoEmbeddingHelper.resolveAutoEmbeddingFieldsMapping(this.generation)));
+          } catch (RuntimeException | Error | com.xgen.mongot.index.WriterClosedException e) {
             try {
-              if (stopped()) {
-                throw new CancellationException();
-              }
-              resolve(
-                  this.generation.getGenerationId().indexId.toHexString(),
-                  this.generation.getGenerationId().uniqueString());
-              var lease =
-                  StandaloneIndexStatistics.this.ingestion.acquireStatisticsLease(
-                      this.generation.getGenerationId());
-              try {
-                var index = lease.index();
-                index.getReader().refresh();
-                var readers = index.getReader().acquireStatisticsSnapshot();
-                try {
-                  var writerHeap = index.getWriter().getBufferHeapBytes();
-                  this.capturedAt = StandaloneIndexStatistics.this.ticker.getAsLong();
-                  this.capturedAtMillis = System.currentTimeMillis();
-                  return new Capture(lease, readers, writerHeap);
-                } catch (RuntimeException | Error | com.xgen.mongot.index.WriterClosedException e) {
-                  try {
-                    readers.close();
-                  } catch (IOException close) {
-                    e.addSuppressed(close);
-                  }
-                  throw e;
-                }
-              } catch (IOException
-                  | ReaderClosedException
-                  | com.xgen.mongot.index.WriterClosedException e) {
-                lease.close();
-                throw Status.UNAVAILABLE
-                    .withDescription("Cannot pin statistics readers")
-                    .withCause(e)
-                    .asRuntimeException();
-              } catch (RuntimeException | Error e) {
-                lease.close();
-                throw e;
-              }
-            } finally {
-              StandaloneIndexStatistics.this.metrics.elapsed(
-                  "statistics.barrier.duration", barrierStarted);
+              readers.close();
+            } catch (IOException close) {
+              e.addSuppressed(close);
             }
-          });
+            throw e;
+          }
+        } catch (IOException
+            | ReaderClosedException
+            | com.xgen.mongot.index.WriterClosedException e) {
+          lease.close();
+          throw Status.UNAVAILABLE
+              .withDescription("Cannot pin statistics readers")
+              .withCause(e)
+              .asRuntimeException();
+        } catch (RuntimeException | Error e) {
+          lease.close();
+          throw e;
+        }
+      } finally {
+        StandaloneIndexStatistics.this.metrics.elapsed(
+            "statistics.barrier.duration", barrierStarted);
+      }
     }
 
     @Override
@@ -551,15 +509,18 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
                 this.generation.getDefinition(),
                 this.detailed,
                 capture.writerHeap(),
-                this::stopped);
+                this::stopped,
+                capture.logicalToPhysical());
         summary =
             StatisticsProtoMapper.summary(
                     statistics,
                     this.generation.getGenerationId().indexId.toHexString(),
                     this.generation.getGenerationId().uniqueString(),
-                    this.generation.getDefinition().getDefinitionVersion().orElse(1L),
+                    StandaloneIndexStatistics.this.reads.revision(this.generation.getDefinition()),
                     UUID.randomUUID().toString())
                 .toBuilder()
+                .setActiveVersion(
+                    StandaloneIndexStatistics.this.reads.version(this.generation.getDefinition()))
                 .setSampledAtUnixMillis(this.capturedAtMillis)
                 .build();
         if (this.detailed) {
@@ -585,7 +546,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
         this.slot.job = null;
         if (!this.cancelled.get()
             && !StandaloneIndexStatistics.this.closed
-            && StandaloneIndexStatistics.this.ingestion.isGenerationReady(
+            && StandaloneIndexStatistics.this.reads.isGenerationReady(
                 this.generation.getGenerationId())) {
           if (summary != null) {
             this.slot.summary = summary;
@@ -634,6 +595,8 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
           "status",
           failure == null ? "OK" : status(failure).getStatus().getCode().name());
       if (summary != null
+          && StandaloneIndexStatistics.this.reads.isGenerationReady(
+              this.generation.getGenerationId())
           && !this.cancelled.get()
           && (failure == null || (this.detailed && failure instanceof StatisticsLimitException))) {
         this.result.complete(summary);

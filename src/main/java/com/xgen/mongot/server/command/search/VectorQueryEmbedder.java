@@ -55,7 +55,7 @@ import org.slf4j.LoggerFactory;
  * <p>One instance serves one namespace: the {@code (database, collectionUuid, viewName)} the query
  * is addressed to, which is what the catalog lookups are keyed by.
  */
-final class VectorQueryEmbedder {
+public final class VectorQueryEmbedder {
 
   private static final Logger LOG = LoggerFactory.getLogger(VectorQueryEmbedder.class);
 
@@ -76,6 +76,25 @@ final class VectorQueryEmbedder {
     this.database = database;
     this.collectionUuid = collectionUuid;
     this.viewName = viewName;
+  }
+
+  /** Prepares a direct query using the same model and vector validation as native commands. */
+  public static MaterializedVectorSearchQuery prepare(
+      IndexCatalog indexes,
+      Supplier<EmbeddingServiceManager> embedding,
+      IndexDefinition definition,
+      VectorSearchQuery query)
+      throws InvalidQueryException,
+          EmbeddingProviderTransientException,
+          EmbeddingProviderNonTransientException {
+    var embedder =
+        new VectorQueryEmbedder(
+            indexes,
+            embedding,
+            definition.getDatabase(),
+            definition.getCollectionUuid(),
+            definition.getView().map(view -> view.getName()));
+    return embedder.materializeQuery(query, embedder.findEmbedRequestInfo(definition, query));
   }
 
   /**

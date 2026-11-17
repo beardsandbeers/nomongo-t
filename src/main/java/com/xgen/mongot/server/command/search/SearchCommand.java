@@ -32,20 +32,15 @@ import com.xgen.mongot.index.QuarantinedIndexException;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.Variables;
 import com.xgen.mongot.index.definition.IndexDefinition;
-import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.AggregationFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.explainers.MetadataFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.explain.tracing.ExplainQueryState;
 import com.xgen.mongot.index.query.InvalidQueryException;
-import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.Query;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.SearchQueryParseOptions;
-import com.xgen.mongot.index.query.operators.VectorSearchCriteria;
-import com.xgen.mongot.index.query.operators.VectorSearchOperator;
-import com.xgen.mongot.index.query.operators.VectorSearchQueryInput;
 import com.xgen.mongot.metrics.MetricsFactory;
 import com.xgen.mongot.searchenvoy.grpc.SearchEnvoyMetadata;
 import com.xgen.mongot.server.command.Command;
@@ -57,7 +52,6 @@ import com.xgen.mongot.server.command.search.definition.request.SearchCommandDef
 import com.xgen.mongot.server.message.MessageUtils;
 import com.xgen.mongot.trace.Tracing;
 import com.xgen.mongot.util.Bytes;
-import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.ErrorType;
 import com.xgen.mongot.util.UserFacingException;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
@@ -290,65 +284,14 @@ public class SearchCommand implements Command {
   @VisibleForTesting
   SearchQuery maybeEmbedSearchQuery(SearchQuery queryDefinition, IndexDefinition indexDefinition)
       throws InvalidQueryException {
-    if (!(queryDefinition instanceof OperatorQuery operatorQuery)) {
-      return queryDefinition;
-    }
-    if (!(operatorQuery.operator() instanceof VectorSearchOperator vecOp)) {
-      return queryDefinition;
-    }
-    VectorSearchCriteria criteria = vecOp.criteria();
-    Optional<String> textToEmbed = criteria.query().flatMap(VectorSearchQueryInput::getText);
-
-    Optional<IndexDefinition> effectiveDef =
-        SearchAutoEmbeddingHelper.resolveAutoEmbeddingDefinition(
-            this.indexCatalog,
-            this.definition.db(),
-            this.definition.collectionUuid(),
-            this.definition.viewName(),
-            queryDefinition.index(),
-            indexDefinition);
-    if (effectiveDef.isEmpty()
-        || !(effectiveDef.get() instanceof SearchIndexDefinition searchDef)) {
-      return queryDefinition;
-    }
-
-    var autoEmbeddingFieldsMapping =
-        SearchAutoEmbeddingHelper.resolveAutoEmbeddingFieldsMapping(
-            this.indexCatalog,
-            this.definition.db(),
-            this.definition.collectionUuid(),
-            this.definition.viewName(),
-            queryDefinition.index());
-
-    VectorSearchCriteria rewrittenCriteria;
-    if (textToEmbed.isPresent()) {
-      // Text query on an auto-embedding index: embed the text and retarget the criteria to the
-      // materialized-view vector path.
-      Optional<String> queryModel = criteria.query().flatMap(VectorSearchQueryInput::getModel);
-      rewrittenCriteria =
-          SearchAutoEmbeddingHelper.embedAndReplaceCriteria(
-              criteria,
-              textToEmbed.get(),
-              queryModel,
-              searchDef,
-              autoEmbeddingFieldsMapping,
-              this.embeddingServiceManagerSupplier);
-    } else if (criteria.queryVector().isPresent()) {
-      // User-supplied queryVector. On an auto-embed field the declared path is retargeted to the
-      // materialized-view vector path and the dtype reconciled against the indexed encoding; on a
-      // regular type:vector field the criteria is returned unchanged.
-      rewrittenCriteria =
-          SearchAutoEmbeddingHelper.retargetQueryVectorCriteria(
-              criteria, criteria.queryVector().get(), searchDef, autoEmbeddingFieldsMapping);
-    } else {
-      // VectorSearchCriteria guarantees exactly one of query/queryVector, so a text query must be
-      // present here; getText() is empty only when that query carries no text.
-      Check.checkState(
-          criteria.query().isPresent(), "query must be present when queryVector is absent");
-      throw new InvalidQueryException(
-          "'query' field cannot be empty when querying Automated Embedding index");
-    }
-    return operatorQuery.withOperator(new VectorSearchOperator(vecOp.score(), rewrittenCriteria));
+    return SearchAutoEmbeddingHelper.prepare(
+        this.indexCatalog,
+        this.embeddingServiceManagerSupplier,
+        this.definition.db(),
+        this.definition.collectionUuid(),
+        this.definition.viewName(),
+        queryDefinition,
+        indexDefinition);
   }
 
   private void validateQueryAndCursorOptions(

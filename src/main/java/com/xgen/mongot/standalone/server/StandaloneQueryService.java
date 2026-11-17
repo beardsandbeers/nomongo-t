@@ -8,7 +8,6 @@ import com.xgen.mongot.cursor.batch.QueryCursorOptions;
 import com.xgen.mongot.index.lucene.explain.explainers.MetadataFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.explain.tracing.ExplainTooLargeException;
-import com.xgen.mongot.index.query.MaterializedVectorSearchQuery;
 import com.xgen.mongot.index.query.QueryExecutionContext;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
@@ -36,7 +35,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
-import org.bson.types.ObjectId;
 
 /** Public queries using ordinary mongot parsers, readers and snapshot-pinning cursors. */
 final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
@@ -52,6 +50,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     private final String principal;
     private final String index;
     private final String generation;
+    private final com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease;
     private final Optional<StandaloneJoinPlanner.Plan> joinPlan;
     private volatile long lastAccess = System.nanoTime();
 
@@ -59,10 +58,12 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         String principal,
         String index,
         String generation,
+        com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease,
         Optional<StandaloneJoinPlanner.Plan> joinPlan) {
       this.principal = principal;
       this.index = index;
       this.generation = generation;
+      this.readLease = readLease;
       this.joinPlan = joinPlan;
     }
   }
@@ -103,21 +104,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   }
 
   QueryResponse query(QueryRequest request, boolean vector) {
-    var desired = this.runtime.catalog().getIndex(request.getIndexId());
-    StandaloneAuthInterceptor.requireIndex(desired.getIndexId());
-    if (desired.getLifecycleState().equals("DROPPED")) {
-      throw Status.NOT_FOUND.withDescription("Index was dropped").asRuntimeException();
-    }
-    var generation =
-        this.runtime
-            .liveIndexes()
-            .getIndexById(new ObjectId(request.getIndexId()))
-            .filter(index -> this.runtime.ingestion().isGenerationReady(index.getGenerationId()))
-            .orElseThrow(
-                () ->
-                    Status.UNAVAILABLE
-                        .withDescription("Index is not query-ready")
-                        .asRuntimeException());
+    StandaloneAuthInterceptor.requireIndex(request.getIndexId());
+    var generation = this.runtime.reads().resolve(request.getIndexId(), request.getGenerationId());
+    var definition = generation.getDefinition();
     String generationId = generation.getGenerationId().uniqueString();
     if (!request.getGenerationId().isEmpty() && !generationId.equals(request.getGenerationId())) {
       throw Status.FAILED_PRECONDITION
@@ -134,38 +123,32 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
           .asRuntimeException();
     }
     @Var long cursorId = 0;
-    @Var boolean retained = false;
+    @Var Lease cursorLease = null;
     @Var StandaloneJoinPlanner.Plan joinPlan = null;
+    @Var com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease = null;
     try (var unused =
         Explain.setup(verbosity, Optional.of(generation.getDefinition().getNumPartitions()))) {
+      readLease = this.runtime.reads().acquire(generation.getGenerationId());
       Explain.getQueryInfo()
           .map(
               info ->
                   info.getFeatureExplainer(
                       MetadataFeatureExplainer.class, MetadataFeatureExplainer::new))
-          .ifPresent(metadata -> metadata.setIndexName(desired.getName()));
+          .ifPresent(metadata -> metadata.setIndexName(definition.getName()));
       var expression = new BsonDocument();
       expression.putAll(
           StandaloneBson.document(request.getQueryBson().toByteArray(), 1024 * 1024, 100));
       if (expression.containsKey("index")
-          && !expression.getString("index").getValue().equals(desired.getName())) {
+          && !expression.getString("index").getValue().equals(definition.getName())) {
         throw Status.INVALID_ARGUMENT
             .withDescription("Query index does not match index_id")
             .asRuntimeException();
       }
-      expression.put("index", new org.bson.BsonString(desired.getName()));
+      expression.put("index", new org.bson.BsonString(definition.getName()));
       CursorQuery query;
       if (vector) {
+        rejectUnusedBindings(request);
         var parsed = VectorSearchQuery.fromBson(expression);
-        var input =
-            parsed
-                .criteria()
-                .queryVector()
-                .orElseThrow(
-                    () ->
-                        Status.INVALID_ARGUMENT
-                            .withDescription("Standalone vector queries require queryVector")
-                            .asRuntimeException());
         var deadline =
             Optional.ofNullable(Context.current().getDeadline())
                 .map(
@@ -174,21 +157,31 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                             + Math.max(0, value.timeRemaining(TimeUnit.MILLISECONDS)));
         query =
             new CursorQuery.Vector(
-                new MaterializedVectorSearchQuery(parsed, input),
+                this.runtime.materializeVectorQuery(parsed, generation.getDefinition()),
                 QueryExecutionContext.withDeadline(deadline));
       } else {
+        @Var
         var parsed =
             SearchQuery.fromBson(
                 expression,
                 QueryOptimizationFlags.DEFAULT_OPTIONS,
                 this.runtime.searchQueryParseOptions());
         this.runtime.validateSearchQuery(parsed);
+        parsed = this.runtime.materializeSearchQuery(parsed, generation.getDefinition());
         if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(parsed))) {
-          joinPlan = this.joinPlanner.prepare(parsed, generation.getGenerationId());
+          joinPlan =
+              this.joinPlanner.prepare(
+                  parsed, generation.getGenerationId(), request.getJoinIndexesList());
           query = new CursorQuery.Search(joinPlan.query(), Optional.of(joinPlan.snapshot()));
         } else {
+          rejectUnusedBindings(request);
           query = new CursorQuery.Search(parsed);
         }
+      }
+      if (readLease.retired()) {
+        throw Status.UNAVAILABLE
+            .withDescription("Query generation was retired")
+            .asRuntimeException();
       }
       var cursor =
           this.runtime
@@ -224,22 +217,48 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       if (joinPlan != null) {
         joinPlan.verifyDependencies();
       }
+      if (readLease.retired()) {
+        throw Status.UNAVAILABLE
+            .withDescription("Query generation was retired")
+            .asRuntimeException();
+      }
       if (!plannerOnly && !batch.exhausted) {
-        this.leases.put(
-            cursorId,
+        var lease =
             new Lease(
                 StandaloneAuthInterceptor.principal().name(),
-                desired.getIndexId(),
+                request.getIndexId(),
                 generationId,
-                Optional.ofNullable(joinPlan)));
-        response.setCursorId(cursorId);
-        retained = true;
+                readLease,
+                Optional.ofNullable(joinPlan));
+        synchronized (lease) {
+          this.leases.put(cursorId, lease);
+          // Transfer cleanup ownership before callbacks can run or registration can fail.
+          // The same monitor keeps retirement from closing the plan during registration.
+          cursorLease = lease;
+          long registeredId = cursorId;
+          readLease.onInvalidated(() -> discardCursor(registeredId));
+          if (joinPlan != null) {
+            joinPlan.onInvalidated(() -> discardCursor(registeredId));
+          }
+          if (readLease.retired()) {
+            throw Status.UNAVAILABLE
+                .withDescription("Query generation was retired")
+                .asRuntimeException();
+          }
+          if (joinPlan != null) {
+            joinPlan.verifyDependencies();
+          }
+          response.setCursorId(cursorId);
+        }
       }
       return response.build();
     } catch (Exception e) {
+      if (cursorLease != null) {
+        release(cursorId, cursorLease);
+      }
       throw queryError(e);
     } finally {
-      if (!retained) {
+      if (cursorLease == null) {
         try {
           if (cursorId != 0) {
             this.runtime.cursors().killCursor(cursorId);
@@ -250,6 +269,9 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
               closeJoinPlan(joinPlan);
             }
           } finally {
+            if (readLease != null) {
+              readLease.close();
+            }
             this.capacity.release();
           }
         }
@@ -257,9 +279,18 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     }
   }
 
+  private static void rejectUnusedBindings(QueryRequest request) {
+    if (request.getJoinIndexesCount() != 0) {
+      throw Status.INVALID_ARGUMENT
+          .withDescription("Join index bindings require a join operator")
+          .asRuntimeException();
+    }
+  }
+
   @Override
   public void getMore(GetMoreRequest request, StreamObserver<QueryResponse> observer) {
-    this.dispatcher.unary(request.getSerializedSize(), observer, () -> nextBatch(request));
+    this.dispatcher.unary(
+        request.getSerializedSize(), observer, () -> nextBatch(request), this::abandoned);
   }
 
   QueryResponse nextBatch(GetMoreRequest request) {
@@ -279,6 +310,11 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                     new BatchCursorOptions(
                         Optional.empty(), Optional.of(batchSize(request.getBatchSize()))));
         lease.joinPlan.ifPresent(StandaloneJoinPlanner.Plan::verifyDependencies);
+        if (lease.readLease.retired()) {
+          throw Status.NOT_FOUND
+              .withDescription("Cursor generation was retired")
+              .asRuntimeException();
+        }
         lease.lastAccess = System.nanoTime();
         if (batch.exhausted) {
           release(request.getCursorId(), lease);
@@ -333,7 +369,12 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       // A search already in progress can register its cursor after drop's invalidation pass.
       // Consult the index catalog so that such a cursor cannot serve another batch.
       try {
-        this.runtime.catalog().getIndex(lease.index);
+        if (lease.readLease.retired()
+            || !this.runtime.reads().isGenerationReady(lease.readLease.index().getGenerationId())) {
+          throw Status.NOT_FOUND
+              .withDescription("Cursor generation was retired")
+              .asRuntimeException();
+        }
         lease.joinPlan.ifPresent(StandaloneJoinPlanner.Plan::verifyDependencies);
       } catch (io.grpc.StatusRuntimeException e) {
         release(id, lease);
@@ -359,9 +400,13 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     long cutoff = System.nanoTime() - IDLE_NANOS;
     this.leases.forEach(
         (id, lease) -> {
-          if (lease.lastAccess < cutoff) {
+          if (lease.lastAccess < cutoff
+              || lease.readLease.retired()
+              || !this.runtime.cursors().isDirectCursor(id)) {
             synchronized (lease) {
-              if (lease.lastAccess < cutoff) {
+              if (lease.lastAccess < cutoff
+                  || lease.readLease.retired()
+                  || !this.runtime.cursors().isDirectCursor(id)) {
                 release(id, lease);
               }
             }
@@ -370,14 +415,17 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   }
 
   private void release(long id, Lease lease) {
-    if (this.leases.remove(id, lease)) {
-      try {
-        this.runtime.cursors().killCursor(id);
-      } finally {
+    synchronized (lease) {
+      if (this.leases.remove(id, lease)) {
         try {
-          lease.joinPlan.ifPresent(StandaloneQueryService::closeJoinPlan);
+          this.runtime.cursors().killCursor(id);
         } finally {
-          this.capacity.release();
+          try {
+            lease.joinPlan.ifPresent(StandaloneQueryService::closeJoinPlan);
+          } finally {
+            lease.readLease.close();
+            this.capacity.release();
+          }
         }
       }
     }

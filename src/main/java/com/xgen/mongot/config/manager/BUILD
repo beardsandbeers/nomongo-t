@@ -13,6 +13,7 @@ java_library(
         "ConfigState.java",
         "DefaultConfigManager.java",
         "DesiredConfigStateUpdater.java",
+        "GenerationReadLeases.java",
         "IncompatibleIndexes.java",
         "IndexActions.java",
         "IndexChangeReason.java",

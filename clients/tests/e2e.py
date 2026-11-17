@@ -720,6 +720,38 @@ def exercise(client):
         {"0", "1", "2"},
     )
     checks.append("query plans, execution tracing, cumulative GetMore statistics")
+    metadata = client.call(
+        "SearchMeta",
+        {
+            "targetIndexId": text["indexId"],
+            "queryBson": encoded(
+                {"text": {"path": "title", "query": "coffee"}, "count": {"type": "total"}}
+            ),
+        },
+    )
+    check(
+        decoded(metadata["metadataBson"])["count"]["total"] == 3,
+        "Explicit SearchMeta target or read-contract acknowledgment failed",
+    )
+    first_page = client.call(
+        "ListIndexes", {"ownership": "INDEX_OWNERSHIP_STANDALONE", "pageSize": 1}
+    )
+    check(len(first_page["indexes"]) == 1 and first_page.get("nextPageToken"), "Missing index page")
+    second_page = client.call(
+        "ListIndexes",
+        {
+            "ownership": "INDEX_OWNERSHIP_STANDALONE",
+            "pageSize": 1,
+            "pageToken": first_page["nextPageToken"],
+        },
+    )
+    check(
+        second_page["indexes"][0]["indexId"] != first_page["indexes"][0]["indexId"],
+        "Index pagination repeated an entry",
+    )
+    checks.append(
+        "all-index read contract, explicit SearchMeta targets, ownership filters, pagination"
+    )
     verify_stats(client, text, 3)
     checks.append(
         "per-index stats, bytes per document, field ledger, filtered immutable pagination"

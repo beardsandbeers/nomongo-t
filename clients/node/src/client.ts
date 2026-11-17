@@ -62,10 +62,32 @@ export class StandaloneClient {
     this.queries = new api.QueryService(address, credentials, channelOptions);
   }
   close(): void { this.catalog.close(); this.documents.close(); this.queries.close(); this.operations.close(); }
-  private call<T>(invoke: (metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<T>) => grpc.ClientUnaryCall): Promise<T> {
-    return new Promise((resolve, reject) => invoke(this.metadata, { deadline: Date.now() + this.timeoutMs }, (error, value) => {
-      if (error) reject(error); else if (value === undefined) reject(new Error('Missing gRPC response')); else resolve(value);
-    }));
+  private call<T>(invoke: (metadata: grpc.Metadata, options: grpc.CallOptions, callback: grpc.requestCallback<T>) => grpc.ClientUnaryCall, requiresContract = false, discard?: (value: T) => Promise<void>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const metadata = this.metadata.clone();
+      let acknowledged = false;
+      if (requiresContract) metadata.set('mongot-direct-read-contract', 'all-index-reads-v1');
+      const call = invoke(metadata, { deadline: Date.now() + this.timeoutMs }, async (error, value) => {
+        if (error) reject(error);
+        else if (requiresContract && !acknowledged) {
+          try {
+            if (value !== undefined) await discard?.(value);
+          } catch { /* Preserve the contract error if cleanup fails. */ }
+          reject(new Error('Server does not support the all-index direct read contract'));
+        } else if (value === undefined) reject(new Error('Missing gRPC response'));
+        else resolve(value);
+      });
+      call.on('metadata', (headers: grpc.Metadata) => {
+        acknowledged = headers.get('mongot-direct-read-contract').includes('all-index-reads-v1');
+      });
+    });
+  }
+  private discardQueryResponse(response: QueryResponse__Output): Promise<void> {
+    if (!response.cursorId || response.cursorId === '0') return Promise.resolve();
+    return new Promise(resolve => {
+      this.queries.killCursor({ cursorId: response.cursorId }, this.metadata,
+        { deadline: Date.now() + Math.min(this.timeoutMs, 5000) }, () => resolve());
+    });
   }
   createIndex(request: CreateIndexRequest): Promise<IndexDescription__Output> {
     return this.call((metadata, options, callback) => this.catalog.createIndex(request, metadata, options, callback));
@@ -83,7 +105,8 @@ export class StandaloneClient {
     return this.call((metadata, options, callback) => this.catalog.getIndexMappings(request, metadata, options, callback));
   }
   listIndexes(request: ListIndexesRequest): Promise<ListIndexesResponse__Output> {
-    return this.call((metadata, options, callback) => this.catalog.listIndexes(request, metadata, options, callback));
+    const ownership = request.ownership === 'INDEX_OWNERSHIP_UNSPECIFIED' ? 0 : request.ownership;
+    return this.call((metadata, options, callback) => this.catalog.listIndexes(request, metadata, options, callback), !!(ownership || request.pageSize || request.pageToken));
   }
   getIndexStats(request: GetIndexStatsRequest): Promise<IndexStats__Output> {
     return this.call((metadata, options, callback) => this.catalog.getIndexStats(request, metadata, options, callback));
@@ -95,13 +118,13 @@ export class StandaloneClient {
     return this.call((metadata, options, callback) => this.operations.getStatus(request, metadata, options, callback));
   }
   search(request: QueryRequest): Promise<QueryResponse__Output> {
-    return this.call((metadata, options, callback) => this.queries.search(request, metadata, options, callback));
+    return this.call((metadata, options, callback) => this.queries.search(request, metadata, options, callback), !!request.joinIndexes?.length, response => this.discardQueryResponse(response));
   }
   searchMeta(request: SearchMetaRequest): Promise<SearchMetaResponse__Output> {
-    return this.call((metadata, options, callback) => this.queries.searchMeta(request, metadata, options, callback));
+    return this.call((metadata, options, callback) => this.queries.searchMeta(request, metadata, options, callback), !!(request.targetIndexId || request.joinIndexes?.length));
   }
   vectorSearch(request: QueryRequest): Promise<QueryResponse__Output> {
-    return this.call((metadata, options, callback) => this.queries.vectorSearch(request, metadata, options, callback));
+    return this.call((metadata, options, callback) => this.queries.vectorSearch(request, metadata, options, callback), !!request.joinIndexes?.length, response => this.discardQueryResponse(response));
   }
   getMore(request: GetMoreRequest): Promise<QueryResponse__Output> {
     return this.call((metadata, options, callback) => this.queries.getMore(request, metadata, options, callback));
