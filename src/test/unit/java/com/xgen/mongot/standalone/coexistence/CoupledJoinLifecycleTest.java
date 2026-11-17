@@ -30,12 +30,14 @@ import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot.OrdinalJoinPartitio
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.codec.LuceneCodec;
+import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.query.OrdinalJoinPreparation;
 import com.xgen.mongot.index.lucene.query.OrdinalJoinQuery;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.operators.CompoundOperator;
 import com.xgen.mongot.index.query.operators.JoinField;
+import com.xgen.mongot.index.query.operators.JoinKeySet;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
 import com.xgen.mongot.index.query.operators.OrdinalJoinMembership;
 import com.xgen.mongot.index.status.IndexStatus;
@@ -50,6 +52,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Random;
@@ -108,6 +111,121 @@ public class CoupledJoinLifecycleTest {
   public static final LuceneCodec.WriteFormat[] CODECS = {
     LuceneCodec.WriteFormat.LUCENE99, LuceneCodec.WriteFormat.LUCENE104
   };
+
+  @DataPoints
+  public static final JoinPlanner.MemoryLimits[] HASH_FALLBACK_LIMITS = {
+    new JoinPlanner.MemoryLimits(512L << 20, 1L << 30),
+    new JoinPlanner.MemoryLimits(32L << 20, 1L << 30),
+    new JoinPlanner.MemoryLimits(512L << 20, 32L << 20)
+  };
+
+  @Theory
+  public void prepare_segmentedFirstPageHashLimit_retriesOrdinalsAndReleasesHashReservation(
+      JoinPlanner.MemoryLimits limits, LuceneCodec.WriteFormat codec) throws Exception {
+    try (var data =
+            new OrdinalData(
+                List.of(
+                    OrdinalData.keyDocument(0, 75_000), OrdinalData.keyDocument(75_000, 75_000)),
+                codec);
+        var scope = Explain.setup(Optional.of(Explain.Verbosity.EXECUTION_STATS), Optional.of(1));
+        var fixture =
+            new Fixture(
+                limits,
+                Optional.of(data.partitions()),
+                SearchQuery.fromBson(BsonDocument.parse(ORDINAL_OPERATOR)))) {
+      var compound = (CompoundOperator) JoinPlanner.operator(fixture.prepared.plan.query());
+      var join = (MaterializedJoinOperator) compound.filter().operators().getFirst();
+      var membership = (OrdinalJoinMembership) join.membership();
+      var query = new OrdinalJoinQuery(OrdinalData.FIELD, membership, Optional.empty());
+
+      int matches = new IndexSearcher(data.reader).count(query);
+
+      assertThat(data.reader.leaves()).hasSize(2);
+      assertThat(matches).isEqualTo(2);
+      assertThat(membership.size()).isEqualTo(150_000);
+      assertThat(membership.selectionReason()).isEqualTo("hashAdmissionLimitExceeded");
+      assertThat(JoinPlanner.retainedBytes()).isLessThan(5 * 1024 * 1024.0);
+      var preparation =
+          Explain.collect().orElseThrow().toBson().getDocument("joins").getDocument("preparation");
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(150_000);
+      // The foreign hash pass is charged in addition to ordinal collection and translation.
+      assertThat(preparation.getInt64("foreignWorkUnits").getValue()).isGreaterThan(450_020L);
+    }
+    assertThat(JoinPlanner.retainedBytes()).isEqualTo(0.0);
+  }
+
+  @Test
+  public void prepare_secondJoinReachesHashCap_preservesFirstJoinReservation() throws Exception {
+    var query =
+        SearchQuery.fromBson(
+            BsonDocument.parse(
+                """
+                {compound:{filter:[
+                  {join:{localField:'key',foreignField:'key',operator:{exists:{path:'key'}}}},
+                  {join:{localField:'key',foreignField:'key',
+                    operator:{exists:{path:'key',score:{constant:{value:2}}}}}}
+                ]}}
+                """));
+    try (var data =
+            new OrdinalData(
+                List.of(
+                    OrdinalData.keyDocument(0, 30_000), OrdinalData.keyDocument(30_000, 30_000)),
+                LuceneCodec.WriteFormat.LUCENE99);
+        var scope = Explain.setup(Optional.of(Explain.Verbosity.EXECUTION_STATS), Optional.of(1));
+        var fixture =
+            new Fixture(
+                new JoinPlanner.MemoryLimits(256L << 20, 512L << 20),
+                Optional.of(data.partitions()),
+                query)) {
+      var compound = (CompoundOperator) JoinPlanner.operator(fixture.prepared.plan.query());
+      var first = (MaterializedJoinOperator) compound.filter().operators().getFirst();
+      var second = (MaterializedJoinOperator) compound.filter().operators().getLast();
+      var preparation =
+          Explain.collect().orElseThrow().toBson().getDocument("joins").getDocument("preparation");
+
+      assertThat(first.membership()).isInstanceOf(JoinKeySet.class);
+      assertThat(second.membership()).isInstanceOf(OrdinalJoinMembership.class);
+      assertThat(first.membership().size()).isEqualTo(60_000);
+      assertThat(second.membership().size()).isEqualTo(60_000);
+      assertThat(preparation.getInt32("keyCount").getValue()).isEqualTo(120_000);
+      assertThat(JoinPlanner.retainedBytes()).isGreaterThan(60 * 1024 * 1024.0);
+    }
+    assertThat(JoinPlanner.retainedBytes()).isEqualTo(0.0);
+  }
+
+  @Test
+  public void prepare_hashFallbackCancellation_preservesOtherPlanReservation() throws Exception {
+    var cancelled = new AtomicBoolean();
+    try (var data =
+            new OrdinalData(
+                List.of(
+                    OrdinalData.keyDocument(0, 75_000), OrdinalData.keyDocument(75_000, 75_000)),
+                LuceneCodec.WriteFormat.LUCENE99);
+        var fixture =
+            new Fixture(
+                new JoinPlanner.MemoryLimits(32L << 20, 64L << 20),
+                Optional.of(
+                    data.partitions(
+                        () -> {
+                          if (cancelled.get()) {
+                            throw new CancellationException("Cancelled during ordinal retry");
+                          }
+                        })),
+                SearchQuery.fromBson(BsonDocument.parse(ORDINAL_OPERATOR)))) {
+      double retained = JoinPlanner.retainedBytes();
+      cancelled.set(true);
+
+      assertThrows(CancellationException.class, fixture::prepare);
+
+      assertThat(JoinPlanner.retainedBytes()).isEqualTo(retained);
+      cancelled.set(false);
+      try (var second = fixture.prepare()) {
+        assertThat(JoinPlanner.retainedBytes()).isEqualTo(2 * retained);
+      }
+      assertThat(JoinPlanner.retainedBytes()).isEqualTo(retained);
+    }
+    assertThat(JoinPlanner.retainedBytes()).isEqualTo(0.0);
+  }
 
   @Theory
   public void prepare_longTokenScorers_reservesActualAllocations(
@@ -328,25 +446,18 @@ public class CoupledJoinLifecycleTest {
     private final DirectoryReader reader;
 
     private OrdinalData(int segments, LuceneCodec.WriteFormat codec) throws IOException {
+      this(Collections.nCopies(segments, longKeyDocument()), codec);
+    }
+
+    private OrdinalData(List<Document> documents, LuceneCodec.WriteFormat codec)
+        throws IOException {
       try (var writer =
           new IndexWriter(
               this.directory,
               new IndexWriterConfig()
                   .setCodec(new LuceneCodec(codec))
                   .setMergePolicy(NoMergePolicy.INSTANCE))) {
-        var document = new Document();
-        for (int key = 0; key < 50_000; key++) {
-          document.add(new SortedSetDocValuesField(FIELD, new BytesRef("key-" + key)));
-        }
-        var random = new Random(13);
-        for (int key = 0; key < 64; key++) {
-          byte[] value = new byte[7000];
-          for (int i = 0; i < value.length; i++) {
-            value[i] = (byte) ('A' + random.nextInt(26));
-          }
-          document.add(new SortedSetDocValuesField(FIELD, new BytesRef(value)));
-        }
-        for (int segment = 0; segment < segments; segment++) {
+        for (var document : documents) {
           writer.addDocument(document);
           writer.commit();
         }
@@ -354,13 +465,40 @@ public class CoupledJoinLifecycleTest {
       this.reader = DirectoryReader.open(this.directory);
     }
 
+    private static Document keyDocument(int start, int count) {
+      var document = new Document();
+      for (int key = start; key < start + count; key++) {
+        document.add(new SortedSetDocValuesField(FIELD, new BytesRef("key-" + key)));
+      }
+      return document;
+    }
+
+    private static Document longKeyDocument() {
+      var document = keyDocument(0, 50_000);
+      var random = new Random(13);
+      for (int key = 0; key < 64; key++) {
+        byte[] value = new byte[7000];
+        for (int i = 0; i < value.length; i++) {
+          value[i] = (byte) ('A' + random.nextInt(26));
+        }
+        document.add(new SortedSetDocValuesField(FIELD, new BytesRef(value)));
+      }
+      return document;
+    }
+
     private List<OrdinalJoinPartition> partitions() {
+      return partitions(() -> {});
+    }
+
+    private List<OrdinalJoinPartition> partitions(Runnable beforeCollection) {
       var searcher = new IndexSearcher(this.reader);
       return List.of(
           new OrdinalJoinPartition(
               this.reader,
-              (predicate, collector, check) ->
-                  searcher.search(new MatchAllDocsQuery(), collector)));
+              (predicate, collector, check) -> {
+                beforeCollection.run();
+                searcher.search(new MatchAllDocsQuery(), collector);
+              }));
     }
 
     @Override

@@ -213,21 +213,7 @@ public class JoinPlanner {
           long foreignStart = System.nanoTime();
           long foreignNanos;
           try (var ignored = Explain.suspend()) {
-            var ordinals = prepareOrdinals(plan, foreign, join, localField, query);
-            if (ordinals.isPresent()) {
-              membership = ordinals.get();
-            } else {
-              plan.reserveBytes(
-                  64L * 1024 * (1L + (long) localSnapshot.partitions() * plan.localQueryCopies));
-              var keys = new JoinKeySet.Builder(plan::reserveKey);
-              foreign.collectKeys(
-                  join.operator(),
-                  join.foreignField(),
-                  localField.type(),
-                  keys::add,
-                  plan::checkWork);
-              membership = keys.build();
-            }
+            membership = prepareMembership(plan, foreign, join, localField, query);
           } finally {
             foreignNanos = joinExplain.isPresent() ? System.nanoTime() - foreignStart : 0;
             this.environment.elapsed("joins.foreign", foreignStart);
@@ -336,8 +322,61 @@ public class JoinPlanner {
     return query instanceof CollectorQuery || query.count().type() == Count.Type.TOTAL;
   }
 
-  private Optional<JoinMembership> prepareOrdinals(
+  private static final class HashAdmissionException extends RuntimeException {
+    private final RuntimeException failure;
+
+    private HashAdmissionException(RuntimeException failure) {
+      super(failure);
+      this.failure = failure;
+    }
+  }
+
+  private JoinMembership prepareMembership(
       Plan plan, QuerySnapshot foreign, JoinOperator join, JoinField field, SearchQuery query)
+      throws IOException, InvalidQueryException {
+    var ordinals = prepareOrdinals(plan, foreign, join, field, query, false);
+    if (ordinals.isPresent()) {
+      return ordinals.get();
+    }
+    try {
+      return prepareHash(plan, foreign, join, field);
+    } catch (HashAdmissionException e) {
+      return prepareOrdinals(plan, foreign, join, field, query, true).orElseThrow(() -> e.failure);
+    }
+  }
+
+  private JoinKeySet prepareHash(
+      Plan plan, QuerySnapshot foreign, JoinOperator join, JoinField field)
+      throws IOException, InvalidQueryException {
+    long bytesBefore = plan.bytes;
+    long keyBytesBefore = plan.keyBytes;
+    int keysBefore = plan.keys;
+    int hashKeysBefore = plan.hashKeys;
+    try {
+      plan.reserveHashBytes(
+          64L * 1024 * (1L + (long) plan.snapshot().partitions() * plan.localQueryCopies));
+      var keys = new JoinKeySet.Builder(plan::reserveKey);
+      foreign.collectKeys(
+          join.operator(), join.foreignField(), field.type(), keys::add, plan::checkWork);
+      return keys.build();
+    } catch (HashAdmissionException e) {
+      // Only this domain's abandoned membership is released. Keep prior domains and the work
+      // charged to this attempt; ordinal retry uses the same pinned snapshots and cancellation.
+      plan.releaseBytes(plan.bytes - bytesBefore);
+      plan.keyBytes = keyBytesBefore;
+      plan.keys = keysBefore;
+      plan.hashKeys = hashKeysBefore;
+      throw e;
+    }
+  }
+
+  private Optional<JoinMembership> prepareOrdinals(
+      Plan plan,
+      QuerySnapshot foreign,
+      JoinOperator join,
+      JoinField field,
+      SearchQuery query,
+      boolean hashLimitExceeded)
       throws IOException, InvalidQueryException {
     // Dictionary size is informative for broad predicates over the join field. It tells us little
     // about the selected keys of a predicate on another field.
@@ -368,7 +407,7 @@ public class JoinPlanner {
     // Above the hash cap, allow a compact path even for the first page. The sum of dictionary
     // sizes may overstate distinct live keys, so still apply the local-size check below.
     boolean aboveHashCap = foreignStats.get().largestDictionary() > MAX_KEYS;
-    if (foreignEntries < threshold && !aboveHashCap) {
+    if (!hashLimitExceeded && foreignEntries < threshold && !aboveHashCap) {
       return Optional.empty();
     }
     var localStats = inspectOrdinals(plan, localPartitions.get(), localField, field.type(), true);
@@ -379,10 +418,14 @@ public class JoinPlanner {
     var source = foreignStats.get();
     // Large repeated local dictionaries increase merge and probe setup. Give exhaustive searches
     // more room when their collector can amortize the translation.
-    if (local.entries() > (exhaustive(query) ? 16 : 8) * foreignEntries) {
+    if (!hashLimitExceeded && local.entries() > (exhaustive(query) ? 16 : 8) * foreignEntries) {
       return Optional.empty();
     }
-    if (firstRelevancePage && !exhaustive(query) && !aboveHashCap && local.leaves() > 16) {
+    if (!hashLimitExceeded
+        && firstRelevancePage
+        && !exhaustive(query)
+        && !aboveHashCap
+        && local.leaves() > 16) {
       return Optional.empty();
     }
     // Each local DocValues scorer eagerly allocates dictionary buffers even when it only reads
@@ -403,11 +446,13 @@ public class JoinPlanner {
       return Optional.empty();
     }
     String reason =
-        aboveHashCap
-            ? "foreignDictionaryAboveHashCap"
-            : (exhaustive(query)
-                ? "largeExhaustiveJoin"
-                : (firstRelevancePage ? "largeRelevanceJoin" : "largeSortedOrPaginatedJoin"));
+        hashLimitExceeded
+            ? "hashAdmissionLimitExceeded"
+            : (aboveHashCap
+                ? "foreignDictionaryAboveHashCap"
+                : (exhaustive(query)
+                    ? "largeExhaustiveJoin"
+                    : (firstRelevancePage ? "largeRelevanceJoin" : "largeSortedOrPaginatedJoin")));
     var result =
         OrdinalJoinPreparation.prepare(
             foreignPartitions.get(),
@@ -582,15 +627,16 @@ public class JoinPlanner {
     }
 
     private void reserveKey(int keyBytes) {
-      if (++this.hashKeys > MAX_KEYS) {
-        throw exhausted("Join distinct-key limit exceeded");
+      if (this.hashKeys == MAX_KEYS) {
+        throw new HashAdmissionException(exhausted("Join distinct-key limit exceeded"));
       }
       // Includes pooled bytes, foreign ordinal deduplication, per-partition probes,
       // lazy term queries and rewrites, or numeric set-query arrays and hash tables.
       // Keep conservative cursor-lifetime admission.
       long estimate =
           (400L + 16L * keyBytes) * (1L + (long) snapshot().partitions() * this.localQueryCopies);
-      reserveBytes(estimate);
+      reserveHashBytes(estimate);
+      this.hashKeys++;
       this.keys++;
       this.keyBytes += keyBytes;
     }
@@ -623,6 +669,14 @@ public class JoinPlanner {
     private void releaseBytes(long bytes) {
       this.bytes -= bytes;
       RETAINED_BYTES.addAndGet(-bytes);
+    }
+
+    private void reserveHashBytes(long estimate) {
+      try {
+        reserveBytes(estimate);
+      } catch (RuntimeException e) {
+        throw new HashAdmissionException(e);
+      }
     }
 
     private void reserveBytes(long estimate) {

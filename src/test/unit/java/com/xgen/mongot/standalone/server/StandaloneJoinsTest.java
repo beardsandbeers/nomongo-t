@@ -1618,6 +1618,63 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_segmentedFirstPageAboveHashCap_retriesOrdinalsAndPreservesCursor()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(1L << 28, 1L << 29))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(75_000, 1));
+      var secondForeign = BsonDocument.parse(keyDocument(75_000, 2));
+      secondForeign.put("_id", new org.bson.BsonString("q"));
+      f.upsert(foreign, secondForeign.toJson());
+      f.upsert(local, "{_id:'first',parent:'x0'}");
+      f.upsert(local, "{_id:'second',parent:'xx74999'}");
+      f.upsert(local, "{_id:'miss',parent:'absent'}");
+      String firstPage =
+          JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}")
+              .replace("type:'total'", "type:'lowerBound'");
+
+      var first =
+          f.queries.search(
+              request(local, firstPage, 1).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertJoinStrategy(first, "ordinalBitmap");
+      var explain = new RawBsonDocument(first.getExplainBson().toByteArray());
+      assertThat(
+              explain
+                  .getDocument("joins")
+                  .getDocument("preparation")
+                  .getInt32("keyCount")
+                  .getValue())
+          .isEqualTo(150_000);
+      assertThat(
+              explain
+                  .getArray("indexPartitionExplain")
+                  .getFirst()
+                  .asDocument()
+                  .getDocument("joins")
+                  .getArray("execution")
+                  .getFirst()
+                  .asDocument()
+                  .getString("selectionReason")
+                  .getValue())
+          .isEqualTo("hashAdmissionLimitExceeded");
+      assertThat(first.getCursorId()).isNotEqualTo(0L);
+      assertThat(reservedBytes(f)).isGreaterThan(0.0);
+      assertThat(reservedBytes(f)).isLessThan(1024 * 1024.0);
+      var next =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
+      var allIds = new java.util.ArrayList<>(ids(first));
+      allIds.addAll(ids(next));
+      assertThat(allIds).containsExactly("first", "second");
+      assertThat(next.getCursorId()).isEqualTo(0L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
   public void search_denseJoinAboveHashCap_preservesSortedCursorAndReleasesMemory()
       throws Exception {
     try (var f = new Fixture(data(), List.of())) {

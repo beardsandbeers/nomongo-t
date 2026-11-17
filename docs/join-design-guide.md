@@ -1022,6 +1022,17 @@ charges bitmap preparation as well as hash collection. Ordinal domains have a
 separate cumulative distinct-key cap. Both strategies preserve exact matches.
 Explain reports `ordinalBitmap` and the selection reason for ordinal queries.
 
+If hash collection reaches its distinct-key or memory limit, eligible string and
+ObjectId joins retry ordinal preparation once on the same pinned snapshots. This
+also handles keys spread across several smaller dictionaries. The retry bypasses
+cost heuristics, including the first-page threshold, but still requires the
+supported foreign predicate and enough memory for ordinal preparation. It releases
+only the abandoned domain's hash reservation and key counts; earlier domains and
+other queries keep their reservations. Both attempts count toward the same work
+limit, and cancellation is propagated. If ordinal admission is unavailable, the
+original hash-limit error is returned. Explain reports the selection reason
+`hashAdmissionLimitExceeded` after a successful retry.
+
 #### Follow-up design
 
 **Request intent.** Treat exact total counts and collectors requiring all matches
@@ -1062,10 +1073,10 @@ repays bitmap setup. Use the four-step advance before seeking as an initial
 candidate for calibration. The measured sparse full-count case still favors hash,
 so exhaustive intent alone must never force ordinals.
 
-**Admission and fallback.** If hash growth crosses its reservation, consider one
-restart on the same pinned snapshots only when the ordinal bound fits. Release discarded buffers and their
-reservation before rebuilding, and charge both passes to the same work limit.
-Propagate cancellation immediately. Reject when neither plan fits. Finish preparation before publishing any hits.
+**Admission and fallback.** The bounded restart described above currently applies
+to the supported broad predicates. Extending it to other predicates should retain
+the same snapshot, memory, work, cancellation, and cleanup guarantees. Finish
+preparation before publishing any hits.
 
 **Validation and rollout.** Start with forced hash and ordinal modes for tests,
 then record the proposed choice in shadow mode. Explain should include request
