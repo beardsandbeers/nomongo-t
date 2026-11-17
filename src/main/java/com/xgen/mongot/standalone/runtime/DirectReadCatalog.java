@@ -402,6 +402,7 @@ public final class DirectReadCatalog {
     return acquire(generation.indexId.toHexString(), generation.uniqueString());
   }
 
+  /** Validates an existing lease; compatible logical revisions do not retire its readers. */
   public boolean isGenerationReady(GenerationId generation) {
     var liveGeneration = this.live.getIndexById(generation.indexId);
     if (liveGeneration.isEmpty()
@@ -411,14 +412,10 @@ public final class DirectReadCatalog {
       return false;
     }
     if (this.local.owns(generation.indexId)) {
-      try {
-        var desired = this.local.getDefinition(generation.indexId.toHexString());
-        return liveGeneration.get().getIndex().getStatus().getStatusCode()
-                == IndexStatus.StatusCode.STEADY
-            && revision(desired) == revision(liveGeneration.get().getDefinition());
-      } catch (io.grpc.StatusRuntimeException error) {
-        return false;
-      }
+      return liveGeneration.get().getIndex().getStatus().getStatusCode()
+              == IndexStatus.StatusCode.STEADY
+          && this.local.permitsReadContinuation(
+              generation, revision(liveGeneration.get().getDefinition()));
     }
     return true;
   }

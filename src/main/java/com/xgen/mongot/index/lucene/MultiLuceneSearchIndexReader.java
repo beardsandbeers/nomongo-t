@@ -354,6 +354,11 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
+    public void disableQueryCache() {
+      this.snapshots.forEach(QuerySnapshot::disableQueryCache);
+    }
+
+    @Override
     public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
       return this.snapshots.getFirst().joinFields(path);
     }

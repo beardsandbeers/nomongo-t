@@ -147,6 +147,8 @@ public class JoinPlanner {
       long dependencyNanos = joinExplain.isPresent() ? System.nanoTime() - dependencyStart : 0;
       var localSnapshot =
           Objects.requireNonNull(plan.snapshots.get(localGeneration.indexId.toHexString()));
+      // Membership is charged to this cursor's reservation and must not outlive the plan.
+      localSnapshot.disableQueryCache();
       plan.localSnapshot = localSnapshot;
       Map<JoinOperator, Operator> resolved = new HashMap<>();
       for (var join : joins) {

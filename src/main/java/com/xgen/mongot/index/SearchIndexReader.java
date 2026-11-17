@@ -27,6 +27,9 @@ public interface SearchIndexReader extends IndexReader {
 
     void setCancellationCheck(Runnable check);
 
+    /** Prevents cursor-owned join membership from escaping into the shared query cache. */
+    void disableQueryCache();
+
     List<JoinField> joinFields(FieldPath path) throws InvalidQueryException;
 
     default JoinField joinField(FieldPath path) throws InvalidQueryException {

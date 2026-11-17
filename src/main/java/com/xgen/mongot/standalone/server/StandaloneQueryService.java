@@ -25,6 +25,7 @@ import com.xgen.mongot.standalone.grpc.SearchMetaRequest;
 import com.xgen.mongot.standalone.grpc.SearchMetaResponse;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import com.xgen.mongot.util.Bytes;
+import com.xgen.mongot.util.QueryCancellation;
 import io.grpc.Context;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -46,12 +47,27 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   private final Semaphore capacity = new Semaphore(1024);
   private final ConcurrentHashMap<Long, Lease> leases = new ConcurrentHashMap<>();
 
+  /** A stable callback for producers that retain it across RPCs, including counting workers. */
+  private static final class CursorCancellation {
+    private volatile Context context = Context.current();
+
+    private void activate(Context context) {
+      this.context = context;
+      check();
+    }
+
+    private void check() {
+      StandaloneJoinPlanner.checkCancellation(this.context);
+    }
+  }
+
   private static final class Lease {
     private final String principal;
     private final String index;
     private final String generation;
     private final com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease;
     private final Optional<StandaloneJoinPlanner.Plan> joinPlan;
+    private final CursorCancellation cancellation;
     private volatile long lastAccess = System.nanoTime();
 
     private Lease(
@@ -59,12 +75,14 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         String index,
         String generation,
         com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease,
-        Optional<StandaloneJoinPlanner.Plan> joinPlan) {
+        Optional<StandaloneJoinPlanner.Plan> joinPlan,
+        CursorCancellation cancellation) {
       this.principal = principal;
       this.index = index;
       this.generation = generation;
       this.readLease = readLease;
       this.joinPlan = joinPlan;
+      this.cancellation = cancellation;
     }
   }
 
@@ -125,8 +143,11 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     @Var Lease cursorLease = null;
     @Var StandaloneJoinPlanner.Plan joinPlan = null;
     @Var com.xgen.mongot.config.manager.GenerationReadLeases.Lease readLease = null;
+    var cancellation = new CursorCancellation();
     try (var unused =
-        Explain.setup(verbosity, Optional.of(generation.getDefinition().getNumPartitions()))) {
+            Explain.setup(verbosity, Optional.of(generation.getDefinition().getNumPartitions()));
+        var scope = QueryCancellation.openScope(cancellation::check)) {
+      cancellation.check();
       readLease = this.runtime.reads().acquire(generation.getGenerationId());
       var definition = readLease.definition();
       Explain.getQueryInfo()
@@ -192,6 +213,10 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         if (snapshot != null) {
           query = new CursorQuery.Search(query.getQuery(), Optional.of(snapshot));
         }
+        if (query instanceof CursorQuery.Search search) {
+          search.snapshot().orElseThrow().setCancellationCheck(cancellation::check);
+        }
+        cancellation.check();
         cursor =
             this.runtime
                 .cursors()
@@ -205,9 +230,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
       if (joinPlan != null) {
         joinPlan.verifyDependencies();
       }
-      if (Context.current().isCancelled()) {
-        throw Status.CANCELLED.asRuntimeException();
-      }
+      cancellation.check();
       var batch =
           this.runtime
               .cursors()
@@ -215,6 +238,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                   cursorId,
                   Bytes.ofBytes(4 * 1024 * 1024),
                   new BatchCursorOptions(Optional.empty(), Optional.of(size)));
+      cancellation.check();
       var response =
           QueryResponse.newBuilder()
               .setGenerationId(generationId)
@@ -239,7 +263,8 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                 request.getIndexId(),
                 generationId,
                 readLease,
-                Optional.ofNullable(joinPlan));
+                Optional.ofNullable(joinPlan),
+                cancellation);
         synchronized (lease) {
           this.leases.put(cursorId, lease);
           // Transfer cleanup ownership before callbacks can run or registration can fail.
@@ -307,10 +332,10 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     var lease = requireLease(request.getCursorId());
     synchronized (lease) {
       try (var unused =
-          Explain.setup(this.runtime.cursors().getExplainQueryState(request.getCursorId()))) {
-        var context = Context.current();
-        lease.joinPlan.ifPresent(
-            plan -> plan.activate(() -> StandaloneJoinPlanner.checkCancellation(context)));
+              Explain.setup(this.runtime.cursors().getExplainQueryState(request.getCursorId()));
+          var scope = QueryCancellation.openScope(lease.cancellation::check)) {
+        lease.cancellation.activate(Context.current());
+        lease.joinPlan.ifPresent(plan -> plan.activate(lease.cancellation::check));
         var batch =
             this.runtime
                 .cursors()
@@ -319,6 +344,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                     Bytes.ofBytes(4 * 1024 * 1024),
                     new BatchCursorOptions(
                         Optional.empty(), Optional.of(batchSize(request.getBatchSize()))));
+        lease.cancellation.check();
         lease.joinPlan.ifPresent(StandaloneJoinPlanner.Plan::verifyDependencies);
         if (lease.readLease.retired()) {
           throw Status.NOT_FOUND

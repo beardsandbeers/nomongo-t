@@ -362,6 +362,10 @@ public final class CoupledJoinService implements AutoCloseable {
       this.plan.activate(check);
     }
 
+    public void disableQueryCache() {
+      this.plan.snapshot().disableQueryCache();
+    }
+
     public List<JoinField> joinFields(FieldPath path) throws InvalidQueryException {
       return this.plan.snapshot().joinFields(path);
     }

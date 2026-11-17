@@ -85,8 +85,10 @@ Concurrent ingestion batches run outside the catalog monitor, including batches 
 same index. Background commits run independently of writes, with per-generation commit coordination.
 The shared worker pool bounds concurrency, so slow requests can still delay other RPCs. Lucene
 indexing, analysis, refresh and commit can still compete for CPU, memory and disk resources.
-There is no adaptive or per-index rate limiter. Client and server deadlines cancel cooperatively
-between documents and before queued work starts; they do not interrupt a Lucene call in progress.
+There is no adaptive or per-index rate limiter. Document writes observe client and server deadlines
+between documents and before queued work starts; they do not interrupt a Lucene write, refresh, or
+commit in progress. Search and GetMore propagate the current RPC's cancellation to Lucene scans and
+metadata counting. Each GetMore uses its own RPC context and deadline.
 
 GetStatus exposes the `standalone.rpc.inflight`, `standalone.rpc.bytes`, `standalone.rpc.queued`
 and `standalone.rpc.rejected` metrics. The release checks cover functional RPC behavior, TLS,

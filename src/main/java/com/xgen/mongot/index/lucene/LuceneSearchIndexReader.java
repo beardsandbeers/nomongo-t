@@ -385,8 +385,6 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
 
     private PinnedQuerySnapshot(LuceneIndexSearcherReference reference) {
       this.reference = reference;
-      // Membership owns a cursor reservation; do not retain its terms in a cross-request cache.
-      this.reference.getIndexSearcher().setQueryCache(null);
       this.reference
           .getIndexSearcher()
           .setTimeout(
@@ -399,6 +397,11 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     @Override
     public void setCancellationCheck(Runnable check) {
       this.cancellationCheck = check;
+    }
+
+    @Override
+    public void disableQueryCache() {
+      this.reference.getIndexSearcher().setQueryCache(null);
     }
 
     @Override

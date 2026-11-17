@@ -193,7 +193,14 @@ def run(args):
 
     def local_ready(index_id, revision=1):
         index = client.get_index(api.GetIndexRequest(index_id=index_id))
-        return index if index.active_revision == revision and index.generation_id else None
+        return (
+            index
+            if index.queryable
+            and index.lifecycle_state == "READY"
+            and index.active_revision == revision
+            and index.generation_id
+            else None
+        )
 
     def local_results(index_id, term):
         response = client.search(
@@ -268,8 +275,14 @@ def run(args):
             lambda: client.get_status(api.GetStatusRequest()).management_ready,
             process=mongot,
         )
-        assert not client.list_indexes(api.ListIndexesRequest()).indexes
+        assert not client.list_indexes(
+            api.ListIndexesRequest(ownership=api.INDEX_OWNERSHIP_STANDALONE)
+        ).indexes
         wait_for("recovered native content", lambda: native_results("original"))
+        replicated = client.list_indexes(
+            api.ListIndexesRequest(ownership=api.INDEX_OWNERSHIP_REPLICATED)
+        ).indexes
+        assert [index.index_id for index in replicated] == [remote_id]
         recovered = json_util.loads((search_data / "configJournal.json").read_text())["indexes"]
         assert recovered[0]["generation"] == remote_generation
         assert str(recovered[0]["index"]["indexID"]) == remote_id
@@ -326,9 +339,12 @@ def run(args):
         assert not local_results(local.index_id, "replicated")
         listed = native_wire(dict(management_base, userCommand={"listSearchIndexes": "records"}))
         assert len(listed["cursor"]["firstBatch"]) == 1
+        remote = client.get_index(api.GetIndexRequest(index_id=remote_id))
+        assert remote.ownership == api.INDEX_OWNERSHIP_REPLICATED
+        assert local_results(remote_id, "original")
         try:
-            client.get_index(api.GetIndexRequest(index_id=remote_id))
-            raise AssertionError("Standalone catalog exposed a replicated index")
+            client.upsert(remote_id, {"_id": "forbidden", "title": "manual"})
+            raise AssertionError("Direct writes accepted a replicated index")
         except grpc.RpcError as error:
             assert error.code() == grpc.StatusCode.NOT_FOUND
 
@@ -479,7 +495,14 @@ def run(args):
         assert len(local_results(local.index_id, "offline")) == 1
         for index_id in probes.values():
             client.drop_index(api.DropIndexRequest(index_id=index_id, expected_revision=1))
-        assert len(client.list_indexes(api.ListIndexesRequest()).indexes) == 1
+        assert (
+            len(
+                client.list_indexes(
+                    api.ListIndexesRequest(ownership=api.INDEX_OWNERSHIP_STANDALONE)
+                ).indexes
+            )
+            == 1
+        )
 
         print("Rejecting unreadable local journal metadata before native cleanup", flush=True)
         mongot.stop()
