@@ -82,6 +82,11 @@ BSON conversion, Lucene buffers and responses also consume memory. Transport adm
 limits concurrent calls to `maxInFlightRequests + 16` and caps each inbound message at
 `maxBatchBytes + 65536` bytes.
 
+The transport enforces the earlier of the client deadline and `maxRpcDurationMillis` for
+standalone calls on either listener. A client that omits its own deadline can receive
+`CANCELLED` when the server timeout closes the stream. Work already running continues to
+count against the request and byte limits until it finishes.
+
 When the request-count, payload-byte, transport-call or worker-queue limit fills, new calls fail
 with gRPC `RESOURCE_EXHAUSTED`. Disk headroom exhaustion also rejects writes with that status.
 Use bounded client concurrency and exponential backoff with jitter. Clients perform no automatic
@@ -102,6 +107,11 @@ GetStatus exposes the `standalone.rpc.inflight`, `standalone.rpc.bytes`, `standa
 and `standalone.rpc.rejected` metrics. The release checks cover functional RPC behavior, TLS,
 index authorization and committed crash recovery. They are not a sustained saturation benchmark.
 
+The Docker `mongotctl health` probe checks the Operations service. All four standalone
+services report `NOT_SERVING` while reconciliation prevents writes, and return to `SERVING`
+when reconciliation recovers. The dedicated listener also reports this state for the aggregate
+health check. A shared listener reports native readiness for its aggregate.
+
 ## API
 
 The authoritative [protobuf schema](../src/proto/standalone/v1/standalone.proto) defines:
@@ -118,7 +128,8 @@ Poll GetIndex until `READY`. BSON uses the ordinary mongot schema, such as
 `{mappings: {dynamic: true}}` for text or
 `{fields: [{type: 'vector', path: 'embedding', numDimensions: 3, similarity: 'cosine'}]}` for vectors.
 An equivalent CreateIndex with the same name returns the existing index; a conflicting definition
-fails. Index names are instance-wide. Up to 64 indexes are supported.
+fails. Index names are instance-wide. Standalone has no fixed index count limit. Practical capacity
+depends on available memory, disk space, file descriptors, and workload.
 
 `GetIndexMappings` exports a ready search index's configured mappings merged with dynamic types
 found in Lucene metadata, with `dynamic: false` at every document level. It returns the mappings
@@ -283,6 +294,10 @@ durable commit before the index is ready. After readiness, missing commits fail 
 Legacy indexes without initialization records reopen only when all commits are valid; incomplete
 legacy data requires restoration or an explicit rebuild. Older binaries cannot open a version-4
 catalog. A catalog mutation can upgrade older metadata, so retain a stopped backup before upgrade.
+If `indexes.json` is missing and the journal still contains a live or staged locally owned
+generation, startup stops before altering the journal or deleting index files. Restore the
+matching stopped backup before restarting. A fresh directory and a journal containing only
+retired local generations can still open.
 Unreadable live or staged local journal entries stop startup before native quarantine cleanup can
 delete local files, including when native quarantine is enabled. Restore compatible journal
 metadata from the matching backup before restarting. See the

@@ -52,9 +52,13 @@ import io.grpc.stub.MetadataUtils;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.bson.BsonBoolean;
@@ -350,6 +354,53 @@ public class StandaloneJoinsTest {
     var field = owner.getClass().getDeclaredField(name);
     field.setAccessible(true);
     return field.get(owner);
+  }
+
+  @Test
+  public void expireIdle_busyCursor_allowsHealthPublicationAndRechecksIdleTime() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String id = f.create("busy-cursor", "{mappings:{dynamic:true}}");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      long cursor = f.search(id, "{text:{path:'title',query:'coffee'}}", 1).getCursorId();
+      var queries = (StandaloneQueryService) fieldValue(f.server, "queries");
+      var leases = (Map<?, ?>) fieldValue(queries, "leases");
+      var lease = leases.get(cursor);
+      assertThat(lease).isNotNull();
+      var lastAccess = lease.getClass().getDeclaredField("lastAccess");
+      lastAccess.setAccessible(true);
+      var sweeper = (ExecutorService) fieldValue(f.server, "cursorSweeper");
+      var started = new CountDownLatch(1);
+      var aged = new CountDownLatch(1);
+      var published = new CountDownLatch(2);
+      Future<?> sweep;
+
+      // Hold the same monitor as an active GetMore, then refresh its timestamp at batch completion.
+      synchronized (lease) {
+        sweep =
+            sweeper.submit(
+                () -> {
+                  started.countDown();
+                  assertThat(aged.await(5, TimeUnit.SECONDS)).isTrue();
+                  queries.expireIdle();
+                  return null;
+                });
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+        lastAccess.setLong(lease, System.nanoTime() - TimeUnit.MINUTES.toNanos(3));
+        aged.countDown();
+        f.server.publishHealth(
+            (name, ready) -> {
+              if (name.isEmpty() && ready) {
+                published.countDown();
+              }
+            });
+        assertThat(published.await(5, TimeUnit.SECONDS)).isTrue();
+        assertThat(sweep.isDone()).isFalse();
+        lastAccess.setLong(lease, System.nanoTime());
+      }
+      sweep.get(5, TimeUnit.SECONDS);
+      assertThat(leases.containsKey(cursor)).isTrue();
+    }
   }
 
   @Test

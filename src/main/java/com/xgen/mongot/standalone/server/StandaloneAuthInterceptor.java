@@ -20,11 +20,9 @@ import java.security.MessageDigest;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
-/** Authentication, role checks, transport-call admission and server-enforced RPC deadlines. */
+/** Authentication, role checks and transport-call admission. */
 final class StandaloneAuthInterceptor implements ServerInterceptor {
   private static final Context.Key<Principal> PRINCIPAL = Context.key("standalone-principal");
   private static final Context.Key<String> OPERATION = Context.key("standalone-operation");
@@ -36,14 +34,11 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
   private static final Principal LOCAL =
       new Principal("local", new byte[0], Set.of(Role.values()), Set.of("*"));
   private final StandaloneConfig config;
-  private final ScheduledExecutorService deadlines;
   private final Semaphore transportCalls;
   private final StandaloneMetrics metrics;
 
-  StandaloneAuthInterceptor(
-      StandaloneConfig config, ScheduledExecutorService deadlines, StandaloneMetrics metrics) {
+  StandaloneAuthInterceptor(StandaloneConfig config, StandaloneMetrics metrics) {
     this.config = config;
-    this.deadlines = deadlines;
     this.transportCalls = new Semaphore(config.maxInFlightRequests() + 16);
     this.metrics = metrics;
   }
@@ -110,15 +105,12 @@ final class StandaloneAuthInterceptor implements ServerInterceptor {
     var context =
         Context.current()
             .withValue(PRINCIPAL, principal)
-            .withValue(OPERATION, call.getMethodDescriptor().getBareMethodName())
-            .withDeadlineAfter(
-                this.config.maxRpcDuration().toMillis(), TimeUnit.MILLISECONDS, this.deadlines);
+            .withValue(OPERATION, call.getMethodDescriptor().getBareMethodName());
     var released = new java.util.concurrent.atomic.AtomicBoolean();
     Runnable release =
         () -> {
           if (released.compareAndSet(false, true)) {
             this.transportCalls.release();
-            context.cancel(null);
           }
         };
     var acknowledged =

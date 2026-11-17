@@ -4,6 +4,8 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.config.backup.ConfigJournalV1;
+import com.xgen.mongot.config.backup.JournalEntry;
 import com.xgen.mongot.index.definition.AnalyzerBoundSearchIndexDefinition;
 import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
@@ -11,14 +13,17 @@ import com.xgen.mongot.index.definition.SearchIndexDefinitionGeneration;
 import com.xgen.mongot.index.definition.VectorIndexDefinitionGeneration;
 import com.xgen.mongot.index.version.UserIndexVersion;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
+import com.xgen.mongot.standalone.grpc.DropIndexRequest;
 import com.xgen.mongot.standalone.grpc.IndexType;
 import com.xgen.mongot.standalone.grpc.IndexUpdateMode;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.util.List;
 import org.bson.BsonDocument;
+import org.bson.types.ObjectId;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -132,6 +137,87 @@ public class IndexInitializationTest {
       assertThat(catalog.requiresExistingData(generation.getGenerationId())).isTrue();
       catalog.createIndex(create());
       assertThat(catalog.initializations()).isEmpty();
+    }
+  }
+
+  @Test
+  public void reopen_missingCatalog_checksStagedAndDeletedOwnership() throws Exception {
+    var root = this.folder.getRoot().toPath();
+    IndexDefinitionGeneration index;
+    try (var catalog = new LocalIndexCatalog(root)) {
+      catalog.createIndex(create());
+      index = generation(catalog.definitions().getFirst());
+    }
+    Files.move(root.resolve("indexes.json"), root.resolve("saved-indexes.json"));
+    var journal = root.resolve("configJournal.json");
+    var entry = JournalEntry.parsed(index);
+    var staged = new ConfigJournalV1(List.of(entry), List.of(), List.of()).toBson();
+    var entries =
+        this.type == IndexType.INDEX_TYPE_SEARCH ? "stagedIndexes" : "stagedVectorIndexes";
+    staged
+        .getArray(entries)
+        .getFirst()
+        .asDocument()
+        .put("futureProperty", org.bson.BsonBoolean.TRUE);
+    Files.writeString(journal, staged.toJson());
+
+    assertThat(assertThrows(IOException.class, () -> new LocalIndexCatalog(root)))
+        .hasMessageThat()
+        .contains("Missing indexes.json");
+    assertThat(Files.readString(journal)).isEqualTo(staged.toJson());
+
+    var deleted = new ConfigJournalV1(List.of(), List.of(), List.of(entry)).toBson();
+    Files.writeString(journal, deleted.toJson());
+    try (var reopened = new LocalIndexCatalog(root)) {
+      assertThat(reopened.definitions()).isEmpty();
+      assertThat(reopened.owns(index.getIndexId())).isTrue();
+    }
+    Files.delete(journal);
+    try (var reserved = new LocalIndexCatalog(root)) {
+      assertThat(reserved.definitions()).isEmpty();
+      assertThat(reserved.owns(index.getIndexId())).isTrue();
+    }
+  }
+
+  @Test
+  public void reopen_recordedDropOrOnlyReplicatedLiveEntries_allowsStartup() throws Exception {
+    var root = this.folder.getRoot().toPath();
+    var journal = root.resolve("configJournal.json");
+    JournalEntry<IndexDefinitionGeneration> local;
+    try (var catalog = new LocalIndexCatalog(root)) {
+      var index = catalog.createIndex(create());
+      local = JournalEntry.parsed(generation(catalog.definitions().getFirst()));
+      catalog.dropIndex(
+          DropIndexRequest.newBuilder()
+              .setIndexId(index.getIndexId())
+              .setExpectedRevision(index.getDesiredRevision())
+              .build());
+    }
+    Files.writeString(
+        journal, new ConfigJournalV1(List.of(), List.of(local), List.of()).toBson().toJson());
+    try (var recordedDrop = new LocalIndexCatalog(root)) {
+      assertThat(recordedDrop.definitions()).isEmpty();
+      assertThat(recordedDrop.owns(local.getGenerationId().indexId)).isTrue();
+    }
+
+    var remote =
+        StandaloneDefinitionValidator.parse(
+                new ObjectId().toHexString(),
+                "remote",
+                this.type,
+                1,
+                create().getDefinitionBson().toByteArray())
+            .internal();
+    var mixed =
+        new ConfigJournalV1(
+            List.of(), List.of(JournalEntry.parsed(generation(remote))), List.of(local));
+    Files.writeString(journal, mixed.toBson().toJson());
+    Files.writeString(root.resolve("coexistence.json"), "{\"version\":1}");
+    Files.move(root.resolve("indexes.json"), root.resolve("saved-indexes.json"));
+    try (var replicatedOnly = new LocalIndexCatalog(root)) {
+      assertThat(replicatedOnly.definitions()).isEmpty();
+      assertThat(replicatedOnly.owns(remote.getIndexId())).isFalse();
+      assertThat(Files.readString(journal)).isEqualTo(mixed.toBson().toJson());
     }
   }
 

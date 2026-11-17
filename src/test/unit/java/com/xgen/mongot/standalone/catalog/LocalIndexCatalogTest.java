@@ -12,6 +12,7 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.stream.IntStream;
 import org.bson.BsonDocument;
 import org.bson.types.ObjectId;
 import org.junit.Rule;
@@ -20,6 +21,32 @@ import org.junit.rules.TemporaryFolder;
 
 public class LocalIndexCatalogTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void createIndex_moreThan64Indexes_persistsAcrossRestart() throws Exception {
+    var directory = this.folder.getRoot().toPath();
+    var definition =
+        ByteString.copyFrom(
+            StandaloneDefinitionValidator.encode(BsonDocument.parse("{mappings:{dynamic:true}}")));
+    var request =
+        CreateIndexRequest.newBuilder()
+            .setName("index-65")
+            .setType(IndexType.INDEX_TYPE_SEARCH)
+            .setDefinitionBson(definition)
+            .build();
+    String id;
+    try (var catalog = new LocalIndexCatalog(directory)) {
+      IntStream.rangeClosed(1, 64)
+          .forEach(i -> catalog.createIndex(request.toBuilder().setName("index-" + i).build()));
+
+      id = catalog.createIndex(request).getIndexId();
+    }
+
+    try (var reopened = new LocalIndexCatalog(directory)) {
+      assertThat(reopened.definitions()).hasSize(65);
+      assertThat(reopened.getIndex(id).getName()).isEqualTo("index-65");
+    }
+  }
 
   @Test
   public void reopen_preservesDefinitionsAndRevisionsWithoutContent() throws Exception {

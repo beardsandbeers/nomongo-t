@@ -27,6 +27,7 @@ import com.xgen.mongot.util.mongodb.SslContextFactory;
 import io.grpc.Context;
 import io.grpc.Server;
 import io.grpc.ServerServiceDefinition;
+import io.grpc.ServerStreamTracer;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.netty.NettyServerBuilder;
@@ -122,7 +123,8 @@ public class GrpcStreamingServer implements CommandServer {
       boolean internalListAllIndexesForTesting,
       IndexDefinitionConfig indexDefinitionConfig,
       Supplier<EmbeddingServiceManager> embeddingServiceManagerSupplier,
-      java.util.List<ServerServiceDefinition> additionalServices) {
+      java.util.List<ServerServiceDefinition> additionalServices,
+      ServerStreamTracer.Factory... additionalTracers) {
     CommandRegistry commandRegistry =
         registerCommands(
             meterRegistry,
@@ -153,7 +155,8 @@ public class GrpcStreamingServer implements CommandServer {
         healthManager,
         inboundMessageSizeLimit,
         FeatureFlags.getDefault(),
-        additionalServices);
+        additionalServices,
+        additionalTracers);
   }
 
   /**
@@ -289,7 +292,8 @@ public class GrpcStreamingServer implements CommandServer {
       HealthManager healthManager,
       Bytes inboundMessageSizeLimit,
       FeatureFlags featureFlags,
-      java.util.List<ServerServiceDefinition> additionalServices) {
+      java.util.List<ServerServiceDefinition> additionalServices,
+      ServerStreamTracer.Factory... additionalTracers) {
     NettyUtil.SocketType socketType = NettyUtil.getSocketType(address);
 
     var wireMessageCallHandler =
@@ -378,6 +382,9 @@ public class GrpcStreamingServer implements CommandServer {
                     socketType, ExecutorManager.EventLoopGroupType.BOSS))
             .channelType(NettyUtil.getServerChannelType(socketType));
     additionalServices.forEach(serverBuilder::addService);
+    for (var tracer : additionalTracers) {
+      serverBuilder.addStreamTracerFactory(tracer);
+    }
     switch (socketType) {
       case TCP -> {
         serverBuilder.withChildOption(ChannelOption.SO_KEEPALIVE, true);

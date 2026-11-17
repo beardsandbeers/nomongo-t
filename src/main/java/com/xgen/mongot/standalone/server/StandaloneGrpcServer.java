@@ -19,7 +19,6 @@ import com.xgen.mongot.standalone.grpc.IndexStats;
 import com.xgen.mongot.standalone.grpc.ListIndexesRequest;
 import com.xgen.mongot.standalone.grpc.ListIndexesResponse;
 import com.xgen.mongot.standalone.grpc.OperationsServiceGrpc;
-import com.xgen.mongot.standalone.grpc.QueryServiceGrpc;
 import com.xgen.mongot.standalone.grpc.ServiceStatus;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
@@ -28,6 +27,7 @@ import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import io.grpc.Server;
 import io.grpc.ServerInterceptors;
 import io.grpc.ServerServiceDefinition;
+import io.grpc.ServerStreamTracer;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 import io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.NettyServerBuilder;
@@ -35,6 +35,7 @@ import io.grpc.protobuf.services.HealthStatusManager;
 import io.grpc.stub.StreamObserver;
 import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletionException;
@@ -46,7 +47,12 @@ import java.util.function.BiConsumer;
 public final class StandaloneGrpcServer implements AutoCloseable {
   private final StandaloneRuntime runtime;
   private final RpcDispatcher dispatcher;
-  private final ScheduledThreadPoolExecutor deadlines;
+  private final ScheduledThreadPoolExecutor healthPublisher =
+      new ScheduledThreadPoolExecutor(1, Thread.ofPlatform().name("standalone-health").factory());
+  private final ScheduledThreadPoolExecutor cursorSweeper =
+      new ScheduledThreadPoolExecutor(
+          1, Thread.ofPlatform().name("standalone-cursor-expiry").factory());
+  private final StandaloneRpcDeadline deadlineTracer;
   private final HealthStatusManager health = new HealthStatusManager();
   private final Optional<Server> server;
   private final List<ServerServiceDefinition> services;
@@ -67,62 +73,64 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.queries = new StandaloneQueryService(runtime, this.dispatcher);
     this.deleteByQuery = new StandaloneDeleteByQuery(runtime);
     runtime.onIndexPublication(this::generationRetired);
-    this.deadlines =
-        new ScheduledThreadPoolExecutor(
-            1, Thread.ofPlatform().name("standalone-deadlines").factory());
-    this.deadlines.setRemoveOnCancelPolicy(true);
-    var interceptor =
-        new StandaloneAuthInterceptor(runtime.config(), this.deadlines, runtime.metrics());
+    var interceptor = new StandaloneAuthInterceptor(runtime.config(), runtime.metrics());
     this.services =
         List.of(
             ServerInterceptors.intercept(new Catalog(), interceptor),
             ServerInterceptors.intercept(new Documents(), interceptor),
             ServerInterceptors.intercept(this.queries, interceptor),
             ServerInterceptors.intercept(new Operations(), interceptor));
-    var builder =
-        NettyServerBuilder.forAddress(runtime.config().address())
-            .directExecutor()
-            .maxInboundMessageSize(runtime.config().documentLimits().maxBatchBytes() + 65536)
-            .maxConcurrentCallsPerConnection(runtime.config().maxInFlightRequests() + 16);
-    this.services.forEach(builder::addService);
-    builder.addService(ServerInterceptors.intercept(this.health.getHealthService(), interceptor));
-    if (!shared && runtime.config().tls().isPresent()) {
-      var tls = runtime.config().tls().get();
-      builder.sslContext(
-          GrpcSslContexts.forServer(tls.certificate().toFile(), tls.privateKey().toFile())
-              .sslProvider(SslProvider.JDK)
-              .build());
+    var registered = new ArrayList<>(this.services);
+    if (!shared) {
+      registered.add(ServerInterceptors.intercept(this.health.getHealthService(), interceptor));
     }
-    this.server = shared ? Optional.empty() : Optional.of(builder.build());
-    this.health.setStatus("", ServingStatus.SERVING);
-    this.health.setStatus(CatalogServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
-    this.health.setStatus(DocumentServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
-    this.health.setStatus(QueryServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
-    this.health.setStatus(OperationsServiceGrpc.SERVICE_NAME, ServingStatus.SERVING);
-    this.deadlines.scheduleWithFixedDelay(
-        () ->
-            this.health.setStatus(
-                "", runtime.managementReady() ? ServingStatus.SERVING : ServingStatus.NOT_SERVING),
-        1,
-        1,
-        TimeUnit.SECONDS);
-    this.deadlines.scheduleWithFixedDelay(this.queries::expireIdle, 10, 10, TimeUnit.SECONDS);
+    this.deadlineTracer = new StandaloneRpcDeadline(registered, runtime.config().maxRpcDuration());
+    if (shared) {
+      this.server = Optional.empty();
+    } else {
+      var builder =
+          NettyServerBuilder.forAddress(runtime.config().address())
+              .directExecutor()
+              .addStreamTracerFactory(this.deadlineTracer)
+              .maxInboundMessageSize(runtime.config().documentLimits().maxBatchBytes() + 65536)
+              .maxConcurrentCallsPerConnection(runtime.config().maxInFlightRequests() + 16);
+      registered.forEach(builder::addService);
+      if (runtime.config().tls().isPresent()) {
+        var tls = runtime.config().tls().get();
+        builder.sslContext(
+            GrpcSslContexts.forServer(tls.certificate().toFile(), tls.privateKey().toFile())
+                .sslProvider(SslProvider.JDK)
+                .build());
+      }
+      this.server = Optional.of(builder.build());
+      publishHealth(
+          (name, ready) ->
+              this.health.setStatus(
+                  name, ready ? ServingStatus.SERVING : ServingStatus.NOT_SERVING));
+    }
+    this.cursorSweeper.scheduleWithFixedDelay(this.queries::expireIdle, 10, 10, TimeUnit.SECONDS);
   }
 
   public List<ServerServiceDefinition> services() {
     return this.services;
   }
 
+  public ServerStreamTracer.Factory deadlineTracer() {
+    return this.deadlineTracer;
+  }
+
   public void publishHealth(BiConsumer<String, Boolean> update) {
-    this.deadlines.scheduleWithFixedDelay(
-        () ->
-            this.services.forEach(
-                service ->
-                    update.accept(
-                        service.getServiceDescriptor().getName(), this.runtime.managementReady())),
-        0,
-        1,
-        TimeUnit.SECONDS);
+    Runnable publish =
+        () -> {
+          boolean ready = this.runtime.managementReady();
+          if (this.server.isPresent()) {
+            update.accept("", ready);
+          }
+          this.services.forEach(
+              service -> update.accept(service.getServiceDescriptor().getName(), ready));
+        };
+    publish.run();
+    this.healthPublisher.scheduleWithFixedDelay(publish, 1, 1, TimeUnit.SECONDS);
   }
 
   public StandaloneGrpcServer start() throws IOException {
@@ -140,6 +148,8 @@ public final class StandaloneGrpcServer implements AutoCloseable {
 
   @Override
   public synchronized void close() throws InterruptedException {
+    this.healthPublisher.shutdown();
+    this.cursorSweeper.shutdown();
     this.health.enterTerminalState();
     if (this.server.isPresent()) {
       var owned = this.server.get();
@@ -150,9 +160,9 @@ public final class StandaloneGrpcServer implements AutoCloseable {
       }
     }
     this.dispatcher.close();
+    this.cursorSweeper.close();
+    this.healthPublisher.close();
     this.queries.close();
-    this.deadlines.shutdownNow();
-    this.deadlines.awaitTermination(10, TimeUnit.SECONDS);
   }
 
   private <T extends com.google.protobuf.MessageLite> T bounded(T response) {

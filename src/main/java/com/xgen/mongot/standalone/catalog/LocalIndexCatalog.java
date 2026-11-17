@@ -1,6 +1,8 @@
 package com.xgen.mongot.standalone.catalog;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.config.backup.ConfigJournalV1;
+import com.xgen.mongot.config.backup.QuarantinePolicy;
 import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
@@ -32,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Stream;
 import org.bson.BsonArray;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
@@ -80,7 +83,7 @@ public final class LocalIndexCatalog implements Closeable {
           && !Files.exists(this.ownershipPath)) {
         throw new IOException("Coexistence ownership metadata is missing");
       }
-      if (Files.exists(this.ownershipPath)) {
+      if (!Files.notExists(this.ownershipPath)) {
         for (var id : BsonDocument.parse(Files.readString(this.ownershipPath)).getArray("ids")) {
           validateIndexId(id.asString().getValue());
           this.ownedIds.add(id.asString().getValue());
@@ -91,7 +94,7 @@ public final class LocalIndexCatalog implements Closeable {
             "Legacy document-store state is unsupported. Use a new dataPath and"
                 + " reingest content.");
       }
-      if (Files.exists(this.path)) {
+      if (!Files.notExists(this.path)) {
         var document = BsonDocument.parse(Files.readString(this.path));
         this.versioned = document.containsKey("catalogVersion");
         if (this.versioned) {
@@ -137,6 +140,8 @@ public final class LocalIndexCatalog implements Closeable {
           throw new IOException("Local catalog conflicts with coexistence ownership metadata");
         }
         this.ownedIds.addAll(this.indexes.keySet());
+      } else if (!this.ownedIds.isEmpty()) {
+        verifyMissingCatalog(directory.resolve("configJournal.json"));
       }
       for (var migration : this.migrations.values()) {
         var desired = this.indexes.get(migration.indexId());
@@ -180,6 +185,28 @@ public final class LocalIndexCatalog implements Closeable {
   /** Includes dropped IDs while their physical generations may still be retiring. */
   public synchronized boolean owns(ObjectId id) {
     return this.ownedIds.contains(id.toHexString());
+  }
+
+  private void verifyMissingCatalog(Path journalPath) throws IOException {
+    if (Files.notExists(journalPath)) {
+      return;
+    }
+    ConfigJournalV1 journal;
+    try {
+      journal =
+          ConfigJournalV1.fromFileIfExists(journalPath, QuarantinePolicy.QUARANTINE)
+              .orElseThrow(
+                  () -> new IOException("Cannot verify the journal for missing indexes.json"));
+    } catch (BsonParseException e) {
+      throw new IOException("Cannot verify missing indexes.json against " + journalPath, e);
+    }
+    // Deleted entries can finish retiring. A live or staged local entry still owns its files.
+    if (Stream.concat(journal.getLiveEntries().stream(), journal.getStagedEntries().stream())
+        .anyMatch(entry -> owns(entry.getGenerationId().indexId))) {
+      throw new IOException(
+          "Missing indexes.json for a live or staged standalone index. Restore the matching"
+              + " stopped backup before restarting.");
+    }
   }
 
   private void persistOwnership() throws IOException {
@@ -233,11 +260,6 @@ public final class LocalIndexCatalog implements Closeable {
             .withDescription("Index name has a different definition")
             .asRuntimeException();
       }
-    }
-    if (this.indexes.size() >= 64) {
-      throw Status.RESOURCE_EXHAUSTED
-          .withDescription("Standalone supports 64 indexes")
-          .asRuntimeException();
     }
     this.ownedIds.add(candidate.internal().getIndexId().toHexString());
     try {

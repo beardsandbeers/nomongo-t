@@ -16,6 +16,7 @@ java_library(
         "//src/proto/standalone/v1:standalone_java",
     ],
     deps = [
+        "//src/main/java/com/xgen/mongot/config/backup",
         "//src/main/java/com/xgen/mongot/config/util",
         "//src/main/java/com/xgen/mongot/index/analyzer",
         "//src/main/java/com/xgen/mongot/index/definition",

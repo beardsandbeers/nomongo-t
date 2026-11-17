@@ -468,7 +468,7 @@ public class OnPremMongotBootstrapper {
             mongotConfigs.featureFlags,
             this.dynamicFeatureFlagRegistry,
             meterAndFtdcRegistry.threadPoolResourceBindings(),
-            coexistence.map(extension -> extension.services().services()).orElse(List.of()));
+            coexistence);
 
     coexistence.ifPresent(
         extension -> extension.services().publishHealth(healthManager::setServiceStatus));
@@ -1184,7 +1184,7 @@ public class OnPremMongotBootstrapper {
       FeatureFlags featureFlags,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry,
       ThreadPoolResourceMetrics.Bindings threadPoolResourceBindings,
-      List<io.grpc.ServerServiceDefinition> additionalServices) {
+      Optional<com.xgen.mongot.standalone.coexistence.CoexistenceRuntime> coexistence) {
     boolean shouldRetryViaEnvoy =
         SearchQueryAdmissionControlConfigMapper.shouldRetryViaLoadBalancer(
             config.advancedConfigs().flatMap(AdvancedConfigs::regularBlockingRequestConfig));
@@ -1219,7 +1219,10 @@ public class OnPremMongotBootstrapper {
             internalListAllIndexesForTesting,
             indexDefinitionConfig,
             embeddingServiceManagerSupplier,
-            additionalServices);
+            coexistence.map(extension -> extension.services().services()).orElse(List.of()),
+            coexistence.stream()
+                .map(extension -> extension.services().deadlineTracer())
+                .toArray(io.grpc.ServerStreamTracer.Factory[]::new));
 
     return new ServerLifecycles(
         grpcServer::start,

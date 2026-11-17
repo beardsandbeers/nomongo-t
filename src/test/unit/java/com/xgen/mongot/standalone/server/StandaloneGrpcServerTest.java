@@ -3202,6 +3202,39 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void restart_missingCatalog_preservesCommittedGenerationForRestore() throws Exception {
+    Path directory = data();
+    String id;
+    String generation;
+    try (var f = new Fixture(directory)) {
+      id = f.create("persistent");
+      generation = f.ready(id, 1).getGenerationId();
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED)
+              .addDocumentsBson(bson("{_id:'a',title:'coffee'}"))
+              .build());
+    }
+    Path catalog = directory.resolve("indexes.json");
+    Path backup = Files.move(catalog, this.folder.getRoot().toPath().resolve("backup.json"));
+    var journal = Files.readString(directory.resolve("configJournal.json"));
+    var ownership = Files.readString(directory.resolve("standalone-owned-ids.json"));
+
+    var failure = assertThrows(IOException.class, () -> new Fixture(directory));
+
+    assertThat(failure).hasMessageThat().contains("Missing indexes.json");
+    assertThat(Files.readString(directory.resolve("configJournal.json"))).isEqualTo(journal);
+    assertThat(Files.readString(directory.resolve("standalone-owned-ids.json")))
+        .isEqualTo(ownership);
+    Files.move(backup, catalog);
+    try (var f = new Fixture(directory)) {
+      assertThat(f.ready(id, 1).getGenerationId()).isEqualTo(generation);
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
   public void standaloneLaunch_journalHasNonLocalGeneration_refusesBeforeRemovingData()
       throws Exception {
     Path directory = data();

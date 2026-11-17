@@ -13,10 +13,37 @@ import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.Test;
 
 public class RpcDispatcherTest {
+  @Test
+  public void unary_expiredContext_skipsWorkBeforeDispatch() throws Exception {
+    var config = StandaloneConfig.development(Path.of("unused"), 0);
+    var called = new AtomicBoolean();
+    var response = new Response<String>();
+    try (var dispatcher = new RpcDispatcher(config, StandaloneMetrics.disabled());
+        var scheduler = Executors.newSingleThreadScheduledExecutor();
+        var expired = Context.current().withDeadlineAfter(0, TimeUnit.NANOSECONDS, scheduler)) {
+      expired.run(
+          () ->
+              dispatcher.unary(
+                  1,
+                  response,
+                  () -> {
+                    called.set(true);
+                    return "unexpected";
+                  }));
+      var error =
+          assertThrows(ExecutionException.class, () -> response.result.get(5, TimeUnit.SECONDS));
+      assertThat(Status.fromThrowable(error.getCause()).getCode())
+          .isEqualTo(Status.Code.DEADLINE_EXCEEDED);
+      assertThat(called.get()).isFalse();
+    }
+  }
+
   @Test
   public void async_cancelledClient_holdsAdmissionUntilWriterDrains() throws Exception {
     var base = StandaloneConfig.development(Path.of("unused"), 0);

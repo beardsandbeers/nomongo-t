@@ -287,9 +287,13 @@ public class GrpcStreamingClient implements Closeable {
               .build();
 
   public HealthCheckResponse.ServingStatus checkHealth() {
+    return checkHealth(this.channel, "");
+  }
+
+  public static HealthCheckResponse.ServingStatus checkHealth(Channel channel, String service) {
     return ClientCalls.blockingUnaryCall(
-            this.channel.newCall(HEALTH_CHECK_METHOD_DESCRIPTOR, CallOptions.DEFAULT),
-            HealthCheckRequest.getDefaultInstance())
+            channel.newCall(HEALTH_CHECK_METHOD_DESCRIPTOR, CallOptions.DEFAULT),
+            HealthCheckRequest.newBuilder().setService(service).build())
         .getStatus();
   }
 

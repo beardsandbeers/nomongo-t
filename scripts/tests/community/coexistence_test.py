@@ -504,10 +504,35 @@ def run(args):
             == 1
         )
 
-        print("Rejecting unreadable local journal metadata before native cleanup", flush=True)
+        print("Checking recovery of missing local metadata on a mixed volume", flush=True)
         mongot.stop()
         journal_file = search_data / "configJournal.json"
         original_journal = journal_file.read_bytes()
+        ownership_file = search_data / "standalone-owned-ids.json"
+
+        def local_data_hashes():
+            files = [journal_file, ownership_file]
+            if catalog_file.exists():
+                files.append(catalog_file)
+            for path in search_data.glob(local.index_id + "*"):
+                if path.is_dir():
+                    files.extend(file for file in path.rglob("*") if file.is_file())
+            return {
+                str(file.relative_to(search_data)): hashlib.sha256(file.read_bytes()).hexdigest()
+                for file in files
+            }
+
+        saved_catalog = catalog_file.rename(directory / "saved-indexes.json")
+        try:
+            before_rejection = local_data_hashes()
+            mongot.start()
+            assert mongot.process.wait(timeout=90) != 0
+            assert "Missing indexes.json" in mongot.logfile.read_text()
+            assert local_data_hashes() == before_rejection
+        finally:
+            saved_catalog.rename(catalog_file)
+
+        print("Rejecting unreadable local journal metadata before native cleanup", flush=True)
         journal = json_util.loads(original_journal)
         local_entry = next(
             entry
@@ -516,16 +541,6 @@ def run(args):
         )
         local_entry["futureProperty"] = True
         journal_file.write_text(json_util.dumps(journal))
-
-        def local_data_hashes():
-            files = [journal_file, search_data / "indexes.json"]
-            for path in search_data.glob(local.index_id + "*"):
-                if path.is_dir():
-                    files.extend(file for file in path.rglob("*") if file.is_file())
-            return {
-                str(file.relative_to(search_data)): hashlib.sha256(file.read_bytes()).hexdigest()
-                for file in files
-            }
 
         before_rejection = local_data_hashes()
         mongot.start()

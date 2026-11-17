@@ -1,6 +1,7 @@
 package com.xgen.mongot.standalone.server;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -27,12 +28,59 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLSession;
 import org.junit.Test;
 import org.mockito.ArgumentCaptor;
 
 public class StandaloneAuthInterceptorTest {
+  @Test
+  @SuppressWarnings("unchecked")
+  public void interceptCall_terminalCallbacksAndSetupFailure_restoreTransportCapacity()
+      throws Exception {
+    var config = StandaloneConfig.development(Path.of("unused"), 0);
+    var interceptor = new StandaloneAuthInterceptor(config, StandaloneMetrics.disabled());
+    var field = StandaloneAuthInterceptor.class.getDeclaredField("transportCalls");
+    field.setAccessible(true);
+    var permits = (Semaphore) field.get(interceptor);
+    int initial = permits.availablePermits();
+    ServerCall<GetStatusRequest, ServiceStatus> call = mock(ServerCall.class);
+    when(call.getMethodDescriptor()).thenReturn(OperationsServiceGrpc.getGetStatusMethod());
+    var listener =
+        interceptor.interceptCall(
+            call, new Metadata(), (accepted, headers) -> new ServerCall.Listener<>() {});
+    assertThat(permits.availablePermits()).isEqualTo(initial - 1);
+
+    var start = new CountDownLatch(1);
+    try (var callbacks = Executors.newSingleThreadExecutor()) {
+      var cancel =
+          callbacks.submit(
+              () -> {
+                assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
+                listener.onCancel();
+                return null;
+              });
+      start.countDown();
+      listener.onComplete();
+      cancel.get(5, TimeUnit.SECONDS);
+    }
+    assertThat(permits.availablePermits()).isEqualTo(initial);
+
+    assertThrows(
+        IllegalStateException.class,
+        () ->
+            interceptor.interceptCall(
+                call,
+                new Metadata(),
+                (accepted, headers) -> {
+                  throw new IllegalStateException("handler setup failed");
+                }));
+    assertThat(permits.availablePermits()).isEqualTo(initial);
+  }
+
   @Test
   public void interceptCall_sharedRemotePlaintext_deniesApiWithoutChangingListener() {
     assertThat(authenticate("192.0.2.10", false, false)).isEqualTo(Status.Code.UNAUTHENTICATED);
@@ -60,7 +108,6 @@ public class StandaloneAuthInterceptorTest {
 
   @SuppressWarnings("unchecked")
   private static Status.Code authenticate(String peer, boolean tls, boolean authenticated) {
-    var deadlines = Executors.newSingleThreadScheduledExecutor();
     var meters = new SimpleMeterRegistry();
     try {
       String token = "test-token-" + "x".repeat(32);
@@ -100,8 +147,7 @@ public class StandaloneAuthInterceptorTest {
         metadata.put(
             Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "Bearer " + token);
       }
-      var interceptor =
-          new StandaloneAuthInterceptor(config, deadlines, new StandaloneMetrics(meters));
+      var interceptor = new StandaloneAuthInterceptor(config, new StandaloneMetrics(meters));
       var listener = interceptor.interceptCall(call, metadata, next);
       if (tls && authenticated || peer.equals("127.0.0.1")) {
         verify(next).startCall(any(), any());
@@ -113,7 +159,6 @@ public class StandaloneAuthInterceptorTest {
       verify(call).close(status.capture(), any());
       return status.getValue().getCode();
     } finally {
-      deadlines.shutdownNow();
       meters.close();
     }
   }

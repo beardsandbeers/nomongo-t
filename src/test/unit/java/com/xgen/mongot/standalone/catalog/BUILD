@@ -3,6 +3,7 @@ load("//bazel/java:test.bzl", "mongot_java_unit_test_suite")
 mongot_java_unit_test_suite(
     name = "lib",
     deps = [
+        "//src/main/java/com/xgen/mongot/config/backup",
         "//src/main/java/com/xgen/mongot/index/definition",
         "//src/main/java/com/xgen/mongot/index/version",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
