@@ -155,6 +155,18 @@ public final class StandaloneGrpcServer implements AutoCloseable {
     this.deadlines.awaitTermination(10, TimeUnit.SECONDS);
   }
 
+  private <T extends com.google.protobuf.MessageLite> T bounded(T response) {
+    if (response.getSerializedSize()
+        > this.runtime.config().documentLimits().maxBatchBytes() + 65536) {
+      throw io.grpc.Status.RESOURCE_EXHAUSTED
+          .withDescription(
+              "Read response exceeds the configured byte limit; use paginated ListIndexes for"
+                  + " discovery")
+          .asRuntimeException();
+    }
+    return response;
+  }
+
   void generationRetired(String generation) {
     if (!generation.isEmpty()) {
       this.queries.generationRetired(generation);
@@ -163,6 +175,11 @@ public final class StandaloneGrpcServer implements AutoCloseable {
   }
 
   private final class Catalog extends CatalogServiceGrpc.CatalogServiceImplBase {
+    private final DirectIndexPages pages =
+        new DirectIndexPages(
+            StandaloneGrpcServer.this.runtime.reads(),
+            StandaloneGrpcServer.this.runtime.config().documentLimits().maxBatchBytes() + 65536);
+
     @Override
     public void createIndex(CreateIndexRequest request, StreamObserver<IndexDescription> observer) {
       StandaloneGrpcServer.this.dispatcher.unary(
@@ -213,6 +230,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
                     .ingestion()
                     .coordinate(
                         () -> StandaloneGrpcServer.this.runtime.catalog().dropIndex(request));
+            StandaloneGrpcServer.this.runtime.reads().invalidate(request.getIndexId());
             StandaloneGrpcServer.this.queries.indexDropped(request.getIndexId());
             StandaloneGrpcServer.this.runtime.statistics().invalidate(request.getIndexId());
             StandaloneGrpcServer.this.runtime.catalogChanged();
@@ -227,7 +245,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
           observer,
           () -> {
             StandaloneAuthInterceptor.requireIndex(request.getIndexId());
-            return StandaloneGrpcServer.this.runtime.describeIndex(request.getIndexId());
+            return bounded(StandaloneGrpcServer.this.runtime.describeIndex(request.getIndexId()));
           });
     }
 
@@ -239,7 +257,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
           observer,
           () -> {
             StandaloneAuthInterceptor.requireIndex(request.getIndexId());
-            return StandaloneGrpcServer.this.runtime.getIndexMappings(request);
+            return bounded(StandaloneGrpcServer.this.runtime.getIndexMappings(request));
           });
     }
 
@@ -276,14 +294,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
           request.getSerializedSize(),
           observer,
           () -> {
-            var result = ListIndexesResponse.newBuilder();
-            for (var definition : StandaloneGrpcServer.this.runtime.catalog().definitions()) {
-              String id = definition.getIndexId().toHexString();
-              if (StandaloneAuthInterceptor.principal().allows(id)) {
-                result.addIndexes(StandaloneGrpcServer.this.runtime.describeIndex(id));
-              }
-            }
-            return result.build();
+            return this.pages.list(request);
           });
     }
   }
@@ -379,7 +390,7 @@ public final class StandaloneGrpcServer implements AutoCloseable {
           () -> {
             StandaloneAuthInterceptor.requireIndex("*");
             try {
-              return StandaloneGrpcServer.this.runtime.serviceStatus();
+              return bounded(StandaloneGrpcServer.this.runtime.serviceStatus());
             } catch (Exception e) {
               throw new CompletionException(e);
             }

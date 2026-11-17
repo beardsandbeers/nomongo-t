@@ -3,6 +3,7 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "runtime",
     srcs = [
+        "DirectReadCatalog.java",
         "IndexSeed.java",
         "StandaloneDiskMonitor.java",
         "StandaloneIndexStatistics.java",
@@ -28,6 +29,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/config/manager",
         "//src/main/java/com/xgen/mongot/config/util",
         "//src/main/java/com/xgen/mongot/cursor",
+        "//src/main/java/com/xgen/mongot/embedding/providers",
         "//src/main/java/com/xgen/mongot/featureflag",
         "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/index",
@@ -45,6 +47,8 @@ java_library(
         "//src/main/java/com/xgen/mongot/metrics",
         "//src/main/java/com/xgen/mongot/monitor",
         "//src/main/java/com/xgen/mongot/replication/mongodb/common",
+        "//src/main/java/com/xgen/mongot/server/command/management/util",
+        "//src/main/java/com/xgen/mongot/server/command/search",
         "//src/main/java/com/xgen/mongot/standalone/catalog",
         "//src/main/java/com/xgen/mongot/standalone/config",
         "//src/main/java/com/xgen/mongot/standalone/ingestion",
@@ -55,6 +59,7 @@ java_library(
         "@com_google_protobuf//:protobuf_java",
         "@io_grpc_grpc_java//api",
         "@maven//:com_google_errorprone_error_prone_annotations",
+        "@maven//:com_google_guava_guava",
         "@maven//:io_micrometer_micrometer_core",
         "@maven//:org_apache_lucene_lucene_core",
         "@maven//:org_jetbrains_annotations",

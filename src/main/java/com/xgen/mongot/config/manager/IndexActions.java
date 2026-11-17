@@ -252,6 +252,7 @@ public class IndexActions {
         .map(IndexDefinition::getIndexId)
         .forEach(this.configState.indexCatalog::removeIndex);
 
+    indexes.forEach(index -> this.configState.readLeases.invalidate(index.getGenerationId()));
     dropAllOrFail(indexes);
   }
 
@@ -265,6 +266,7 @@ public class IndexActions {
     validateAllInStaged(indexes);
     indexes.forEach(this.configState.staged::removeIndex);
 
+    indexes.forEach(index -> this.configState.readLeases.invalidate(index.getGenerationId()));
     dropAllOrFail(indexes);
   }
 
@@ -278,6 +280,7 @@ public class IndexActions {
     validateAllInPhasingOut(indexes);
     indexes.forEach(this.configState.phasingOut::removeIndex);
 
+    indexes.forEach(index -> this.configState.readLeases.invalidate(index.getGenerationId()));
     dropAllOrFail(indexes);
   }
 
@@ -306,7 +309,8 @@ public class IndexActions {
 
   private void dropAllOrFail(List<IndexGeneration> indexes) {
     if (this.configState.defersRetirement()) {
-      indexes.forEach(index -> this.configState.deferRetirement(index, () -> dropIndex(index)));
+      indexes.forEach(
+          index -> this.configState.deferRetirement(index, () -> dropDrainedIndex(index)));
       return;
     }
     List<CompletableFuture<?>> dropFutures =
@@ -318,6 +322,13 @@ public class IndexActions {
   }
 
   private CompletableFuture<Void> dropIndex(IndexGeneration indexGeneration) {
+    return this.configState
+        .readLeases
+        .invalidate(indexGeneration.getGenerationId())
+        .thenCompose(unused -> dropDrainedIndex(indexGeneration));
+  }
+
+  private CompletableFuture<Void> dropDrainedIndex(IndexGeneration indexGeneration) {
     GenerationId generationId = indexGeneration.getGenerationId();
     LOG.atInfo()
         .addKeyValue("indexId", generationId.indexId)

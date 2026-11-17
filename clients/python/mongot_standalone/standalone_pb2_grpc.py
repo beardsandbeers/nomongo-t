@@ -28,7 +28,8 @@ if _version_not_supported:
 
 
 class CatalogServiceStub:
-    """Compatible mapping updates preserve indexed content without backfilling added fields.
+    """Compatible mapping updates keep the same physical index and generation; schema revision advances.
+    Existing content is retained without backfilling added fields.
     Other updates rebuild empty unless REQUIRE_PRESERVE is requested. There is no source replay log.
     """
 
@@ -89,7 +90,8 @@ class CatalogServiceStub:
 
 
 class CatalogServiceServicer:
-    """Compatible mapping updates preserve indexed content without backfilling added fields.
+    """Compatible mapping updates keep the same physical index and generation; schema revision advances.
+    Existing content is retained without backfilling added fields.
     Other updates rebuild empty unless REQUIRE_PRESERVE is requested. There is no source replay log.
     """
 
@@ -196,7 +198,8 @@ def add_CatalogServiceServicer_to_server(servicer, server):
 
 # This class is part of an EXPERIMENTAL API.
 class CatalogService:
-    """Compatible mapping updates preserve indexed content without backfilling added fields.
+    """Compatible mapping updates keep the same physical index and generation; schema revision advances.
+    Existing content is retained without backfilling added fields.
     Other updates rebuild empty unless REQUIRE_PRESERVE is requested. There is no source replay log.
     """
 

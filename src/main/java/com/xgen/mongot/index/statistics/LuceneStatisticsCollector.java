@@ -11,6 +11,7 @@ import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.field.FieldValue;
 import com.xgen.mongot.index.statistics.IndexStatistics.Bytes;
 import com.xgen.mongot.index.statistics.IndexStatistics.Method;
+import com.xgen.mongot.util.FieldPath;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
@@ -47,6 +48,7 @@ public final class LuceneStatisticsCollector {
   private final BooleanSupplier cancelled;
   private final IndexDefinition definition;
   private final boolean detailed;
+  private final Map<String, String> logicalPaths;
   private boolean unrecognizedVector;
 
   private static final class MutableField {
@@ -103,10 +105,23 @@ public final class LuceneStatisticsCollector {
   }
 
   private LuceneStatisticsCollector(
-      IndexDefinition definition, boolean detailed, BooleanSupplier cancelled) {
+      IndexDefinition definition,
+      boolean detailed,
+      BooleanSupplier cancelled,
+      Map<FieldPath, FieldPath> logicalToPhysical) {
     this.definition = definition;
     this.detailed = detailed;
     this.cancelled = cancelled;
+    this.logicalPaths =
+        logicalToPhysical.entrySet().stream()
+            .collect(
+                java.util.stream.Collectors.toUnmodifiableMap(
+                    entry -> entry.getValue().toString(),
+                    entry -> entry.getKey().toString(),
+                    (existing, replacement) -> {
+                      throw new IllegalArgumentException(
+                          "Multiple logical fields map to the same physical field");
+                    }));
   }
 
   public static IndexStatistics collect(
@@ -116,7 +131,19 @@ public final class LuceneStatisticsCollector {
       OptionalLong writerHeap,
       BooleanSupplier cancelled)
       throws IOException {
-    return new LuceneStatisticsCollector(definition, detailed, cancelled)
+    return collect(snapshot, definition, detailed, writerHeap, cancelled, Map.of());
+  }
+
+  /** Attribute derived fields to logical paths while retaining physical representation names. */
+  public static IndexStatistics collect(
+      LuceneStatisticsSnapshot snapshot,
+      IndexDefinition definition,
+      boolean detailed,
+      OptionalLong writerHeap,
+      BooleanSupplier cancelled,
+      Map<FieldPath, FieldPath> logicalToPhysical)
+      throws IOException {
+    return new LuceneStatisticsCollector(definition, detailed, cancelled, logicalToPhysical)
         .collect(snapshot, writerHeap);
   }
 
@@ -353,10 +380,11 @@ public final class LuceneStatisticsCollector {
   }
 
   private String path(String name) {
-    if (FieldName.MultiField.isTypeOf(name)) {
-      return FieldName.MultiField.getFieldPath(name).getFieldPath().toString();
-    }
-    return FieldName.TypeField.getTypeOf(name).map(type -> type.stripPrefix(name)).orElse("");
+    String physicalPath =
+        FieldName.MultiField.isTypeOf(name)
+            ? FieldName.MultiField.getFieldPath(name).getFieldPath().toString()
+            : FieldName.TypeField.getTypeOf(name).map(type -> type.stripPrefix(name)).orElse("");
+    return this.logicalPaths.getOrDefault(physicalPath, physicalPath);
   }
 
   private void configuredFields() {

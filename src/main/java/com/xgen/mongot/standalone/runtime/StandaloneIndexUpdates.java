@@ -273,6 +273,7 @@ public final class StandaloneIndexUpdates implements Closeable {
     }
   }
 
+  /** Installs ownership and durable recovery safeguards before lifecycle startup. */
   public static void configureFactory(
       LuceneIndexFactory factory, LocalIndexCatalog catalog, Path root) {
     factory.requireExistingDataFor(catalog::requiresExistingData);

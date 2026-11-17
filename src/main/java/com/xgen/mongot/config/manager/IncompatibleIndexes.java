@@ -136,8 +136,16 @@ public class IncompatibleIndexes implements QuarantinedIndexLookup {
     return new ArrayList<>(this.stagedIndexes.values());
   }
 
+  public Optional<QuarantinedIndex> getStagedIndex(ObjectId indexId) {
+    return Optional.ofNullable(this.stagedIndexes.get(indexId));
+  }
+
   public Collection<QuarantinedIndex> getLiveIndexes() {
     return new ArrayList<>(this.liveIndexes.values());
+  }
+
+  public Optional<QuarantinedIndex> getLiveIndex(ObjectId indexId) {
+    return Optional.ofNullable(this.liveIndexes.get(indexId));
   }
 
   public boolean isEmpty() {

@@ -3,6 +3,7 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "server",
     srcs = [
+        "DirectIndexPages.java",
         "RpcDispatcher.java",
         "StandaloneAuthInterceptor.java",
         "StandaloneDeleteByQuery.java",
@@ -21,6 +22,7 @@ java_library(
         "@io_grpc_grpc_java//api",
     ],
     deps = [
+        "//src/main/java/com/xgen/mongot/config/manager",
         "//src/main/java/com/xgen/mongot/cursor",
         "//src/main/java/com/xgen/mongot/cursor/batch",
         "//src/main/java/com/xgen/mongot/extensions/join",

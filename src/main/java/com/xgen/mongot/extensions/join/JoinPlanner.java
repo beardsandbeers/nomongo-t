@@ -49,6 +49,11 @@ public class JoinPlanner {
   public interface Environment {
     String resolve(JoinSource source) throws Exception;
 
+    /**
+     * Checks transport-specific source bindings before acquiring readers or executing predicates.
+     */
+    default void validateSources(List<JoinSource> sources) {}
+
     GenerationId pin(String id, Optional<GenerationId> expected) throws Exception;
 
     QuerySnapshot acquire(GenerationId generation, boolean concurrent) throws Exception;
@@ -57,6 +62,9 @@ public class JoinPlanner {
     default Closeable lease(GenerationId generation) {
       return () -> {};
     }
+
+    /** Registers direct-reader retirement; native adapters retain their own cursor lifecycle. */
+    default void onInvalidated(Runnable callback) {}
 
     void verify(String id, GenerationId generation);
 
@@ -114,6 +122,7 @@ public class JoinPlanner {
     if (joins.size() > MAX_JOINS) {
       throw exhausted("Too many join predicates (maximum " + MAX_JOINS + ")");
     }
+    this.environment.validateSources(joins.stream().flatMap(join -> join.from().stream()).toList());
     var plan = new Plan(query);
     var joinExplain = JoinFeatureExplainer.root();
     long startNanos = System.nanoTime();
@@ -383,6 +392,10 @@ public class JoinPlanner {
       for (var dependency : this.dependencies.entrySet()) {
         JoinPlanner.this.environment.verify(dependency.getKey(), dependency.getValue());
       }
+    }
+
+    public void onInvalidated(Runnable callback) {
+      JoinPlanner.this.environment.onInvalidated(callback);
     }
 
     private void add(String id, Optional<GenerationId> expected) throws Exception {

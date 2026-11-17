@@ -4,14 +4,19 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.config.backup.JournalEntryIdentity;
+import com.xgen.mongot.config.manager.DefaultConfigManager;
+import com.xgen.mongot.config.manager.QuarantinedIndex;
 import com.xgen.mongot.featureflag.Feature;
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
 import com.xgen.mongot.index.IndexMetricValuesSupplier;
+import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.vector.Similarity;
+import com.xgen.mongot.index.version.Generation;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.CatalogServiceGrpc;
@@ -63,47 +68,6 @@ import org.junit.rules.TemporaryFolder;
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
-  @Test
-  public void mappingUpdate_queryAnalyzer_refreshesFieldTypeMetricsWithoutRestart()
-      throws Exception {
-    var flags = DynamicFeatureFlagRegistry.communityDefault();
-    try (var f =
-        new Fixture(
-            StandaloneConfig.development(data(), 0),
-            new io.grpc.Metadata(),
-            FeatureFlags.communityDefaults(),
-            flags)) {
-      String id = f.create("field-counts", "{mappings:{fields:{title:{type:'string'}}}}");
-      f.upsert(id, "{_id:'a',title:'coffee'}");
-      // Populate the old-schema cache after visibility, rather than sampling the empty index.
-      flags.updateDynamicFeatureFlags(
-          List.of(enabledFlag(DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC)));
-      var generation =
-          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
-      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId())) {
-        var supplier = pin.index().getMetricsUpdater().getIndexMetricValuesSupplier();
-        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.STRING, 1.0));
-
-        var updated =
-            f.catalog.updateIndex(
-                UpdateIndexRequest.newBuilder()
-                    .setIndexId(id)
-                    .setExpectedRevision(1)
-                    .setDefinitionBson(
-                        bson(
-                            "{analyzers:[{name:'edge',tokenizer:{type:'edgeGram',"
-                                + "minGram:2,maxGram:15}}],mappings:{fields:{"
-                                + "title:{type:'string',searchAnalyzer:'edge'}}}}"))
-                    .build());
-
-        assertThat(updated.getGenerationId())
-            .isEqualTo(generation.getGenerationId().uniqueString());
-        assertThat(updated.getActiveRevision()).isEqualTo(2);
-        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.AUTOCOMPLETE, 1.0));
-      }
-    }
-  }
-
   private static void awaitFieldTypeMetrics(
       IndexMetricValuesSupplier supplier, Map<FieldName.TypeField, Double> expected)
       throws Exception {
@@ -112,145 +76,6 @@ public class StandaloneGrpcServerTest {
       Thread.sleep(20);
     }
     assertThat(supplier.getNumFieldsPerDatatype()).isEqualTo(expected);
-  }
-
-  @Test
-  public void mappingUpdate_customAnalyzerAndMulti_preservesSortedEmbeddedDataAndMatchesFreshIndex()
-      throws Exception {
-    String before =
-        "{storedSource:true,sort:{rank:1},mappings:{fields:{"
-            + "rank:{type:'number'},title:{type:'string'},"
-            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
-    String after =
-        "{storedSource:true,sort:{rank:1},analyzers:[{name:'exact',tokenizer:{type:'keyword'}}],"
-            + "mappings:{fields:{rank:{type:'number'},title:{type:'string',"
-            + "multi:{exact:{type:'string',analyzer:'exact'}}},"
-            + "label:{type:'string',analyzer:'exact',similarity:{type:'boolean'}},"
-            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
-    try (var f =
-        new Fixture(
-            StandaloneConfig.development(data(), 0),
-            new io.grpc.Metadata(),
-            FeatureFlags.withDefaults().enable(Feature.SORTED_INDEX).build(),
-            DynamicFeatureFlagRegistry.communityDefault())) {
-      String id = f.create("mutable-sorted", before);
-      String fresh = f.create("fresh-sorted", after);
-      String physical = f.ready(id, 1).getGenerationId();
-      String old = "{_id:'a',rank:2,title:'Old',items:[{name:'retained'}]}";
-      f.upsert(id, old);
-      f.upsert(fresh, old);
-
-      var updated =
-          f.catalog.updateIndex(
-              UpdateIndexRequest.newBuilder()
-                  .setIndexId(id)
-                  .setExpectedRevision(1)
-                  .setDefinitionBson(bson(after))
-                  .build());
-      String added = "{_id:'b',rank:1,title:'CAPS Word',label:'CAPS Word',items:[{name:'added'}]}";
-      f.upsert(id, added);
-      f.upsert(fresh, added);
-
-      assertThat(updated.getGenerationId()).isEqualTo(physical);
-      String labelQuery = "{text:{path:'label',query:'CAPS Word'},returnStoredSource:true}";
-      assertThat(f.query(id, labelQuery).getArray("results"))
-          .isEqualTo(f.query(fresh, labelQuery).getArray("results"));
-      assertThat(f.query(id, "{text:{path:'label',query:'CAPS'}}").getArray("results")).isEmpty();
-      assertThat(
-              f.query(id, "{text:{path:{value:'title',multi:'exact'},query:'CAPS Word'}}")
-                  .getArray("results"))
-          .hasSize(1);
-      assertThat(
-              f.query(
-                      id,
-                      "{embeddedDocument:{path:'items',operator:{"
-                          + "text:{path:'items.name',query:'retained'}}}}")
-                  .getArray("results"))
-          .hasSize(1);
-      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
-    }
-  }
-
-  @Test
-  public void mappingUpdate_inPlace_keepsWriterFilesCursorsAndPublishesNewAnalyzer()
-      throws Exception {
-    String id;
-    String physical;
-    Path root = data();
-    try (var f = new Fixture(root)) {
-      id = f.create("in-place", "{numPartitions:2,mappings:{fields:{title:{type:'string'}}}}");
-      physical = f.ready(id, 1).getGenerationId();
-      f.upsert(id, "{_id:'a',title:'coffee',label:'CAPS Word'}");
-      f.upsert(id, "{_id:'b',title:'coffee'}");
-      var cursor =
-          f.queries.search(
-              QueryRequest.newBuilder()
-                  .setIndexId(id)
-                  .setBatchSize(1)
-                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
-                  .build());
-      assertThat(f.stats(id).getActiveRevision()).isEqualTo(1);
-      var generation =
-          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
-      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId())) {
-        var writer = pin.index().getWriter();
-        var updated =
-            f.catalog.updateIndex(
-                UpdateIndexRequest.newBuilder()
-                    .setIndexId(id)
-                    .setExpectedRevision(1)
-                    .setDefinitionBson(
-                        bson(
-                            "{numPartitions:2,mappings:{fields:{title:{type:'string'},"
-                                + "label:{type:'string',analyzer:'lucene.keyword'},"
-                                + "tag:{type:'token',normalizer:'lowercase'}}}}"))
-                    .build());
-
-        assertThat(updated.getLifecycleState()).isEqualTo("READY");
-        assertThat(updated.getGenerationId()).isEqualTo(physical);
-        assertThat(updated.getActiveRevision()).isEqualTo(2);
-        assertThat(pin.index().getWriter()).isSameInstanceAs(writer);
-        assertThat(pin.retired()).isFalse();
-        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
-            .isEmpty();
-        f.upsert(id, "{_id:'c',title:'coffee',label:'CAPS Word',tag:'UPPER'}");
-        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
-            .hasSize(1);
-        assertThat(f.query(id, "{equals:{path:'tag',value:'upper'}}").getArray("results"))
-            .hasSize(1);
-        assertThat(
-                new RawBsonDocument(
-                        f.queries
-                            .getMore(
-                                GetMoreRequest.newBuilder()
-                                    .setCursorId(cursor.getCursorId())
-                                    .build())
-                            .getBatchBson()
-                            .toByteArray())
-                    .getArray("results"))
-            .hasSize(1);
-        assertThat(
-                f.catalog
-                    .getIndexStats(GetIndexStatsRequest.newBuilder().setIndexId(id).build())
-                    .getActiveRevision())
-            .isEqualTo(2);
-        assertThat(f.stats(id).getDocumentCount()).isEqualTo(3);
-        try (var files = Files.list(root)) {
-          assertThat(
-                  files.filter(path -> path.getFileName().toString().startsWith(id + "_")).toList())
-              .hasSize(1);
-        }
-        assertThat(f.runtime.catalog().migrations()).isEmpty();
-      }
-    }
-    try (var f = new Fixture(root)) {
-      assertThat(f.ready(id, 2).getGenerationId()).isEqualTo(physical);
-      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
-          .hasSize(1);
-      f.upsert(id, "{_id:'d',title:'coffee',label:'CAPS Word'}");
-      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
-          .hasSize(2);
-    }
   }
 
   @Test
@@ -319,6 +144,516 @@ public class StandaloneGrpcServerTest {
                   .getIndexStats()
                   .getSnapshotId())
           .isEqualTo(fields.getIndexStats().getSnapshotId());
+    }
+  }
+
+  @Test
+  public void mappingUpdate_inPlace_keepsWriterFilesCursorsAndPublishesNewAnalyzer()
+      throws Exception {
+    String id;
+    String physical;
+    Path root = data();
+    try (var f = new Fixture(root)) {
+      id = f.create("in-place", "{numPartitions:2,mappings:{fields:{title:{type:'string'}}}}");
+      physical = f.ready(id, 1).getGenerationId();
+      f.upsert(id, "{_id:'a',title:'coffee',label:'CAPS Word'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var cursor =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      assertThat(f.stats(id).getActiveRevision()).isEqualTo(1);
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId());
+          var direct = f.runtime.reads().acquire(id, physical)) {
+        var originalReader = direct.reader();
+        var writer = pin.index().getWriter();
+        var updated =
+            f.catalog.updateIndex(
+                UpdateIndexRequest.newBuilder()
+                    .setIndexId(id)
+                    .setExpectedRevision(1)
+                    .setDefinitionBson(
+                        bson(
+                            "{numPartitions:2,mappings:{fields:{title:{type:'string'},"
+                                + "label:{type:'string',analyzer:'lucene.keyword'},"
+                                + "tag:{type:'token',normalizer:'lowercase'}}}}"))
+                    .build());
+
+        assertThat(updated.getLifecycleState()).isEqualTo("READY");
+        assertThat(updated.getGenerationId()).isEqualTo(physical);
+        assertThat(updated.getActiveRevision()).isEqualTo(2);
+        assertThat(pin.index().getWriter()).isSameInstanceAs(writer);
+        assertThat(pin.retired()).isFalse();
+        assertThat(direct.retired()).isFalse();
+        assertThat(direct.definition().getDefinitionVersion()).hasValue(1L);
+        assertThat(direct.reader()).isSameInstanceAs(originalReader);
+        try (var current = f.runtime.reads().acquire(id, physical)) {
+          assertThat(current.definition().getDefinitionVersion()).hasValue(2L);
+          assertThat(current.reader()).isNotSameInstanceAs(originalReader);
+        }
+        try (var oldSnapshot = f.runtime.acquireQuerySnapshot(direct, false)) {
+          assertThrows(
+              com.xgen.mongot.index.query.InvalidQueryException.class,
+              () -> oldSnapshot.joinFields(com.xgen.mongot.util.FieldPath.parse("tag")));
+        }
+
+        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+            .isEmpty();
+        f.upsert(id, "{_id:'c',title:'coffee',label:'CAPS Word',tag:'UPPER'}");
+        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+            .hasSize(1);
+        assertThat(f.query(id, "{equals:{path:'tag',value:'upper'}}").getArray("results"))
+            .hasSize(1);
+        assertThat(
+                new RawBsonDocument(
+                        f.queries
+                            .getMore(
+                                GetMoreRequest.newBuilder()
+                                    .setCursorId(cursor.getCursorId())
+                                    .build())
+                            .getBatchBson()
+                            .toByteArray())
+                    .getArray("results"))
+            .hasSize(1);
+        assertThat(
+                f.catalog
+                    .getIndexStats(GetIndexStatsRequest.newBuilder().setIndexId(id).build())
+                    .getActiveRevision())
+            .isEqualTo(2);
+        assertThat(f.stats(id).getDocumentCount()).isEqualTo(3);
+        try (var files = Files.list(root)) {
+          assertThat(
+                  files.filter(path -> path.getFileName().toString().startsWith(id + "_")).toList())
+              .hasSize(1);
+        }
+        assertThat(f.runtime.catalog().migrations()).isEmpty();
+      }
+    }
+    try (var f = new Fixture(root)) {
+      assertThat(f.ready(id, 2).getGenerationId()).isEqualTo(physical);
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+          .hasSize(1);
+      f.upsert(id, "{_id:'d',title:'coffee',label:'CAPS Word'}");
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+          .hasSize(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_customAnalyzerAndMulti_preservesSortedEmbeddedDataAndMatchesFreshIndex()
+      throws Exception {
+    String before =
+        "{storedSource:true,sort:{rank:1},mappings:{fields:{"
+            + "rank:{type:'number'},title:{type:'string'},"
+            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
+    String after =
+        "{storedSource:true,sort:{rank:1},analyzers:[{name:'exact',tokenizer:{type:'keyword'}}],"
+            + "mappings:{fields:{rank:{type:'number'},title:{type:'string',"
+            + "multi:{exact:{type:'string',analyzer:'exact'}}},"
+            + "label:{type:'string',analyzer:'exact',similarity:{type:'boolean'}},"
+            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.withDefaults().enable(Feature.SORTED_INDEX).build(),
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.create("mutable-sorted", before);
+      String fresh = f.create("fresh-sorted", after);
+      String physical = f.ready(id, 1).getGenerationId();
+      String old = "{_id:'a',rank:2,title:'Old',items:[{name:'retained'}]}";
+      f.upsert(id, old);
+      f.upsert(fresh, old);
+
+      var updated =
+          f.catalog.updateIndex(
+              UpdateIndexRequest.newBuilder()
+                  .setIndexId(id)
+                  .setExpectedRevision(1)
+                  .setDefinitionBson(bson(after))
+                  .build());
+      String added = "{_id:'b',rank:1,title:'CAPS Word',label:'CAPS Word',items:[{name:'added'}]}";
+      f.upsert(id, added);
+      f.upsert(fresh, added);
+
+      assertThat(updated.getGenerationId()).isEqualTo(physical);
+      String labelQuery = "{text:{path:'label',query:'CAPS Word'},returnStoredSource:true}";
+      assertThat(f.query(id, labelQuery).getArray("results"))
+          .isEqualTo(f.query(fresh, labelQuery).getArray("results"));
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS'}}").getArray("results")).isEmpty();
+      assertThat(
+              f.query(id, "{text:{path:{value:'title',multi:'exact'},query:'CAPS Word'}}")
+                  .getArray("results"))
+          .hasSize(1);
+      assertThat(
+              f.query(
+                      id,
+                      "{embeddedDocument:{path:'items',operator:{"
+                          + "text:{path:'items.name',query:'retained'}}}}")
+                  .getArray("results"))
+          .hasSize(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_queryAnalyzer_refreshesFieldTypeMetricsWithoutRestart()
+      throws Exception {
+    var flags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            flags)) {
+      String id = f.create("field-counts", "{mappings:{fields:{title:{type:'string'}}}}");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      // Populate the old-schema cache after visibility, rather than sampling the empty index.
+      flags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC)));
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId())) {
+        var supplier = pin.index().getMetricsUpdater().getIndexMetricValuesSupplier();
+        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.STRING, 1.0));
+
+        var updated =
+            f.catalog.updateIndex(
+                UpdateIndexRequest.newBuilder()
+                    .setIndexId(id)
+                    .setExpectedRevision(1)
+                    .setDefinitionBson(
+                        bson(
+                            "{analyzers:[{name:'edge',tokenizer:{type:'edgeGram',"
+                                + "minGram:2,maxGram:15}}],mappings:{fields:{"
+                                + "title:{type:'string',searchAnalyzer:'edge'}}}}"))
+                    .build());
+
+        assertThat(updated.getGenerationId())
+            .isEqualTo(generation.getGenerationId().uniqueString());
+        assertThat(updated.getActiveRevision()).isEqualTo(2);
+        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.AUTOCOMPLETE, 1.0));
+      }
+    }
+  }
+
+  @Test
+  public void vectorSearch_autoNumCandidatesDisabled_requiresExplicitCandidates() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id = f.createVector();
+      f.upsert(id, "{_id:'near',v:[1.0,0.0,0.0]}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(bson("{path:'v',queryVector:[1.0,0.0,0.0],limit:1}"))
+              .build();
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.queries.vectorSearch(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription())
+          .isEqualTo("numCandidates is required for approximate vector search");
+      assertThat(f.hasOpenCursors(id)).isFalse();
+      var response =
+          f.queries.vectorSearch(
+              request.toBuilder()
+                  .setQueryBson(
+                      bson("{path:'v',queryVector:[1.0,0.0,0.0],numCandidates:10,limit:1}"))
+                  .build());
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+    }
+  }
+
+  @Test
+  public void vectorSearch_autoNumCandidatesEnabled_acceptsOmittedCandidates() throws Exception {
+    Similarity.load();
+    var flags =
+        FeatureFlags.withDefaults()
+            .enable(Feature.INDEX_FEATURE_VERSION_FOUR)
+            .enable(Feature.AUTO_NUM_CANDIDATES)
+            .build();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            flags,
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.createVector();
+      f.upsert(id, "{_id:'near',v:[1.0,0.0,0.0]}");
+
+      var response =
+          f.queries.vectorSearch(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setQueryBson(bson("{path:'v',queryVector:[1.0,0.0,0.0],limit:1}"))
+                  .build());
+
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_quarantinedExplicitTarget_reportsIncompatibility() throws Exception {
+    try (var f = new Fixture(data())) {
+      var manager = f.stopReconciliation();
+      var id = new org.bson.types.ObjectId();
+      var identity =
+          new JournalEntryIdentity(
+              id, "database", java.util.UUID.randomUUID(), "unreadable", Generation.FIRST);
+      var quarantine =
+          new QuarantinedIndex(
+              identity,
+              IndexDefinitionGeneration.Type.SEARCH,
+              "Unsupported mapping",
+              new BsonDocument());
+      synchronized (manager) {
+        manager.configState.incompatibleIndexes.addLiveIndex(quarantine);
+      }
+      assertThat(
+              f.catalog
+                  .getIndex(GetIndexRequest.newBuilder().setIndexId(id.toHexString()).build())
+                  .getLifecycleState())
+          .isEqualTo("QUARANTINED");
+      var query = bson("{exists:{path:'title'},count:{type:'total'}}");
+      var search =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.search(
+                      QueryRequest.newBuilder()
+                          .setIndexId(id.toHexString())
+                          .setQueryBson(query)
+                          .build()));
+
+      var meta =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setTargetIndexId(id.toHexString())
+                          .setQueryBson(query)
+                          .build()));
+
+      assertThat(search.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(meta.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(meta.getStatus().getDescription()).isEqualTo(search.getStatus().getDescription());
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+    }
+  }
+
+  @Test
+  public void searchMeta_quarantinedReplacement_queriesHealthyActiveGeneration() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("healthy");
+      f.upsert(id, "{_id:1,title:'coffee'}");
+      var active = f.runtime.reads().resolve(id, "");
+      var definition = active.getDefinition();
+      var manager = f.stopReconciliation();
+      var identity =
+          new JournalEntryIdentity(
+              definition.getIndexId(),
+              definition.getDatabase(),
+              definition.getCollectionUuid(),
+              definition.getName(),
+              active.getGenerationId().generation.incrementUser());
+      var quarantine =
+          new QuarantinedIndex(
+              identity,
+              IndexDefinitionGeneration.Type.SEARCH,
+              "Unsupported replacement",
+              new BsonDocument());
+      synchronized (manager) {
+        manager.configState.incompatibleIndexes.addStagedIndex(quarantine);
+      }
+      var description = f.catalog.getIndex(GetIndexRequest.newBuilder().setIndexId(id).build());
+      assertThat(description.getLifecycleState()).isEqualTo("FAILED");
+      assertThat(description.getQueryable()).isTrue();
+
+      var response =
+          f.queries.searchMeta(
+              SearchMetaRequest.newBuilder()
+                  .setTargetIndexId(id)
+                  .setQueryBson(bson("{exists:{path:'title'},count:{type:'total'}}"))
+                  .build());
+
+      assertThat(response.getGenerationId()).isEqualTo(active.getGenerationId().uniqueString());
+      assertThat(metadata(response).getDocument("count").getInt64("total").getValue()).isEqualTo(1);
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void searchMeta_vectorIndex_rejectsTypeAndReleasesLease() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("vector")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      var manager = f.stopReconciliation();
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.searchMeta(
+                      SearchMetaRequest.newBuilder()
+                          .setTargetIndexId(id)
+                          .setQueryBson(bson("{exists:{path:'title'},count:{type:'total'}}"))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(error.getStatus().getDescription())
+          .isEqualTo("SearchMeta requires a search index");
+      synchronized (manager) {
+        assertThat(manager.configState.readLeases.activeCount()).isEqualTo(0);
+      }
+      assertThat(f.hasOpenCursors(id)).isFalse();
+    }
+  }
+
+  @Test
+  public void cursors_sameGeneration_isolatesNativeOriginAndDirectInvalidation() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("shared");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var direct =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      var nativeManager =
+          new com.xgen.mongot.standalone.coexistence.NativeCursorManager(f.runtime.cursors());
+      var generation = f.runtime.reads().resolve(id, "");
+      var definition = generation.getDefinition();
+      var nativeCursor =
+          nativeManager.newCursor(
+              definition.getDatabase(),
+              definition.getLastObservedCollectionName(),
+              definition.getCollectionUuid(),
+              Optional.empty(),
+              new com.xgen.mongot.cursor.CursorQuery.Search(
+                  com.xgen.mongot.index.query.SearchQuery.fromBson(
+                      BsonDocument.parse("{index:'shared',text:{path:'title',query:'coffee'}}"),
+                      com.xgen.mongot.index.query.QueryOptimizationFlags.DEFAULT_OPTIONS)),
+              com.xgen.mongot.cursor.batch.QueryCursorOptions.empty(),
+              com.xgen.mongot.index.query.QueryOptimizationFlags.DEFAULT_OPTIONS,
+              Optional.empty());
+
+      assertThrows(
+          com.xgen.mongot.cursor.MongotCursorNotFoundException.class,
+          () ->
+              nativeManager.getNextBatch(
+                  direct.getCursorId(),
+                  com.xgen.mongot.util.Bytes.ofMebi(1),
+                  com.xgen.mongot.cursor.batch.QueryCursorOptions.empty()));
+      nativeManager.killCursor(direct.getCursorId());
+      assertThat(f.runtime.cursors().isDirectCursor(direct.getCursorId())).isTrue();
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(nativeCursor.cursorId)
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      f.runtime.reads().invalidate(id);
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(direct.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      var nativeBatch =
+          nativeManager.getNextBatch(
+              nativeCursor.cursorId,
+              com.xgen.mongot.util.Bytes.ofMebi(1),
+              com.xgen.mongot.cursor.batch.QueryCursorOptions.empty());
+
+      assertThat(nativeBatch.batch.asArray().size()).isEqualTo(2);
+      nativeManager.killCursor(nativeCursor.cursorId);
+    }
+  }
+
+  @Test
+  public void searchMeta_explicitTarget_selectsNamedIndexAndPreservesLegacyDefault()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String local = f.create("default");
+      String selected = f.create("selected");
+      f.upsert(local, "{_id:'a',title:'coffee'}");
+      f.upsert(selected, "{_id:'a',title:'coffee'}");
+      f.upsert(selected, "{_id:'b',title:'coffee'}");
+      var query = metaRequest("{text:{path:'title',query:'coffee'},count:{type:'total'}}");
+
+      var legacy = f.queries.searchMeta(query);
+      var explicit = f.queries.searchMeta(query.toBuilder().setTargetIndexId(selected).build());
+
+      assertThat(metadata(legacy).getDocument("count").getInt64("total").getValue()).isEqualTo(1);
+      assertThat(metadata(explicit).getDocument("count").getInt64("total").getValue()).isEqualTo(2);
+      assertThat(f.hasOpenCursors(selected)).isFalse();
+    }
+  }
+
+  @Test
+  public void listIndexes_paginationAndOwnershipFilter_returnsCompleteDistinctPages()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String first = f.create("one");
+      String second = f.create("two");
+      var request =
+          com.xgen.mongot.standalone.grpc.ListIndexesRequest.newBuilder().setPageSize(1).build();
+
+      var page = f.catalog.listIndexes(request);
+      var next =
+          f.catalog.listIndexes(request.toBuilder().setPageToken(page.getNextPageToken()).build());
+      var remote =
+          f.catalog.listIndexes(
+              request.toBuilder()
+                  .setOwnership(
+                      com.xgen.mongot.standalone.grpc.IndexOwnership.INDEX_OWNERSHIP_REPLICATED)
+                  .build());
+
+      assertThat(java.util.Set.of(page.getIndexes(0).getIndexId(), next.getIndexes(0).getIndexId()))
+          .containsExactly(first, second);
+      assertThat(next.getNextPageToken()).isEmpty();
+      assertThat(remote.getIndexesList()).isEmpty();
+      assertThat(page.getIndexes(0).getOwnership())
+          .isEqualTo(com.xgen.mongot.standalone.grpc.IndexOwnership.INDEX_OWNERSHIP_STANDALONE);
     }
   }
 
@@ -2764,17 +3099,19 @@ public class StandaloneGrpcServerTest {
                           """))
                   .build());
       f.ready(vector.getIndexId(), 1);
+      var vectorMappings =
+          f.catalog.getIndexMappings(
+              GetIndexMappingsRequest.newBuilder().setIndexId(vector.getIndexId()).build());
+      assertThat(vectorMappings.getIndexType()).isEqualTo(IndexType.INDEX_TYPE_VECTOR_SEARCH);
       assertThat(
-              assertThrows(
-                      StatusRuntimeException.class,
-                      () ->
-                          f.catalog.getIndexMappings(
-                              GetIndexMappingsRequest.newBuilder()
-                                  .setIndexId(vector.getIndexId())
-                                  .build()))
-                  .getStatus()
-                  .getCode())
-          .isEqualTo(Status.Code.FAILED_PRECONDITION);
+              BsonDocument.parse("{fields:" + vectorMappings.getVectorFieldsJson() + "}")
+                  .getArray("fields")
+                  .get(0)
+                  .asDocument()
+                  .getString("path")
+                  .getValue())
+          .isEqualTo("v");
+      assertThat(vectorMappings.getMappingsJson()).isEmpty();
       f.catalog.dropIndex(
           DropIndexRequest.newBuilder().setIndexId(id).setExpectedRevision(1).build());
       assertThat(
@@ -3152,6 +3489,18 @@ public class StandaloneGrpcServerTest {
               .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(headers));
     }
 
+    private DefaultConfigManager stopReconciliation() throws Exception {
+      var reconcilerField = StandaloneRuntime.class.getDeclaredField("reconciler");
+      reconcilerField.setAccessible(true);
+      var reconciler =
+          (java.util.concurrent.ScheduledThreadPoolExecutor) reconcilerField.get(this.runtime);
+      reconciler.shutdown();
+      assertThat(reconciler.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+      var managerField = StandaloneRuntime.class.getDeclaredField("configManager");
+      managerField.setAccessible(true);
+      return (DefaultConfigManager) managerField.get(this.runtime);
+    }
+
     private String create(String name) throws Exception {
       return create(name, "{mappings:{dynamic:true}}");
     }
@@ -3164,6 +3513,23 @@ public class StandaloneGrpcServerTest {
                       .setName(name)
                       .setType(IndexType.INDEX_TYPE_SEARCH)
                       .setDefinitionBson(bson(definition))
+                      .build())
+              .getIndexId();
+      ready(id, 1);
+      return id;
+    }
+
+    private String createVector() throws Exception {
+      String id =
+          this.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("vectors")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                                  + "similarity:'cosine'}]}"))
                       .build())
               .getIndexId();
       ready(id, 1);

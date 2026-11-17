@@ -109,7 +109,16 @@ public class StandaloneIndexUpdatesTest {
     }
 
     try (var runtime = new StandaloneRuntime(base)) {
-      await(() -> runtime.describeIndex(id).getActiveRevision() == 1);
+      // Active metadata can precede initialization; retry only once the source is usable.
+      await(
+          () ->
+              runtime.describeIndex(id).getActiveRevision() == 1
+                  && runtime
+                      .liveIndexes()
+                      .getIndexById(new org.bson.types.ObjectId(id))
+                      .filter(
+                          index -> runtime.ingestion().isGenerationReady(index.getGenerationId()))
+                      .isPresent());
       runtime.updateIndex(update(id, 2));
       runtime.catalogChanged();
       await(() -> runtime.describeIndex(id).getLifecycleState().equals("READY"));

@@ -49,6 +49,42 @@ public final class StandaloneClient implements AutoCloseable {
     queries = QueryServiceGrpc.newBlockingStub(channel).withInterceptors(auth);
   }
 
+  private <T> T read(
+      boolean required, java.util.function.Function<io.grpc.ClientInterceptor[], T> call) {
+    if (!required) return call.apply(new io.grpc.ClientInterceptor[0]);
+    var key = Metadata.Key.of("mongot-direct-read-contract", Metadata.ASCII_STRING_MARSHALLER);
+    var requestHeaders = new Metadata();
+    requestHeaders.put(key, "all-index-reads-v1");
+    var responseHeaders = new java.util.concurrent.atomic.AtomicReference<Metadata>();
+    var result =
+        call.apply(
+            new io.grpc.ClientInterceptor[] {
+              MetadataUtils.newAttachHeadersInterceptor(requestHeaders),
+              MetadataUtils.newCaptureMetadataInterceptor(
+                  responseHeaders, new java.util.concurrent.atomic.AtomicReference<>())
+            });
+    if (responseHeaders.get() == null
+        || !"all-index-reads-v1".equals(responseHeaders.get().get(key))) {
+      var failure =
+          io.grpc.Status.FAILED_PRECONDITION
+              .withDescription("Server does not support the all-index direct read contract")
+              .asRuntimeException();
+      if (result instanceof QueryResponse response && response.getCursorId() != 0) {
+        try {
+          queries
+              .withDeadlineAfter(
+                  Math.min(timeoutNanos, TimeUnit.SECONDS.toNanos(5)), TimeUnit.NANOSECONDS)
+              .killCursor(
+                  KillCursorRequest.newBuilder().setCursorId(response.getCursorId()).build());
+        } catch (io.grpc.StatusRuntimeException cleanupFailure) {
+          failure.addSuppressed(cleanupFailure);
+        }
+      }
+      throw failure;
+    }
+    return result;
+  }
+
   public static ByteString encodeBson(BsonDocument document) {
     var buffer = new RawBsonDocument(document, new BsonDocumentCodec()).getByteBuffer().asNIO();
     return ByteString.copyFrom(buffer);
@@ -85,7 +121,15 @@ public final class StandaloneClient implements AutoCloseable {
   }
 
   public ListIndexesResponse listIndexes(ListIndexesRequest request) {
-    return catalog.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).listIndexes(request);
+    return read(
+        request.getOwnershipValue() != 0
+            || request.getPageSize() != 0
+            || !request.getPageToken().isEmpty(),
+        interceptors ->
+            catalog
+                .withInterceptors(interceptors)
+                .withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS)
+                .listIndexes(request));
   }
 
   public IndexStats getIndexStats(GetIndexStatsRequest request) {
@@ -103,15 +147,33 @@ public final class StandaloneClient implements AutoCloseable {
   }
 
   public QueryResponse search(QueryRequest request) {
-    return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).search(request);
+    return read(
+        request.getJoinIndexesCount() != 0,
+        interceptors ->
+            queries
+                .withInterceptors(interceptors)
+                .withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS)
+                .search(request));
   }
 
   public SearchMetaResponse searchMeta(SearchMetaRequest request) {
-    return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).searchMeta(request);
+    return read(
+        !request.getTargetIndexId().isEmpty() || request.getJoinIndexesCount() != 0,
+        interceptors ->
+            queries
+                .withInterceptors(interceptors)
+                .withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS)
+                .searchMeta(request));
   }
 
   public QueryResponse vectorSearch(QueryRequest request) {
-    return queries.withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS).vectorSearch(request);
+    return read(
+        request.getJoinIndexesCount() != 0,
+        interceptors ->
+            queries
+                .withInterceptors(interceptors)
+                .withDeadlineAfter(timeoutNanos, TimeUnit.NANOSECONDS)
+                .vectorSearch(request));
   }
 
   public QueryResponse getMore(GetMoreRequest request) {

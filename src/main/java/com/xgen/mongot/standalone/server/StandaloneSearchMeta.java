@@ -2,10 +2,12 @@ package com.xgen.mongot.standalone.server;
 
 import com.google.errorprone.annotations.Var;
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.config.manager.GenerationReadLeases.Lease;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.SearchCursorInfo;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
 import com.xgen.mongot.index.SearchIndexReader.QuerySnapshot;
+import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.MetadataFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
@@ -14,10 +16,8 @@ import com.xgen.mongot.standalone.StandaloneBson;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
-import com.xgen.mongot.standalone.grpc.IndexType;
 import com.xgen.mongot.standalone.grpc.SearchMetaRequest;
 import com.xgen.mongot.standalone.grpc.SearchMetaResponse;
-import com.xgen.mongot.standalone.ingestion.ApiIngestionManager.IndexLease;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
 import com.xgen.mongot.util.Bytes;
 import com.xgen.mongot.util.QueryCancellation;
@@ -44,10 +44,25 @@ final class StandaloneSearchMeta {
     var context = Context.current();
     try (var regexScope = RegexBudget.openScope();
         var cancellation = QueryCancellation.openScope(() -> checkCancellation(context))) {
-      var expression =
-          StandaloneBson.document(request.getQueryBson().toByteArray(), 16 * 1024 * 1024, 100);
+      var expression = new org.bson.BsonDocument();
+      expression.putAll(
+          StandaloneBson.document(request.getQueryBson().toByteArray(), 16 * 1024 * 1024, 100));
+      if (!request.getTargetIndexId().isEmpty()) {
+        LocalIndexCatalog.validateIndexId(request.getTargetIndexId());
+        StandaloneAuthInterceptor.requireIndex(request.getTargetIndexId());
+        var target = this.runtime.reads().describe(request.getTargetIndexId());
+        if (!expression.containsKey("index")) {
+          expression.put("index", new org.bson.BsonString(target.getName()));
+        }
+      }
       var query = SearchQuery.fromBson(expression, FLAGS, this.runtime.searchQueryParseOptions());
       this.runtime.validateSearchQuery(query);
+      if (request.getJoinIndexesCount() != 0
+          && !StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(query))) {
+        throw Status.INVALID_ARGUMENT
+            .withDescription("Join index bindings require a join operator")
+            .asRuntimeException();
+      }
       var verbosity = StandaloneQueryService.explainVerbosity(request.getExplainVerbosity());
       validateFences(request);
       checkCancellation(context);
@@ -60,8 +75,18 @@ final class StandaloneSearchMeta {
           var explain =
               Explain.setup(
                   verbosity, Optional.of(lease.index().getDefinition().getNumPartitions()))) {
+        // Resolve readiness before inspecting the type: quarantined descriptors may have no type.
+        if (!(lease.definition() instanceof SearchIndexDefinition)) {
+          throw Status.INVALID_ARGUMENT
+              .withDescription("SearchMeta requires a search index")
+              .asRuntimeException();
+        }
         addExplainMetadata(query);
-        return executePinned(query, request, lease, context);
+        return executePinned(
+            this.runtime.materializeSearchQuery(query, lease.definition()),
+            request,
+            lease,
+            context);
       }
     } catch (Exception e) {
       checkCancellation(context);
@@ -93,7 +118,7 @@ final class StandaloneSearchMeta {
   }
 
   private SearchMetaResponse executePinned(
-      @Var SearchQuery query, SearchMetaRequest request, IndexLease lease, Context context)
+      @Var SearchQuery query, SearchMetaRequest request, Lease lease, Context context)
       throws Exception {
     @Var long cursorId = 0;
     @Var StandaloneJoinPlanner.Plan join = null;
@@ -101,13 +126,14 @@ final class StandaloneSearchMeta {
     // Resource declarations ensure cleanup failures do not replace the original query failure.
     try (var resources = new QueryResources()) {
       if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(query))) {
-        join = this.joins.prepare(query, lease.index().getGenerationId());
+        join =
+            this.joins.prepare(
+                query, lease.index().getGenerationId(), request.getJoinIndexesList());
         resources.join = join;
         snapshot = join.snapshot();
         query = join.query();
       } else {
-        snapshot =
-            this.runtime.acquireQuerySnapshot(lease.index().getGenerationId(), query.concurrent());
+        snapshot = this.runtime.acquireQuerySnapshot(lease, query.concurrent());
         resources.snapshot = snapshot;
       }
       snapshot.setCancellationCheck(() -> checkCancellation(context));
@@ -157,21 +183,25 @@ final class StandaloneSearchMeta {
 
   private Optional<IndexDescription> resolve(SearchQuery query, SearchMetaRequest request) {
     try {
-      var index = this.runtime.catalog().getIndexByName(query.index());
+      var index =
+          request.getTargetIndexId().isEmpty()
+              ? this.runtime.catalog().getIndexByName(query.index())
+              : this.runtime.reads().describe(request.getTargetIndexId());
+      if (!query.index().equals(index.getName())) {
+        throw Status.FAILED_PRECONDITION
+            .withDescription("Query index does not match target_index_id")
+            .asRuntimeException();
+      }
       StandaloneAuthInterceptor.requireIndex(index.getIndexId());
       if (!request.getIndexId().isEmpty() && !request.getIndexId().equals(index.getIndexId())) {
         throw Status.FAILED_PRECONDITION
             .withDescription("Query index does not match index_id")
             .asRuntimeException();
       }
-      if (index.getType() != IndexType.INDEX_TYPE_SEARCH) {
-        throw Status.INVALID_ARGUMENT
-            .withDescription("SearchMeta requires a search index")
-            .asRuntimeException();
-      }
       return Optional.of(index);
     } catch (StatusRuntimeException e) {
-      if (e.getStatus().getCode() != Status.Code.NOT_FOUND) {
+      if (!request.getTargetIndexId().isEmpty()
+          || e.getStatus().getCode() != Status.Code.NOT_FOUND) {
         throw e;
       }
       if (!request.getIndexId().isEmpty() || !request.getGenerationId().isEmpty()) {
@@ -183,28 +213,8 @@ final class StandaloneSearchMeta {
     }
   }
 
-  private IndexLease acquire(IndexDescription desired, SearchMetaRequest request) {
-    return this.runtime
-        .ingestion()
-        .coordinate(
-            () -> {
-              var live =
-                  this.runtime
-                      .liveIndexes()
-                      .getIndexById(new org.bson.types.ObjectId(desired.getIndexId()))
-                      .orElseThrow(
-                          () ->
-                              Status.UNAVAILABLE
-                                  .withDescription("Index is not query-ready")
-                                  .asRuntimeException());
-              if (!request.getGenerationId().isEmpty()
-                  && !request.getGenerationId().equals(live.getGenerationId().uniqueString())) {
-                throw Status.FAILED_PRECONDITION
-                    .withDescription("Requested generation is no longer live")
-                    .asRuntimeException();
-              }
-              return this.runtime.ingestion().acquireQueryLease(live.getGenerationId());
-            });
+  private Lease acquire(IndexDescription desired, SearchMetaRequest request) {
+    return this.runtime.reads().acquire(desired.getIndexId(), request.getGenerationId());
   }
 
   private static void validateFences(SearchMetaRequest request) {

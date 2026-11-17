@@ -14,6 +14,7 @@ import com.xgen.mongot.lifecycle.LifecycleManager;
 import com.xgen.mongot.monitor.ReplicationStateMonitor;
 import com.xgen.mongot.replication.ReplicationStatus;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
+import com.xgen.mongot.standalone.runtime.DirectReadCatalog;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.mongot.util.mongodb.SyncSourceConfig;
@@ -21,6 +22,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -38,7 +40,8 @@ import org.slf4j.LoggerFactory;
 /**
  * Native config facade and the sole union reconciler. Network fetches happen in the native updater.
  */
-public final class CoexistenceConfigManager implements ConfigManager {
+public final class CoexistenceConfigManager
+    implements ConfigManager, DirectReadCatalog.RemoteDefinitions {
   private final DefaultConfigManager delegate;
   private final LocalIndexCatalog local;
   private final LifecycleManager sourceLifecycle;
@@ -51,7 +54,7 @@ public final class CoexistenceConfigManager implements ConfigManager {
   private final AtomicBoolean replicationInitialized = new AtomicBoolean();
   // Accessed only by the source executor. A timeout must not start a second native shutdown.
   private Optional<CompletableFuture<Void>> sourceDrain = Optional.empty();
-  private List<IndexDefinition> remote;
+  private Map<ObjectId, IndexDefinition> remote;
   private List<OverriddenBaseAnalyzerDefinition> analyzers = List.of();
   private Set<UUID> collections = Set.of();
   private Set<ObjectId> unreadable = Set.of();
@@ -74,7 +77,7 @@ public final class CoexistenceConfigManager implements ConfigManager {
         .map(IndexGeneration::getDefinition)
         .filter(i -> !local.owns(i.getIndexId()))
         .forEach(i -> recovered.put(i.getIndexId(), i));
-    this.remote = recovered.values().stream().map(CoexistenceConfigManager::copy).toList();
+    this.remote = copyDefinitions(recovered.values());
     var quarantined = delegate.getQuarantinedIndexInfos();
     this.unreadable =
         Stream.concat(quarantined.liveIndexes().stream(), quarantined.stagedIndexes().stream())
@@ -99,20 +102,37 @@ public final class CoexistenceConfigManager implements ConfigManager {
           .error("MongoDB catalog has conflicting index identities; retaining accepted" + " state");
       return;
     }
-    this.remote = next.stream().map(CoexistenceConfigManager::copy).toList();
+    this.remote = copyDefinitions(next);
     this.analyzers = List.copyOf(analyzers);
     this.collections = Set.copyOf(collections);
     this.unreadable = Set.copyOf(unreadable);
     reconcileLocal();
   }
 
+  @Override
+  public synchronized List<IndexDefinition> snapshot() {
+    return this.remote.values().stream().map(CoexistenceConfigManager::copy).toList();
+  }
+
+  @Override
+  public synchronized Optional<IndexDefinition> get(ObjectId id) {
+    return Optional.ofNullable(this.remote.get(id)).map(CoexistenceConfigManager::copy);
+  }
+
+  private static Map<ObjectId, IndexDefinition> copyDefinitions(
+      java.util.Collection<IndexDefinition> definitions) {
+    var copies = new LinkedHashMap<ObjectId, IndexDefinition>();
+    definitions.forEach(definition -> copies.put(definition.getIndexId(), copy(definition)));
+    return java.util.Collections.unmodifiableMap(copies);
+  }
+
+  /** Reconciles remote metadata together with local physical/schema recovery bindings. */
   public synchronized void reconcileLocal() {
     synchronized (this.delegate) {
       // Replication updates lastObservedCollectionName in its working definitions. Keep accepted
       // desired state separate so source observation cannot mutate the snapshot used during
       // outages.
-      var union =
-          new ArrayList<>(this.remote.stream().map(CoexistenceConfigManager::copy).toList());
+      var union = new ArrayList<>(snapshot());
       union.addAll(
           this.local.reconciliationDefinitions(
               this.delegate.getLiveIndexes().stream()

@@ -8,6 +8,7 @@ import org.bson.BsonDocument;
 /** Durable schema publication on an unchanged physical index. Never authorizes empty creation. */
 public record IndexSchemaUpdate(
     SearchIndexDefinitionGeneration source, SearchIndexDefinitionGeneration target) {
+  /** Validates a single compatible revision advance on the same physical index. */
   public IndexSchemaUpdate {
     if (!source.getGenerationId().equals(target.getGenerationId())
         || !source.getIndexDefinition().getName().equals(target.getIndexDefinition().getName())

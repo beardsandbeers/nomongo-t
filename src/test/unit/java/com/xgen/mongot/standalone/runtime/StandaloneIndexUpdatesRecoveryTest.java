@@ -84,7 +84,16 @@ public class StandaloneIndexUpdatesRecoveryTest {
     recordPreparedState(config.dataPath(), migration);
 
     try (var runtime = new StandaloneRuntime(config)) {
-      await(() -> runtime.describeIndex(migration.indexId()).getActiveRevision() == 1);
+      // Active metadata can precede initialization; retry only once the source is usable.
+      await(
+          () ->
+              runtime.describeIndex(migration.indexId()).getActiveRevision() == 1
+                  && runtime
+                      .liveIndexes()
+                      .getIndexById(new org.bson.types.ObjectId(migration.indexId()))
+                      .filter(
+                          index -> runtime.ingestion().isGenerationReady(index.getGenerationId()))
+                      .isPresent());
       await(() -> runtime.describeIndex(migration.indexId()).getLifecycleState().equals("FAILED"));
       await(() -> runtime.describeIndex(healthy).getLifecycleState().equals("READY"));
 
@@ -99,7 +108,16 @@ public class StandaloneIndexUpdatesRecoveryTest {
     // A second restart must retain the failure instead of silently publishing a valid-looking
     // Lucene directory whose manifest was damaged, or creating an empty replacement.
     try (var runtime = new StandaloneRuntime(config)) {
-      await(() -> runtime.describeIndex(migration.indexId()).getActiveRevision() == 1);
+      // Active metadata can precede initialization; retry only once the source is usable.
+      await(
+          () ->
+              runtime.describeIndex(migration.indexId()).getActiveRevision() == 1
+                  && runtime
+                      .liveIndexes()
+                      .getIndexById(new org.bson.types.ObjectId(migration.indexId()))
+                      .filter(
+                          index -> runtime.ingestion().isGenerationReady(index.getGenerationId()))
+                      .isPresent());
       await(() -> runtime.describeIndex(migration.indexId()).getLifecycleState().equals("FAILED"));
       await(() -> retry(runtime, migration.indexId()));
       runtime.catalogChanged();

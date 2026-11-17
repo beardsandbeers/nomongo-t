@@ -93,6 +93,57 @@ public class StandaloneJoinsTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
   @Test
+  public void getMore_delayedForeignPublication_keepsCursorDependingOnNewGeneration()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      f.upsert(local, "{_id:'first',parent:'a'}");
+      f.upsert(local, "{_id:'second',parent:'a'}");
+      var oldCursor = f.search(local, JOIN, 1);
+      String oldGeneration = f.ready(foreign, 1).getGenerationId();
+
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(foreign)
+              .setExpectedRevision(1)
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
+              .setDefinitionBson(
+                  bson(
+                      MAPPING.replace(
+                          "title:{type:'string'}",
+                          "title:{type:'string'},category:{type:'token'}")))
+              .build());
+      f.ready(foreign, 2);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      var current = f.search(local, JOIN, 1);
+      String retired = oldGeneration;
+
+      assertThat(retired).isEqualTo(oldGeneration);
+      f.server.generationRetired(retired);
+
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(oldCursor.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      assertThat(
+              ids(
+                  f.queries.getMore(
+                      GetMoreRequest.newBuilder().setCursorId(current.getCursorId()).build())))
+          .hasSize(1);
+    }
+  }
+
+  @Test
   public void search_inPlaceUpdateWithoutCopyHeadroom_keepsMetadataAndForeignJoinsReadable()
       throws Exception {
     String foreign;
@@ -146,54 +197,158 @@ public class StandaloneJoinsTest {
   }
 
   @Test
-  public void getMore_delayedForeignPublication_keepsCursorDependingOnNewGeneration()
+  public void search_aliasesShareDependency_enforcesEveryGenerationFence() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String local = f.create("local", MAPPING);
+      String foreign = f.create("foreign", MAPPING);
+      String generation = f.runtime.reads().resolve(foreign, "").getGenerationId().uniqueString();
+      var expression = BsonDocument.parse(JOIN.replace("from:'foreign'", "from:'first'"));
+      var filters = expression.getDocument("compound").getArray("filter");
+      var second = filters.getFirst().asDocument().clone();
+      second.getDocument("join").put("from", new org.bson.BsonString("second"));
+      filters.add(second);
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(local)
+              .setQueryBson(bson(expression.toJson()))
+              .addJoinIndexes(
+                  com.xgen.mongot.standalone.grpc.JoinIndexBinding.newBuilder()
+                      .setAlias("first")
+                      .setIndexId(foreign)
+                      .setGenerationId(generation))
+              .addJoinIndexes(
+                  com.xgen.mongot.standalone.grpc.JoinIndexBinding.newBuilder()
+                      .setAlias("second")
+                      .setIndexId(foreign)
+                      .setGenerationId("retired-generation"))
+              .build();
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_aliasSelectsRoot_enforcesGenerationFence() throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String local = f.create("local", MAPPING);
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(local)
+              .setQueryBson(bson(JOIN))
+              .addJoinIndexes(
+                  com.xgen.mongot.standalone.grpc.JoinIndexBinding.newBuilder()
+                      .setAlias("foreign")
+                      .setIndexId(local)
+                      .setGenerationId("retired-generation"))
+              .build();
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.queries.search(request));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_invalidationDuringJoinCallbackRegistration_releasesCapacityOnce()
       throws Exception {
+    assertCallbackRegistrationCleanup(false);
+  }
+
+  @Test
+  public void search_callbackRegistrationFailsDuringInvalidation_releasesCapacityOnce()
+      throws Exception {
+    assertCallbackRegistrationCleanup(true);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void assertCallbackRegistrationCleanup(boolean failRegistration) throws Exception {
     try (var f = new Fixture(data(), List.of())) {
       String foreign = f.create("foreign", MAPPING);
       String local = f.create("local", MAPPING);
-      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
-      f.upsert(local, "{_id:'first',parent:'a'}");
-      f.upsert(local, "{_id:'second',parent:'a'}");
-      var oldCursor = f.search(local, JOIN, 1);
-      String oldGeneration = f.ready(foreign, 1).getGenerationId();
+      f.upsert(foreign, "{_id:'f',key:'one',office:'Berlin'}");
+      f.upsert(local, "{_id:'a',parent:'one'}");
+      f.upsert(local, "{_id:'b',parent:'one'}");
+      var generation = f.runtime.reads().resolve(local, "").getGenerationId();
+      var service = (StandaloneQueryService) fieldValue(f.server, "queries");
+      var manager =
+          (com.xgen.mongot.config.manager.DefaultConfigManager)
+              fieldValue(f.runtime, "configManager");
+      com.xgen.mongot.config.manager.GenerationReadLeases registry;
+      synchronized (manager) {
+        registry = manager.configState.readLeases;
+      }
+      var notifications =
+          (java.util.concurrent.ExecutorService) fieldValue(registry, "notifications");
+      var planner =
+          org.mockito.Mockito.mock(
+              StandaloneJoinPlanner.class,
+              org.mockito.Mockito.withSettings()
+                  .mockMaker(org.mockito.MockMakers.INLINE)
+                  .spiedInstance(fieldValue(service, "joinPlanner"))
+                  .defaultAnswer(org.mockito.Mockito.CALLS_REAL_METHODS));
+      org.mockito.Mockito.doAnswer(
+              invocation -> {
+                var plan = (StandaloneJoinPlanner.Plan) invocation.callRealMethod();
+                var environment = fieldValue(fieldValue(plan, "this$0"), "environment");
+                var leases =
+                    (java.util.Map<
+                            com.xgen.mongot.index.version.GenerationId,
+                            com.xgen.mongot.config.manager.GenerationReadLeases.Lease>)
+                        fieldValue(environment, "leases");
+                var firstId = leases.keySet().iterator().next();
+                var first =
+                    org.mockito.Mockito.mock(
+                        com.xgen.mongot.config.manager.GenerationReadLeases.Lease.class,
+                        org.mockito.Mockito.withSettings()
+                            .mockMaker(org.mockito.MockMakers.INLINE)
+                            .spiedInstance(leases.get(firstId))
+                            .defaultAnswer(org.mockito.Mockito.CALLS_REAL_METHODS));
+                org.mockito.Mockito.doAnswer(
+                        register -> {
+                          // Retire after registering the root callback, while visiting the first
+                          // join dependency. Also exercise failure before publishing the cursor.
+                          f.runtime.reads().invalidate(local);
+                          if (failRegistration) {
+                            throw new IllegalStateException("Callback registration failed");
+                          }
+                          return register.callRealMethod();
+                        })
+                    .when(first)
+                    .onInvalidated(org.mockito.ArgumentMatchers.any(Runnable.class));
+                leases.put(firstId, first);
+                return plan;
+              })
+          .when(planner)
+          .prepare(
+              org.mockito.ArgumentMatchers.any(),
+              org.mockito.ArgumentMatchers.any(),
+              org.mockito.ArgumentMatchers.anyList());
+      var plannerField = StandaloneQueryService.class.getDeclaredField("joinPlanner");
+      plannerField.setAccessible(true);
+      plannerField.set(service, planner);
+      var capacity = (java.util.concurrent.Semaphore) fieldValue(service, "capacity");
+      assertThat(capacity.availablePermits()).isEqualTo(1024);
 
-      f.catalog.updateIndex(
-          UpdateIndexRequest.newBuilder()
-              .setIndexId(foreign)
-              .setExpectedRevision(1)
-              .setUpdateMode(
-                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
-              .setDefinitionBson(
-                  bson(
-                      MAPPING.replace(
-                          "title:{type:'string'}",
-                          "title:{type:'string'},category:{type:'token'}")))
-              .build());
-      f.ready(foreign, 2);
-      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
-      var current = f.search(local, JOIN, 1);
-      String retired = oldGeneration;
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 1));
+      notifications.submit(() -> {}).get(5, TimeUnit.SECONDS);
 
-      assertThat(retired).isEqualTo(oldGeneration);
-      f.server.generationRetired(retired);
-
-      assertThat(
-              assertThrows(
-                      StatusRuntimeException.class,
-                      () ->
-                          f.queries.getMore(
-                              GetMoreRequest.newBuilder()
-                                  .setCursorId(oldCursor.getCursorId())
-                                  .build()))
-                  .getStatus()
-                  .getCode())
-          .isEqualTo(Status.Code.NOT_FOUND);
-      assertThat(
-              ids(
-                  f.queries.getMore(
-                      GetMoreRequest.newBuilder().setCursorId(current.getCursorId()).build())))
-          .hasSize(1);
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(capacity.availablePermits()).isEqualTo(1024);
+      assertThat(registry.activeCount()).isEqualTo(0);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+      assertThat((java.util.Map<?, ?>) fieldValue(service, "leases")).isEmpty();
+      assertThat(f.runtime.cursors().hasOpenCursors(generation)).isFalse();
     }
+  }
+
+  private static Object fieldValue(Object owner, String name) throws Exception {
+    var field = owner.getClass().getDeclaredField(name);
+    field.setAccessible(true);
+    return field.get(owner);
   }
 
   @Test
@@ -828,7 +983,8 @@ public class StandaloneJoinsTest {
           (JoinOperator) ((CompoundOperator) parsed.operator()).filter().operators().getFirst();
       var work = new AtomicInteger();
 
-      try (var snapshot = f.runtime.acquireQuerySnapshot(generation, false)) {
+      try (var lease = f.runtime.reads().acquire(generation);
+          var snapshot = f.runtime.acquireQuerySnapshot(lease, false)) {
         assertThrows(
             CancellationException.class,
             () ->
@@ -1566,7 +1722,8 @@ public class StandaloneJoinsTest {
                               "index:'employees',returnStoredSource:true")));
       var compound = (CompoundOperator) parsed.operator();
       var join = (JoinOperator) compound.filter().operators().getFirst();
-      try (var snapshot = f.runtime.acquireQuerySnapshot(generation, false)) {
+      try (var lease = f.runtime.reads().acquire(generation);
+          var snapshot = f.runtime.acquireQuerySnapshot(lease, false)) {
         var builder = new JoinKeySet.Builder(ignored -> {});
         snapshot.collectKeys(join.operator(), join.foreignField(), builder::add, () -> {});
         var keys = builder.build();
@@ -1645,7 +1802,8 @@ public class StandaloneJoinsTest {
       var join =
           (JoinOperator) ((CompoundOperator) parsed.operator()).filter().operators().getFirst();
       var work = new AtomicInteger();
-      try (var snapshot = f.runtime.acquireQuerySnapshot(generation, false)) {
+      try (var lease = f.runtime.reads().acquire(generation);
+          var snapshot = f.runtime.acquireQuerySnapshot(lease, false)) {
         assertThrows(
             CancellationException.class,
             () ->

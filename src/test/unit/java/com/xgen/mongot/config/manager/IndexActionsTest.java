@@ -1,5 +1,6 @@
 package com.xgen.mongot.config.manager;
 
+import static com.google.common.truth.Truth.assertThat;
 import static com.xgen.testing.mongot.mock.index.IndexGeneration.mockDefinitionGeneration;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
@@ -51,6 +52,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.bson.BsonTimestamp;
@@ -925,6 +930,142 @@ public class IndexActionsTest {
   }
 
   @Test
+  public void dropFromCatalog_directReader_defersProducerAndPhysicalClose() throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var generation = indexes.get(0);
+    var initialized = this.mocks.waitAndGetInitializedIndex(generation.getGenerationId());
+    this.mocks.configState.enableDeferredRetirement(Runnable::run);
+    try (var lease = this.mocks.configState.readLeases.acquire(generation, initialized)) {
+      this.actions.dropFromCatalog(indexes);
+
+      com.google.common.truth.Truth.assertThat(lease.retired()).isTrue();
+      this.mocks.assertIndexCatalogSize(0);
+      verify(this.mocks.lifecycleManager, never()).dropIndex(any());
+      verify(initialized, never()).close();
+      verify(generation.getIndex(), never()).drop();
+    }
+    this.mocks.configState.awaitRetirements();
+
+    verify(this.mocks.lifecycleManager).dropIndex(generation.getGenerationId());
+    this.mocks.assertIndexDropped(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION, initialized);
+    this.mocks.configState.readLeases.stop().join();
+  }
+
+  @Test
+  public void dropFromCatalog_lastReaderCloses_doesNotBlockOnProducerTeardown() throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var generation = indexes.get(0);
+    var initialized = this.mocks.waitAndGetInitializedIndex(generation.getGenerationId());
+    var retirements =
+        Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().name("index-retirement-worker").factory());
+    var dropStarted = new CountDownLatch(1);
+    var allowDrop = new CountDownLatch(1);
+    var readerClosed = new CountDownLatch(1);
+    var dropThread = new AtomicReference<String>();
+    var lease = this.mocks.configState.readLeases.acquire(generation, initialized);
+    this.mocks.configState.enableDeferredRetirement(retirements);
+    doAnswer(
+            invocation -> {
+              dropThread.set(Thread.currentThread().getName());
+              dropStarted.countDown();
+              Assert.assertTrue(allowDrop.await(5, TimeUnit.SECONDS));
+              return CompletableFuture.completedFuture(null);
+            })
+        .when(this.mocks.lifecycleManager)
+        .dropIndex(any());
+    try {
+      this.actions.dropFromCatalog(indexes);
+      retirements.submit(() -> {}).get(5, TimeUnit.SECONDS);
+      Thread reader =
+          Thread.ofPlatform()
+              .name("reader-close")
+              .start(
+                  () -> {
+                    lease.close();
+                    readerClosed.countDown();
+                  });
+      try {
+        Assert.assertTrue(dropStarted.await(5, TimeUnit.SECONDS));
+        assertThat(dropThread.get()).isEqualTo("index-retirement-worker");
+        assertThat(readerClosed.await(1, TimeUnit.SECONDS)).isTrue();
+      } finally {
+        allowDrop.countDown();
+        reader.join(5000);
+      }
+      this.mocks.configState.awaitRetirements();
+    } finally {
+      allowDrop.countDown();
+      lease.close();
+      this.mocks.configState.readLeases.stop().join();
+      retirements.shutdown();
+      Assert.assertTrue(retirements.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
+  public void dropFromCatalog_cursorRetirement_doesNotBlockOtherNotifications() throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var generation = indexes.get(0);
+    var initialized = this.mocks.waitAndGetInitializedIndex(generation.getGenerationId());
+    var retirements =
+        Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().name("index-retirement-worker").factory());
+    var dropStarted = new CountDownLatch(1);
+    var allowDrop = new CountDownLatch(1);
+    var nextNotification = new CountDownLatch(1);
+    var dropThread = new AtomicReference<String>();
+    var allowCursorClose = new CountDownLatch(1);
+    var registry = this.mocks.configState.readLeases;
+    var lease = registry.acquire(generation, initialized);
+    lease.onInvalidated(
+        () -> {
+          try {
+            Assert.assertTrue(allowCursorClose.await(5, TimeUnit.SECONDS));
+            lease.close();
+          } catch (InterruptedException e) {
+            throw new AssertionError(e);
+          }
+        });
+    this.mocks.configState.enableDeferredRetirement(retirements);
+    doAnswer(
+            invocation -> {
+              dropThread.set(Thread.currentThread().getName());
+              dropStarted.countDown();
+              Assert.assertTrue(allowDrop.await(5, TimeUnit.SECONDS));
+              return CompletableFuture.completedFuture(null);
+            })
+        .when(this.mocks.lifecycleManager)
+        .dropIndex(any());
+    var field = GenerationReadLeases.class.getDeclaredField("notifications");
+    field.setAccessible(true);
+    var notifications = (ExecutorService) field.get(registry);
+    // Queue the drop while the producer still has an active reader, as in an idle cursor drop.
+    try {
+      this.actions.dropFromCatalog(indexes);
+      retirements.submit(() -> {}).get(5, TimeUnit.SECONDS);
+      allowCursorClose.countDown();
+      Assert.assertTrue(dropStarted.await(5, TimeUnit.SECONDS));
+      assertThat(dropThread.get()).isEqualTo("index-retirement-worker");
+
+      notifications.execute(nextNotification::countDown);
+
+      assertThat(nextNotification.await(1, TimeUnit.SECONDS)).isTrue();
+    } finally {
+      allowCursorClose.countDown();
+      allowDrop.countDown();
+      lease.close();
+      this.mocks.configState.awaitRetirements();
+      registry.stop().join();
+      retirements.shutdown();
+      Assert.assertTrue(retirements.awaitTermination(5, TimeUnit.SECONDS));
+    }
+  }
+
+  @Test
   public void dropFromCatalog_deferredDrainFailure_keepsWriterAndRecoveryEntry() throws Exception {
     this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
     var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
@@ -940,6 +1081,33 @@ public class IndexActionsTest {
     verify(indexes.get(0).getIndex(), never()).drop();
     Assert.assertEquals(1, this.mocks.configState.currentJournal().getDeletedEntries().size());
     Assert.assertThrows(IllegalStateException.class, this.mocks.configState::awaitRetirements);
+  }
+
+  @Test
+  public void dropFromCatalog_executorStopsBeforeReaderDrains_keepsWriterAndRecoveryEntry()
+      throws Exception {
+    this.actions.addNewIndexes(List.of(SearchIndex.MOCK_INDEX_DEFINITION_GENERATION));
+    var indexes = List.copyOf(this.mocks.indexCatalog.getIndexes());
+    var generation = indexes.get(0);
+    var initialized = this.mocks.waitAndGetInitializedIndex(generation.getGenerationId());
+    var retirements = Executors.newSingleThreadExecutor();
+    this.mocks.configState.enableDeferredRetirement(retirements);
+    try (var lease = this.mocks.configState.readLeases.acquire(generation, initialized)) {
+      this.actions.dropFromCatalog(indexes);
+      retirements.shutdown();
+      assertThat(retirements.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+
+      lease.close();
+
+      Assert.assertThrows(IllegalStateException.class, this.mocks.configState::awaitRetirements);
+      verify(this.mocks.lifecycleManager, never()).dropIndex(any());
+      verify(initialized, never()).close();
+      verify(generation.getIndex(), never()).drop();
+      assertThat(this.mocks.configState.currentJournal().getDeletedEntries()).hasSize(1);
+    } finally {
+      retirements.shutdownNow();
+      this.mocks.configState.readLeases.stop().join();
+    }
   }
 
   /** Stands in for {@code Runtime.halt()}, which the halt handler replaces under test. */

@@ -13,7 +13,6 @@ import com.xgen.mongot.cursor.CursorConfig;
 import com.xgen.mongot.cursor.MongotCursorManagerImpl;
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
-import com.xgen.mongot.index.InitializedSearchIndex;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.SearchIndexReader;
 import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
@@ -28,15 +27,12 @@ import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.SearchQueryParseOptions;
 import com.xgen.mongot.index.query.aggregation.SearchAggregationBootstrap;
-import com.xgen.mongot.index.status.IndexStatus;
-import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.lifecycle.DefaultLifecycleManager;
 import com.xgen.mongot.lifecycle.LifecycleConfig;
 import com.xgen.mongot.metrics.MeterAndFtdcRegistry;
 import com.xgen.mongot.monitor.ReplicationStateMonitor;
 import com.xgen.mongot.replication.mongodb.common.IndexingWorkSchedulerFactory;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
-import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.config.StandaloneConfig;
 import com.xgen.mongot.standalone.grpc.GetIndexMappingsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexMappingsResponse;
@@ -63,9 +59,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.bson.BsonDocument;
-import org.bson.RawBsonDocument;
-import org.bson.types.ObjectId;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -80,6 +73,39 @@ public final class StandaloneRuntime implements Closeable {
   private final MongotCursorManagerImpl cursors;
   private final ApiIngestionManager ingestion;
   private final StandaloneIndexStatistics statistics;
+  private final DirectReadCatalog reads;
+  private com.google.common.base.Supplier<
+          com.xgen.mongot.embedding.providers.EmbeddingServiceManager>
+      embedding = () -> null;
+
+  public void setEmbeddingService(
+      com.google.common.base.Supplier<com.xgen.mongot.embedding.providers.EmbeddingServiceManager>
+          embedding) {
+    this.embedding = embedding;
+  }
+
+  public com.xgen.mongot.index.query.MaterializedVectorSearchQuery materializeVectorQuery(
+      com.xgen.mongot.index.query.VectorSearchQuery query,
+      com.xgen.mongot.index.definition.IndexDefinition definition)
+      throws Exception {
+    this.configManager.validateVectorQuery(query);
+    return com.xgen.mongot.server.command.search.VectorQueryEmbedder.prepare(
+        this.reads.liveIndexes(), this.embedding, definition, query);
+  }
+
+  public SearchQuery materializeSearchQuery(
+      SearchQuery query, com.xgen.mongot.index.definition.IndexDefinition definition)
+      throws InvalidQueryException {
+    return com.xgen.mongot.server.command.search.SearchAutoEmbeddingHelper.prepare(
+        this.reads.liveIndexes(),
+        this.embedding,
+        definition.getDatabase(),
+        definition.getCollectionUuid(),
+        definition.getView().map(view -> view.getName()),
+        query,
+        definition);
+  }
+
   private final StandaloneIndexUpdates updates;
   private final DefaultConfigManager configManager;
   private final MeterAndFtdcRegistry metrics;
@@ -197,8 +223,8 @@ public final class StandaloneRuntime implements Closeable {
               .map(index -> index.getIndexId())
               .collect(Collectors.toSet());
       var retirements =
-          java.util.concurrent.Executors.newSingleThreadExecutor(
-              Thread.ofPlatform().name("standalone-retirement").factory());
+          java.util.concurrent.Executors.newFixedThreadPool(
+              2, Thread.ofPlatform().name("standalone-retirement-", 0).factory());
       this.resources.addFirst(
           () -> {
             retirements.shutdown();
@@ -230,6 +256,9 @@ public final class StandaloneRuntime implements Closeable {
       this.resources.remove(cursorOwner);
       this.resources.remove(lifecycleOwner);
       this.resources.addFirst(this.configManager::close);
+      this.reads =
+          new DirectReadCatalog(this.catalog, this.configManager, this.liveIndexes, initialized);
+      this.reads.observe(this.serviceMetrics);
       this.updates =
           new StandaloneIndexUpdates(
               config,
@@ -240,12 +269,7 @@ public final class StandaloneRuntime implements Closeable {
               this.serviceMetrics);
       this.resources.addFirst(this.updates);
       this.statistics =
-          new StandaloneIndexStatistics(
-              this.catalog,
-              this.liveIndexes,
-              this.ingestion,
-              config.maxRpcDuration(),
-              this.serviceMetrics);
+          new StandaloneIndexStatistics(this.reads, config.maxRpcDuration(), this.serviceMetrics);
       this.resources.addFirst(this.statistics);
       reconcile();
       this.reconciler =
@@ -281,7 +305,9 @@ public final class StandaloneRuntime implements Closeable {
       ApiIngestionManager ingestion,
       DefaultConfigManager manager,
       MeterAndFtdcRegistry metrics,
-      Runnable reconcile) {
+      Runnable reconcile,
+      DirectReadCatalog.RemoteDefinitions remoteDefinitions,
+      Object metadataMonitor) {
     this.config = config;
     this.catalog = catalog;
     this.liveIndexes = indexes;
@@ -292,13 +318,21 @@ public final class StandaloneRuntime implements Closeable {
     this.metrics = metrics;
     this.externalReconcile = Optional.of(reconcile);
     this.serviceMetrics = new StandaloneMetrics(metrics.meterRegistry());
+    this.reads =
+        new DirectReadCatalog(
+            catalog,
+            manager,
+            manager.configState.indexCatalog,
+            initialized,
+            remoteDefinitions,
+            metadataMonitor);
+    this.reads.observe(this.serviceMetrics);
     this.updates =
         new StandaloneIndexUpdates(
             config, catalog, indexes, ingestion, manager, this.serviceMetrics);
     this.resources.addFirst(this.updates);
     this.statistics =
-        new StandaloneIndexStatistics(
-            catalog, indexes, ingestion, config.maxRpcDuration(), this.serviceMetrics);
+        new StandaloneIndexStatistics(this.reads, config.maxRpcDuration(), this.serviceMetrics);
     this.resources.addFirst(this.statistics);
     this.reconciler =
         new ScheduledThreadPoolExecutor(
@@ -324,6 +358,10 @@ public final class StandaloneRuntime implements Closeable {
 
   public SearchQueryParseOptions searchQueryParseOptions() {
     return this.configManager.getSearchQueryParseOptions();
+  }
+
+  public DirectReadCatalog reads() {
+    return this.reads;
   }
 
   public LocalIndexCatalog catalog() {
@@ -364,90 +402,64 @@ public final class StandaloneRuntime implements Closeable {
 
   /** Acquires managed search snapshots without exposing raw Lucene readers to transport code. */
   public SearchIndexReader.QuerySnapshot acquireQuerySnapshot(
-      GenerationId generationId, boolean concurrent) throws IOException, ReaderClosedException {
-    var live =
-        this.liveIndexes
-            .getIndexById(generationId.indexId)
-            .filter(index -> index.getGenerationId().equals(generationId))
-            .filter(index -> this.ingestion.isGenerationReady(generationId))
-            .orElseThrow(
-                () ->
-                    Status.UNAVAILABLE
-                        .withDescription("Query index is not query-ready")
-                        .asRuntimeException());
-    var initialized = this.initializedIndexes.getIndex(live.getGenerationId());
-    if (initialized.isEmpty() || !(initialized.get() instanceof InitializedSearchIndex search)) {
+      com.xgen.mongot.config.manager.GenerationReadLeases.Lease lease, boolean concurrent)
+      throws IOException, ReaderClosedException {
+    if (lease.retired()) {
+      throw Status.UNAVAILABLE.withDescription("Query generation was retired").asRuntimeException();
+    }
+    if (!(lease.reader() instanceof SearchIndexReader reader)) {
       throw Status.INVALID_ARGUMENT
           .withDescription("Query snapshots require search indexes")
           .asRuntimeException();
     }
-    return search.getReader().acquireQuerySnapshot(concurrent);
+    return reader.acquireQuerySnapshot(concurrent);
   }
 
-  /** Exports one ready generation, coordinated with schema changes and retirement. */
+  /** Exports one active generation under a producer-independent resource lease. */
   public GetIndexMappingsResponse getIndexMappings(GetIndexMappingsRequest request) {
-    return this.ingestion.coordinate(
-        () -> {
-          var desired = this.catalog.getIndex(request.getIndexId());
-          if (desired.getLifecycleState().equals("DROPPED")) {
-            throw Status.NOT_FOUND.withDescription("Index was dropped").asRuntimeException();
-          }
-          var generation =
-              this.liveIndexes
-                  .getIndexById(new ObjectId(request.getIndexId()))
-                  .filter(index -> this.ingestion.isGenerationReady(index.getGenerationId()))
-                  .orElseThrow(
-                      () ->
-                          Status.UNAVAILABLE
-                              .withDescription("Index is not ready")
-                              .asRuntimeException());
-          String generationId = generation.getGenerationId().uniqueString();
-          if (!request.getGenerationId().isEmpty()
-              && !request.getGenerationId().equals(generationId)) {
-            throw Status.FAILED_PRECONDITION
-                .withDescription("Requested generation is no longer live")
-                .asRuntimeException();
-          }
-          long revision = generation.getDefinition().getDefinitionVersion().orElse(1L);
-          if (revision != desired.getDesiredRevision()) {
-            throw Status.UNAVAILABLE
-                .withDescription("Index schema is changing")
-                .asRuntimeException();
-          }
-          var initialized = this.initializedIndexes.getIndex(generation.getGenerationId());
-          if (initialized.isEmpty()
-              || !(initialized.get() instanceof InitializedSearchIndex search)) {
-            throw Status.FAILED_PRECONDITION
-                .withDescription("Mapping export requires a search index")
-                .asRuntimeException();
-          }
-          try {
-            var definition = generation.getDefinition().asSearchDefinition();
-            var reader = search.getReader();
-            reader.refresh();
-            var mappings =
-                LuceneIndexMappingExporter.export(
-                    definition,
-                    generation.getGenerationId().generation.formatVersion.asLucene(),
-                    reader.getFieldInfos());
-            var external = new BsonDocument();
-            external.putAll(
-                new RawBsonDocument(StandaloneDefinitionValidator.normalize(definition)));
-            external.put("mappings", mappings);
-            return GetIndexMappingsResponse.newBuilder()
-                .setIndexId(request.getIndexId())
-                .setGenerationId(generationId)
-                .setActiveRevision(revision)
-                .setMappingsJson(mappings.toJson())
-                .setDefinitionJson(external.toJson())
-                .build();
-          } catch (IOException | ReaderClosedException e) {
-            throw Status.UNAVAILABLE
-                .withDescription("Cannot read index field metadata")
-                .withCause(e)
-                .asRuntimeException();
-          }
-        });
+    try (var lease = this.reads.acquire(request.getIndexId(), request.getGenerationId())) {
+      var definition = lease.definition();
+      var external = this.reads.publicDefinition(definition);
+      var response =
+          GetIndexMappingsResponse.newBuilder()
+              .setIndexId(request.getIndexId())
+              .setGenerationId(lease.index().getGenerationId().uniqueString())
+              .setActiveRevision(this.reads.revision(definition))
+              .setActiveVersion(this.reads.version(definition));
+      if (lease.reader() instanceof SearchIndexReader reader) {
+        reader.refresh();
+        var mappings =
+            LuceneIndexMappingExporter.export(
+                definition.asSearchDefinition(),
+                lease.index().getGenerationId().generation.formatVersion.asLucene(),
+                reader.getFieldInfos());
+        external.put("mappings", mappings);
+        response
+            .setMappingsJson(mappings.toJson())
+            .setIndexType(com.xgen.mongot.standalone.grpc.IndexType.INDEX_TYPE_SEARCH);
+      } else {
+        response
+            .setIndexType(com.xgen.mongot.standalone.grpc.IndexType.INDEX_TYPE_VECTOR_SEARCH)
+            .setVectorFieldsJson(vectorFieldsJson(external));
+      }
+      if (lease.retired()) {
+        throw Status.UNAVAILABLE
+            .withDescription("Mapping generation was retired")
+            .asRuntimeException();
+      }
+      return response.setDefinitionJson(external.toJson()).build();
+    } catch (IOException | ReaderClosedException error) {
+      throw Status.UNAVAILABLE
+          .withDescription("Cannot read index field metadata")
+          .withCause(error)
+          .asRuntimeException();
+    }
+  }
+
+  private static String vectorFieldsJson(org.bson.BsonDocument definition) {
+    return definition.getArray("fields", new org.bson.BsonArray()).stream()
+        .map(value -> value.asDocument().toJson())
+        .collect(java.util.stream.Collectors.joining(",", "[", "]"));
   }
 
   /**
@@ -522,9 +534,9 @@ public final class StandaloneRuntime implements Closeable {
             .setManagementReady(managementReady())
             .setFailureMessage(this.reconciliationFailure.get().orElse(""))
             .setFreeDiskBytes(Files.getFileStore(this.config.dataPath()).getUsableSpace());
-    for (var index : this.catalog.definitions()) {
+    for (var index : this.reads.snapshot()) {
       result.addIndexes(
-          describeIndex(index.getIndexId().toHexString()).toBuilder().clearDesiredDefinitionBson());
+          index.toBuilder().clearDesiredDefinitionBson().clearActiveDefinitionBson().clearBuild());
     }
     for (var meter : this.metrics.meterRegistry().getMeters()) {
       if (this.externalReconcile.isPresent()
@@ -571,46 +583,7 @@ public final class StandaloneRuntime implements Closeable {
    * Desired-catalog status includes uninitialized/failed resources and exact live/build identities.
    */
   public IndexDescription describeIndex(String id) {
-    synchronized (this.configManager) {
-      var desired = this.catalog.getIndex(id);
-      if (desired.getLifecycleState().equals("DROPPED")) {
-        return desired;
-      }
-      var result = desired.toBuilder();
-      var live = this.liveIndexes.getIndexById(new ObjectId(id));
-      var staged = this.configManager.configState.staged.getIndex(new ObjectId(id));
-      @Var String state = "PENDING";
-      if (live.isPresent()) {
-        var generation = live.get();
-        result.setGenerationId(generation.getGenerationId().uniqueString());
-        if (this.ingestion.isGenerationReady(generation.getGenerationId())) {
-          long active = generation.getDefinition().getDefinitionVersion().orElse(1L);
-          result.setActiveRevision(active);
-          state = active == desired.getDesiredRevision() ? "READY" : "BUILDING";
-        } else {
-          result.setFailureMessage(generation.getIndex().getStatus().getMessage().orElse(""));
-          state =
-              generation.getIndex().getStatus().getStatusCode() == IndexStatus.StatusCode.FAILED
-                  ? "FAILED"
-                  : "BUILDING";
-        }
-      }
-      if (staged.isPresent()) {
-        var status = staged.orElseThrow().getIndex().getStatus();
-        if (status.getStatusCode() == IndexStatus.StatusCode.FAILED) {
-          state = "FAILED";
-          result.setFailureMessage(status.getMessage().orElse("Index initialization failed"));
-        } else {
-          state = "BUILDING";
-        }
-      }
-      var migration = this.catalog.migration(id);
-      if (migration.isPresent() && !migration.get().failure().isEmpty()) {
-        state = "FAILED";
-        result.setFailureMessage(migration.get().failure());
-      }
-      return result.setLifecycleState(state).build();
-    }
+    return this.reads.describe(id);
   }
 
   @Override

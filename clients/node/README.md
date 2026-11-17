@@ -2,6 +2,7 @@
 
 See [the client guide](https://github.com/beardsandbeers/nomongo-t/blob/main/clients/README.md) for build instructions, examples, TLS, deadlines and write
 semantics. This client targets indexes directly using the schema bundled with this checkout.
+Run `npm test` to build the client and run the gRPC read-contract compatibility tests.
 Release 0.9.0 uses this push API and is incompatible with the older collection-backed 0.2.x API. Use the matching server.
 
 Upsert replaces BSON documents by `_id`; Delete sends BSON `_id` wrappers. No source documents,

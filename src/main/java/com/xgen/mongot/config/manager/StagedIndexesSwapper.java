@@ -145,6 +145,7 @@ class StagedIndexesSwapper {
     // point. So instead of removing the old ones we simply over-write them with the new ones
     // (as they have the same namespace and indexId).
     swapIn.forEach(configState.indexCatalog::addIndex);
+    swapOutIds.forEach(configState.readLeases::invalidate);
 
     // remove the new ones from staged
     swapIn.forEach(configState.staged::removeIndex);
