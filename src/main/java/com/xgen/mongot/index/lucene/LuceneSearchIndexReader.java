@@ -407,6 +407,60 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
     }
 
     @Override
+    public Optional<List<OrdinalJoinPartition>> ordinalJoinPartitions() {
+      checkState(!this.closed && !this.transferred, "Query snapshot is no longer available");
+      return Optional.of(
+          List.of(
+              new OrdinalJoinPartition(
+                  this.reference.getIndexSearcher().getIndexReader(),
+                  this::collectForeignMatches)));
+    }
+
+    private void collectForeignMatches(
+        Operator predicate, org.apache.lucene.search.Collector collector, Runnable checkWork)
+        throws IOException, InvalidQueryException {
+      try (var ignored = LockGuard.with(LuceneSearchIndexReader.this.shutdownSharedLock)) {
+        LuceneSearchIndexReader.this.ensureOpen("collectForeignMatches");
+        checkState(!this.closed && !this.transferred, "Query snapshot is no longer available");
+        var searcher = joinSearcher(checkWork);
+        searcher.search(foreignJoinPredicate(predicate, searcher), collector);
+      }
+    }
+
+    private LuceneIndexSearcher joinSearcher(Runnable checkWork) {
+      // A self-join shares this pinned reader with the local query. Use an unprofiled searcher
+      // over that same reader so membership collection cannot pollute the local query's plan.
+      var searcher = LuceneIndexSearcher.create(this.reference.getIndexSearcher());
+      searcher.setTimeout(
+          () -> {
+            checkWork.run();
+            return false;
+          });
+      return searcher;
+    }
+
+    private org.apache.lucene.search.Query foreignJoinPredicate(
+        Operator operator, LuceneIndexSearcher searcher) throws InvalidQueryException, IOException {
+      var factory = LuceneSearchIndexReader.this.queryFactory;
+      var predicate =
+          factory.createQuery(
+              operator,
+              searcher.getIndexReader(),
+              Optional.empty(),
+              QueryOptimizationFlags.DEFAULT_OPTIONS);
+      var rootFilter =
+          factory.createQuery(
+              AllDocumentsOperator.INSTANCE,
+              searcher.getIndexReader(),
+              Optional.empty(),
+              QueryOptimizationFlags.DEFAULT_OPTIONS);
+      return new BooleanQuery.Builder()
+          .add(predicate, BooleanClause.Occur.FILTER)
+          .add(rootFilter, BooleanClause.Occur.FILTER)
+          .build();
+    }
+
+    @Override
     public void collectKeys(
         Operator operator,
         FieldPath path,
@@ -431,32 +485,8 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
       if (joinFields(path).stream().noneMatch(field -> field.type() == type)) {
         throw new InvalidQueryException("Join field does not support " + type);
       }
-      // A self-join shares this pinned reader with the local query. Use an unprofiled searcher
-      // over that same reader so membership collection cannot pollute the local query's plan.
-      var searcher = LuceneIndexSearcher.create(this.reference.getIndexSearcher());
-      searcher.setTimeout(
-          () -> {
-            checkWork.run();
-            return false;
-          });
-      var factory = LuceneSearchIndexReader.this.queryFactory;
-      var predicate =
-          factory.createQuery(
-              operator,
-              searcher.getIndexReader(),
-              Optional.empty(),
-              QueryOptimizationFlags.DEFAULT_OPTIONS);
-      var rootFilter =
-          factory.createQuery(
-              AllDocumentsOperator.INSTANCE,
-              searcher.getIndexReader(),
-              Optional.empty(),
-              QueryOptimizationFlags.DEFAULT_OPTIONS);
-      var query =
-          new BooleanQuery.Builder()
-              .add(predicate, BooleanClause.Occur.FILTER)
-              .add(rootFilter, BooleanClause.Occur.FILTER)
-              .build();
+      var searcher = joinSearcher(checkWork);
+      var query = foreignJoinPredicate(operator, searcher);
       FieldName.TypeField typeField =
           switch (type) {
             case TOKEN -> FieldName.TypeField.TOKEN;

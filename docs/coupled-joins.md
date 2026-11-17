@@ -58,9 +58,10 @@ existing dependency grants and direct query access.
 ## Bounds and implementation
 
 Both APIs share the planner and one retained-memory budget. Defaults are eight predicates,
-100,000 distinct keys, 32 MiB estimated memory per query, 256 MiB estimated retained memory per
-process, and 10,000,000 foreign-work checkpoints. Reservations live until cursor close,
-exhaustion, expiry, or failure.
+100,000 distinct hash keys, 1,000,000 distinct ordinal keys, 32 MiB estimated memory per query,
+256 MiB estimated retained memory per process, and 10,000,000 preparation work checkpoints.
+The planner may use ordinal bitmaps for large string or ObjectId joins with a foreign `exists`
+predicate on the join key. Cursor reservations live until close, exhaustion, expiry, or failure.
 
 Configure memory at startup with `standalone.querying.joins.maxQueryBytes` and
 `standalone.querying.joins.maxConcurrentBytes` in YAML, or override them with

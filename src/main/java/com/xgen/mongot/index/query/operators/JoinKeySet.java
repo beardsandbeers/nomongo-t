@@ -8,13 +8,15 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefHash;
 
 /** Owned binary membership, frozen before publication to concurrent local searchers. */
-public final class JoinKeySet {
+public final class JoinKeySet implements JoinMembership {
+
   private final BytesRefHash values;
 
   private JoinKeySet(BytesRefHash values) {
     this.values = values;
   }
 
+  @Override
   public int size() {
     return this.values.size();
   }

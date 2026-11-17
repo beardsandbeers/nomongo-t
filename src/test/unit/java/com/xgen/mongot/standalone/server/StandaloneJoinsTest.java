@@ -1581,6 +1581,87 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_denseJoin_choosesOrdinalsForTotalAndHashForFirstPage() throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(1L << 28, 1L << 29))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(52_000, 1));
+      f.upsert(local, "{_id:'first',parent:'x0'}");
+      f.upsert(local, "{_id:'second',parent:'x51999'}");
+      f.upsert(local, "{_id:'miss',parent:'absent'}");
+      String total = JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}");
+      String firstPage = total.replace("type:'total'", "type:'lowerBound'");
+      var totalRequest =
+          request(local, total, 100).toBuilder()
+              .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+              .build();
+
+      var ordinal = f.queries.search(totalRequest);
+      var hash =
+          f.queries.search(
+              totalRequest.toBuilder()
+                  .setQueryBson(request(local, firstPage, 100).getQueryBson())
+                  .build());
+
+      assertThat(ids(ordinal)).containsExactly("first", "second");
+      assertThat(
+              new RawBsonDocument(ordinal.getMetadataBson().toByteArray())
+                  .getDocument("count")
+                  .getNumber("total")
+                  .longValue())
+          .isEqualTo(2);
+      assertThat(ids(hash)).containsExactlyElementsIn(ids(ordinal));
+      assertJoinStrategy(ordinal, "ordinalBitmap");
+      assertJoinStrategy(hash, "adaptive");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_denseJoinAboveHashCap_preservesSortedCursorAndReleasesMemory()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of())) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(100_001, 1));
+      f.upsert(local, "{_id:'first',key:'a',parent:'x100000'}");
+      f.upsert(local, "{_id:'second',key:'b',parent:'x0'}");
+      f.upsert(local, "{_id:'miss',key:'0',parent:'absent'}");
+      String sorted =
+          JOIN.replace("equals:{path:'office',value:'Berlin'}", "exists:{path:'key'}")
+              .replace("count:{type:'total'}", "count:{type:'lowerBound'},sort:{key:1}");
+
+      var first = f.search(local, sorted, 1);
+
+      assertThat(ids(first)).containsExactly("first");
+      assertThat(first.getCursorId()).isNotEqualTo(0L);
+      assertThat(reservedBytes(f)).isGreaterThan(0.0);
+      assertThat(reservedBytes(f)).isLessThan(100_000.0);
+      var next =
+          f.queries.getMore(GetMoreRequest.newBuilder().setCursorId(first.getCursorId()).build());
+      assertThat(ids(next)).containsExactly("second");
+      assertThat(next.getCursorId()).isEqualTo(0L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  private static void assertJoinStrategy(QueryResponse response, String strategy) {
+    var explain = new RawBsonDocument(response.getExplainBson().toByteArray());
+    for (var partition : explain.getArray("indexPartitionExplain")) {
+      assertThat(
+              partition
+                  .asDocument()
+                  .getDocument("joins")
+                  .getArray("execution")
+                  .getFirst()
+                  .asDocument()
+                  .getString("strategy")
+                  .getValue())
+          .isEqualTo(strategy);
+    }
+  }
+
+  @Test
   public void search_largerConfiguredQueryBudget_acceptsMembershipAboveDefaultLimit()
       throws Exception {
     try (var f = new Fixture(data(), List.of(), new MemoryLimits(67108864L, 134217728L))) {

@@ -626,10 +626,11 @@ The server applies these admission limits by default:
 | Limit | Value |
 | --- | --- |
 | Independent predicates per query | 8 |
-| Distinct keys across predicates | 100,000, also constrained by memory |
+| Distinct hash keys across predicates | 100,000 |
+| Distinct ordinal keys across predicates | 1,000,000 |
 | Estimated build/retained memory per query | 32 MiB |
 | Estimated memory across concurrent joins and their cursors | 256 MiB |
-| Foreign-work checkpoints across predicates | 10,000,000 |
+| Join preparation work checkpoints across predicates | 10,000,000 |
 
 Configure the memory limits at startup in standalone YAML:
 
@@ -651,11 +652,11 @@ Changes require a restart. Explain reports the effective limits in
 `joins.preparation.limits`; memory-limit errors include the limit, currently
 reserved bytes, and the requested additional reservation.
 
-Memory reservations conservatively account for query metadata, pooled binary
-keys, ordinal deduplication, probe state, and term-query/rewrite copies per
-partition and facet.
-They are admission estimates,
-not a measurement of JVM heap or RSS. Cursor-retained membership keeps its
+Admission estimates account for query metadata and prepared membership. The hash
+path includes pooled keys, foreign deduplication, probe state, and term-query
+copies per partition and facet. The ordinal path budgets local bitmaps, scorer
+overhead, and temporary dictionary work. These estimates are independent of JVM
+heap or RSS measurements. Cursor-retained membership keeps its
 reservation until exhaustion, kill, invalidation, expiry, or shutdown. Deadline
 and cancellation checks run during foreign collection and local Lucene execution;
 each `GetMore` installs its current invocation's cancellation context.
@@ -808,6 +809,258 @@ admission. Tests additionally check multivalued keys, missing values, deleted
 documents, unsampled matches, score ordering across parallel leaves, pagination,
 probe-to-postings switching, native mapped `_id`, type validation, and collector
 hints. Total-count and facet requests remain exact.
+
+### Ordinal bitmap prototype (17 November 2026)
+
+The initial `OrdinalJoinQuery` experiment replaced copied foreign keys with
+local ordinal bitmaps. The measurements below used the isolated Lucene
+benchmark before production integration.
+It supports the existing sorted-set columns for strings and ObjectIds, not the
+numeric columns used by integer joins.
+
+Preparation evaluates the foreign predicate and marks selected ordinals in each
+foreign segment. It merges those selected dictionary streams by binary key,
+deduplicates across segments and partitions, and intersects the stream with each
+local dictionary. The retained query owns only local membership bitmaps and
+reader cache identities. Foreign readers can close after preparation. Local
+execution uses a `TwoPhaseIterator` to check candidate document ordinals, preserving
+ordinary document traversal and ranking. Executing against an unrelated local
+snapshot fails rather than reusing invalid ordinal numbers.
+
+This first implementation uses dense `LongBitSet` storage on both sides. Bitmap
+payload grows with the sum of per-segment dictionary cardinalities, approximately
+one bit per dictionary entry, rather than the byte lengths of selected keys.
+Repeated dictionaries in different segments require separate bitmaps. Sparse
+ordinal representations and a production strategy selector are future work.
+
+The baseline compares production `JoinKeySet` collection and `AdaptiveJoinQuery`
+with the prototype's default seek-first merge. It uses Java 21.0.11, the pinned
+Lucene 10.4.0-5 fork, `-Xms768m -Xmx1536m`, warm `FSDirectory` readers, no query
+caches, and a single query thread. Each case has two fresh JVMs, 15 warmups and
+30 measured operations per strategy and request shape in each JVM. Strategy
+order is shuffled. The 2,880 raw measured operations include foreign collection,
+membership preparation, and local search. Index creation, transport, authorization,
+and production admission are excluded. Temporary indexes are removed after each
+JVM run; build and dependency caches remain on `/hdd`.
+
+The default layout has four foreign and eight local segments. Most cases have
+100,000 foreign keys, 1,000,000 local documents, and 100,000 unique local keys.
+The million-key case has 1,000,000 foreign keys and 2,000,000 local documents.
+The sparse case selects 10,000 of 1,000,000 foreign keys, also with 2,000,000 local
+documents. Its matching foreign documents are clustered in the first foreign
+segment. The low-overlap case has 1,000,000 unique local keys, giving 10% overlap.
+The small case selects 10 of 10,000 foreign keys and has 100,000 local documents.
+Local key numbers follow a deterministic permutation; selective predicates match
+every thousandth local document. This is a synthetic comparison, not a production
+latency or capacity guarantee.
+
+Pooled median end-to-end milliseconds, **current hash path → ordinal prototype**:
+
+| Case | Selective top-10 | Broad top-10 | Exact full count |
+| --- | ---: | ---: | ---: |
+| 10 ObjectId keys | 3.0 → 1.4 | 2.4 → 3.3 | 2.0 → 2.2 |
+| 100,000 ObjectId keys | 51.0 → 88.1 | 51.2 → 100.7 | 209.9 → 110.5 |
+| 1,000,000 ObjectId keys | 728.6 → 359.3 | 725.4 → 412.1 | 2156.1 → 424.4 |
+| 100,000 string keys, 64 bytes | 293.7 → 121.6 | 294.3 → 132.8 | 546.3 → 143.8 |
+| 100,000 string keys, 256 bytes | 464.2 → 168.4 | 459.1 → 184.4 | 778.5 → 194.2 |
+| Sparse foreign matches | 8.7 → 102.9 | 32.5 → 105.5 | 32.3 → 119.6 |
+| 32 foreign / 32 local segments | 54.4 → 214.1 | 53.8 → 210.9 | 497.1 → 223.0 |
+| 10% local overlap | 51.3 → 588.7 | 88.6 → 596.9 | 171.5 → 608.1 |
+
+Memory measures deliberately separate retained query state from allocation and
+preparation structures. Retained membership below is the prepared query object
+graph estimated with Lucene's `RamUsageTester`, excluding index readers and local
+execution weights. Allocation is the main thread's `ThreadMXBean` allocation
+delta over preparation plus full-count execution; it is not retained heap.
+
+| Case | Retained membership, KiB | Allocated per full count, MiB |
+| --- | ---: | ---: |
+| 10 ObjectId keys | 32.6 → 10.5 | 0.68 → 0.22 |
+| 100,000 ObjectId keys | 2701.6 → 98.3 | 18.65 → 0.35 |
+| 1,000,000 ObjectId keys | 25086.0 → 244.8 | 97.44 → 0.61 |
+| 100,000 string keys, 64 bytes | 7792.8 → 98.3 | 73.80 → 0.43 |
+| 100,000 string keys, 256 bytes | 26652.3 → 98.3 | 129.79 → 0.76 |
+| Sparse foreign matches | 298.7 → 244.8 | 2.21 → 0.58 |
+| 32 foreign / 32 local segments | 2701.6 → 124.4 | 11.94 → 1.28 |
+| 10% local overlap | 2701.6 → 122.8 | 18.66 → 0.37 |
+
+For one million ObjectId keys, peak owned preparation structures were approximately
+28.50 MiB for the current hash path versus 0.36 MiB of foreign and local ordinal
+bitmaps. The hash estimate samples the key hash plus current foreign ordinal
+deduplication set at leaf boundaries and every 4,096 documents. These figures
+exclude iterator objects, temporary reallocation overlap, local query rewrite,
+and reader memory. They are **not** JVM heap high-water marks or process RSS.
+Cold-reader I/O and concurrent request behavior were not benchmarked.
+
+The low-overlap regression exposed an avoidable cost: seeking a DocValues
+dictionary for every short gap. A separate follow-up advances at most four terms
+sequentially before falling back to `seekCeil`. This mode is selected with
+`--scan-before-seek 4`; the default remains zero so the full baseline is
+reproducible. Both modes pass the same correctness oracles. The follow-up uses
+two fresh JVMs, 10 warmups and 20 measured operations per strategy and shape per
+JVM, adding 320 raw measured operations. Retained membership is unchanged.
+
+| Case / request | Initial seek-first, ms | Four sequential steps, ms | Hash rerun, ms |
+| --- | ---: | ---: | ---: |
+| 10% overlap / selective top-10 | 588.7 | 112.5 | 52.0 |
+| 10% overlap / exact full count | 608.1 | 122.0 | 172.0 |
+| Sparse / selective top-10 | 102.9 | 107.2 | 9.1 |
+| Sparse / exact full count | 119.6 | 122.8 | 33.1 |
+
+These are medians from separate experiments, with an interleaved hash baseline
+in each. Sequential advancement fixes much of the low-overlap setup overhead and
+makes its full count faster than the hash rerun. It does not solve the sparse
+case. [Follow-up raw samples](benchmarks/ordinal-joins/scan-before-seek/samples.csv),
+[summary](benchmarks/ordinal-joins/scan-before-seek/summary.json), and
+[metadata](benchmarks/ordinal-joins/scan-before-seek/metadata.json) preserve the
+comparison separately from the full baseline.
+
+The results support an additional strategy for large membership and long keys.
+They do not support replacing the current path unconditionally: eager local
+dictionary preparation is expensive for selective requests, sparse foreign
+matches, low overlap, and many segments. A selector needs to consider selected
+key bytes, the sum of local dictionary sizes, segment count, local candidate
+cost, and the available memory budget. Production integration also needs
+admission before bitmap allocation, cancellation/work checks in all preparation
+phases, and a strategy-specific policy for the existing key cap.
+
+The focused oracle tests cover binary and string keys, multivalued and missing
+fields, deletions, union across partitions, exclusions, parallel scoring,
+pagination, self-joins, foreign-reader release, snapshot mismatch, and preparation
+cancellation. Benchmark fixtures independently verify the expected distinct-key
+and full-match counts before timing.
+
+Sources: [ordinal query](../src/main/java/com/xgen/mongot/index/lucene/query/OrdinalJoinQuery.java),
+[benchmark](../src/test/bench/java/com/xgen/mongot/index/lucene/query/OrdinalJoinBenchmark.java),
+[runner](../scripts/perf/ordinal_join_benchmark.py),
+[raw samples](benchmarks/ordinal-joins/baseline/samples.csv),
+[summary including p95 and individual JVM medians](benchmarks/ordinal-joins/baseline/summary.json),
+and [measurement metadata](benchmarks/ordinal-joins/baseline/metadata.json).
+
+Reproduce the full baseline into a fresh results directory:
+
+```bash
+python3 scripts/perf/ordinal_join_benchmark.py \
+  --output-dir /tmp/ordinal-join-results-new \
+  --forks 2 --warmups 15 --samples 30 --scan-before-seek 0
+```
+
+Reproduce the targeted traversal follow-up:
+
+```bash
+python3 scripts/perf/ordinal_join_benchmark.py \
+  --output-dir /tmp/ordinal-join-scan4-new \
+  --forks 2 --warmups 10 --samples 20 --scan-before-seek 4 \
+  --shape selectiveTop10 --shape broadCount \
+  --case low-overlap --case sparse-objectid
+```
+
+The runner checks that `/hdd` is mounted, configures persistent Bazel caches there,
+and stops its build server before timing. Rebuild the comparison from preserved
+samples without rerunning queries:
+
+```bash
+python3 scripts/perf/ordinal_join_benchmark.py \
+  --output-dir docs/benchmarks/ordinal-joins/baseline --summarize-only \
+  --html-output docs/benchmarks/ordinal-joins/ordinal-join-comparison.html
+```
+
+### Adaptive choice during join preparation
+
+The shared planner chooses a representation per string or ObjectId equality
+domain. Hash membership uses the existing adaptive postings and DocValues
+query. Ordinal membership uses the pinned local segment dictionaries and
+matches the resulting bitmaps through the ordinary collector.
+
+Automatic selection starts with foreign `exists` on the join key. The planner
+reads dictionary sizes from the pinned snapshots. Repeated values across
+segments and keys on deleted documents can raise these estimates. Foreign
+selection and the exact join still use the normal predicate and root filter.
+
+| Request | Minimum sum of foreign dictionary sizes to consider ordinals |
+| --- | ---: |
+| Exact count or metadata collector | 50,000 |
+| Field sort or explicit pagination with a lower-bound count | 100,000 |
+| First relevance page with a lower-bound count | 250,000 |
+
+A single foreign dictionary above the 100,000 hash cap also qualifies for
+consideration. Very large local dictionaries can rule out ordinals because
+each participating dictionary adds traversal and bitmap work. The exact
+thresholds are initial heuristics. The benchmark covered relevance and full
+counts. The field-sort rule conservatively gives less credit for early
+termination until representative sorted workloads can be measured.
+
+Each prepared snapshot may expose its join partitions. The metered snapshot
+forwards the capability and the partitioned reader composes it. Readers without
+the capability use hash. The selection stays in the shared planner and the
+query factory creates a scorer for the prepared representation. Existing
+collectors consume either scorer for filtering, sorting and pagination.
+
+Before ordinal preparation, reserve local bitmap and scorer memory plus scratch
+space for both sides of the dictionary merge. If the reservation cannot be
+made, try hash. Release scratch on success and keep local membership reserved
+until cursor close. Release the entire plan on failure. The shared work limit
+charges bitmap preparation as well as hash collection. Ordinal domains have a
+separate cumulative distinct-key cap. Both strategies preserve exact matches.
+Explain reports `ordinalBitmap` and the selection reason for ordinal queries.
+
+#### Follow-up design
+
+**Request intent.** Treat exact total counts and collectors requiring all matches
+(including facets) as exhaustive, even if the request returns only ten sorted hits.
+For a hits request with a lower-bound count, estimate the work to fill the page
+*and* satisfy the count threshold. Track first page and continuation separately.
+A page boundary alone gives no upper bound on candidates examined. Reuse the
+prepared membership for the lifetime of a cursor.
+
+**Sort.** For relevance order, the collector may skip noncompetitive scores.
+For explicit field order, discount local work only when the collector can exploit
+the actual index sort, including field sequence, directions and missing-value
+semantics. With an unrelated sort, finding the best ten may require visiting
+every candidate. Treat unknown collector capabilities conservatively. A sort
+hint influences the cost estimate only. Keep scoring, tie-breaking, search-after,
+exclusion, and termination in the existing collector.
+
+**Cheap inputs.** Read segment counts and per-leaf dictionary sizes from pinned
+DocValues. Sum rounded bitmap sizes across all local and foreign leaves for a
+conservative dense-bitmap bound. Obtain foreign predicate cost from the scorer
+supplier where cheap. That cost estimates documents, while distinct key count
+also depends on duplication and multivalued fields. If the decision is close,
+take a bounded sample across partitions and leaves to estimate key width,
+duplication and local dictionary overlap. Cap documents, values, dictionary
+seeks and elapsed work. Skip sampling for tiny joins. Treat clustered or
+inconclusive samples as low confidence. Never use a sample to omit a key or
+declare a join empty.
+
+**Selection rule.** First rule out plans that cannot fit their preparation peak
+and retained state within the configured budgets. For feasible choices compare
+estimated preparation time plus local execution time. Hash preparation depends
+on distinct selected keys and their byte lengths. Ordinal preparation depends on
+selected ordinal visits, dictionary entries traversed, overlap and segment count.
+Local work depends on expected candidate visits and whether the request is
+exhaustive. Prefer hash when estimates are close for a first page. Favor ordinals
+when wide or numerous keys make hashing expensive, or exhaustive local work
+repays bitmap setup. Use the four-step advance before seeking as an initial
+candidate for calibration. The measured sparse full-count case still favors hash,
+so exhaustive intent alone must never force ordinals.
+
+**Admission and fallback.** If hash growth crosses its reservation, consider one
+restart on the same pinned snapshots only when the ordinal bound fits. Release discarded buffers and their
+reservation before rebuilding, and charge both passes to the same work limit.
+Propagate cancellation immediately. Reject when neither plan fits. Finish preparation before publishing any hits.
+
+**Validation and rollout.** Start with forced hash and ordinal modes for tests,
+then record the proposed choice in shadow mode. Explain should include request
+intent, sort eligibility, sample size and confidence, estimated bytes and cost
+for both plans, the selected strategy, actual preparation work and any restart.
+Calibrate on held-out workloads covering relevance, aligned and unaligned field
+sorts, first and later pages, selective siblings, sparse dictionaries, skew and
+concurrent cursors. The existing benchmark measured relevance top-10 and exact
+counts. Field-sort and continuation performance still need measurement. Compare
+ordered hits, scores, counts and facets against forced hash, and measure p50/p95
+first-page latency, preparation peak, retained bytes and cancellation latency.
+Evaluate broader automatic selection behind a rollout flag after the selector
+preserves correctness and stays within agreed latency and memory bounds.
 
 ## 9. Agreed initial syntax and scope
 

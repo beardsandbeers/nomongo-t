@@ -1,0 +1,107 @@
+{
+  "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.43",
+  "cpu_count": 4,
+  "revision": "191743b502ff66328a9ee6714f981b910db933f5",
+  "dirty": true,
+  "forks": 2,
+  "warmups_per_shape_and_strategy": 15,
+  "samples_per_shape_and_strategy_and_fork": 30,
+  "cases": {
+    "small-objectid": {
+      "kind": "objectId",
+      "foreign-keys": 10000,
+      "selected-keys": 10,
+      "local-docs": 100000,
+      "local-keys": 10000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "objectid-100k": {
+      "kind": "objectId",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 100000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "objectid-1m": {
+      "kind": "objectId",
+      "foreign-keys": 1000000,
+      "selected-keys": 1000000,
+      "local-docs": 2000000,
+      "local-keys": 1000000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "string64-100k": {
+      "kind": "string",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 100000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "string256-100k": {
+      "kind": "string",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 100000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 256
+    },
+    "sparse-objectid": {
+      "kind": "objectId",
+      "foreign-keys": 1000000,
+      "selected-keys": 10000,
+      "local-docs": 2000000,
+      "local-keys": 1000000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    },
+    "many-segments": {
+      "kind": "objectId",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 100000,
+      "foreign-segments": 32,
+      "local-segments": 32,
+      "string-bytes": 64
+    },
+    "low-overlap": {
+      "kind": "objectId",
+      "foreign-keys": 100000,
+      "selected-keys": 100000,
+      "local-docs": 1000000,
+      "local-keys": 1000000,
+      "foreign-segments": 4,
+      "local-segments": 8,
+      "string-bytes": 64
+    }
+  },
+  "cache": "query caches disabled; warm FSDirectory readers; no transport or production admission",
+  "memory": {
+    "allocated": "ThreadMXBean thread allocation delta over preparation plus search",
+    "retained": "Lucene RamUsageTester graph size of prepared membership query; excludes readers",
+    "peak_membership": "owned membership structures during preparation; hash+current seen set sampled at leaf boundaries/every 4096 documents, or sum of foreign/local ordinal bitmaps; excludes iterators, reallocation overlap, and query rewrite; not JVM heap high-water mark"
+  },
+  "elapsed_seconds": 1357.5821859739954,
+  "scan_before_seek": 0,
+  "java_runtime": "21.0.11",
+  "lucene_fork": "10.4.0-5",
+  "heap": "-Xms768m -Xmx1536m",
+  "shapes": [
+    "selectiveTop10",
+    "broadTop10",
+    "broadCount"
+  ]
+}

@@ -30,6 +30,8 @@ java_library(
         "NumericNearQueryFactory.java",
         "NumericRangeQueryFactory.java",
         "ObjectIdRangeQueryFactory.java",
+        "OrdinalJoinPreparation.java",
+        "OrdinalJoinQuery.java",
         "PhraseQueryFactory.java",
         "QueryCreator.java",
         "QueryStringParser.java",
