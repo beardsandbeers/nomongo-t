@@ -179,7 +179,8 @@ public class StandaloneIndexUpdatesCrashTest {
               .setExpectedRevision(1)
               .setDefinitionBson(
                   bson(
-                      "{numPartitions:2,mappings:{dynamic:false,fields:{title:{type:'string'},category:{type:'token'}}}}"))
+                      "{numPartitions:2,mappings:{dynamic:false,fields:{title:{type:'string'},"
+                          + "category:{type:'token'}}}}"))
               .build());
       runtime.catalogChanged();
     }

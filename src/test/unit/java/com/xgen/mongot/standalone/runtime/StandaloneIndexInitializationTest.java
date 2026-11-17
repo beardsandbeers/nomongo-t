@@ -174,7 +174,8 @@ public class StandaloneIndexInitializationTest {
     String definition =
         this.type == IndexType.INDEX_TYPE_SEARCH
             ? "{numPartitions:2,mappings:{fields:{title:{type:'string'}}}}"
-            : "{numPartitions:2,fields:[{type:'vector',path:'v',numDimensions:2,similarity:'cosine'}]}";
+            : "{numPartitions:2,fields:[{type:'vector',path:'v',numDimensions:2,"
+                + "similarity:'cosine'}]}";
     String id =
         runtime
             .catalog()

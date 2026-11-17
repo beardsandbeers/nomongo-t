@@ -91,8 +91,9 @@ public class StandaloneGrpcServerTest {
                     .setExpectedRevision(1)
                     .setDefinitionBson(
                         bson(
-                            "{analyzers:[{name:'edge',tokenizer:{type:'edgeGram',minGram:2,maxGram:15}}],"
-                                + "mappings:{fields:{title:{type:'string',searchAnalyzer:'edge'}}}}"))
+                            "{analyzers:[{name:'edge',tokenizer:{type:'edgeGram',"
+                                + "minGram:2,maxGram:15}}],mappings:{fields:{"
+                                + "title:{type:'string',searchAnalyzer:'edge'}}}}"))
                     .build());
 
         assertThat(updated.getGenerationId())
@@ -201,7 +202,8 @@ public class StandaloneGrpcServerTest {
                     .setDefinitionBson(
                         bson(
                             "{numPartitions:2,mappings:{fields:{title:{type:'string'},"
-                                + "label:{type:'string',analyzer:'lucene.keyword'},tag:{type:'token',normalizer:'lowercase'}}}}"))
+                                + "label:{type:'string',analyzer:'lucene.keyword'},"
+                                + "tag:{type:'token',normalizer:'lowercase'}}}}"))
                     .build());
 
         assertThat(updated.getLifecycleState()).isEqualTo("READY");

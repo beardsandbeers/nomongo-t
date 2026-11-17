@@ -122,7 +122,8 @@ public class StandaloneJoinsTest {
                   .setIndexId(foreign)
                   .setQueryBson(
                       bson(
-                          "{index:'foreign',equals:{path:'office',value:'Berlin'},count:{type:'total'}}"))
+                          "{index:'foreign',equals:{path:'office',value:'Berlin'},"
+                              + "count:{type:'total'}}"))
                   .build());
       assertThat(
               new RawBsonDocument(meta.getMetadataBson().toByteArray())

@@ -25,8 +25,8 @@ import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
-@RunWith(Parameterized.class)
 /** Legacy copy-recovery fixtures plus regressions for the public in-place update path. */
+@RunWith(Parameterized.class)
 public class StandaloneIndexUpdatesRecoveryTest {
   private static final String ORIGINAL =
       "{mappings:{dynamic:false,fields:{title:{type:'string'}}}}";
