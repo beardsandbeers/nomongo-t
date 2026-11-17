@@ -10,8 +10,9 @@ Java, and TypeScript clients use the matching 0.10.0 API.
   Ownership filters, pagination, explicit index targets, and join bindings disambiguate
   indexes with the same name. Replicated indexes remain read-only through this API.
 - Run SearchMeta counts and facets without returning document hits.
-- Preserve existing Lucene content for supported compatible schema updates. Incompatible
-  changes still require an explicit rebuild or reingestion; see the
+- Preserve existing Lucene content for compatible schema updates. Upsert existing documents to
+  populate newly mapped fields. An incompatible update in `AUTO` mode rebuilds the index empty.
+  Use `REQUIRE_PRESERVE` to reject changes that would require a rebuild. See the
   [index lifecycle guide](../standalone-mongot.md#mapping-changes-and-index-lifecycle).
 - Use inline joins through MongoDB-backed search, with join planning diagnostics and
   analyzed and rewritten Lucene queries in explain. Coupled joins do not enforce the

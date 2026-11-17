@@ -146,7 +146,7 @@ public final class OrdinalJoinPreparation {
       }
     }
 
-    Map<CacheKey, LongBitSet> membership = new IdentityHashMap<>();
+    Map<CacheKey, OrdinalJoinMembership.Leaf> membership = new IdentityHashMap<>();
     var localQueue = new PriorityQueue<LocalCursor>(Comparator.comparing(cursor -> cursor.term));
     @Var long localBytes = 0;
     for (var partition : local) {
@@ -157,11 +157,11 @@ public final class OrdinalJoinPreparation {
           throw new IllegalStateException("Ordinal join requires a local reader cache identity");
         }
         var values = DocValues.getSortedSet(context.reader(), localField);
-        var ordinals = new LongBitSet(values.getValueCount());
+        var ordinals = new OrdinalJoinMembership.Leaf(values.getValueCount());
         if (membership.putIfAbsent(helper.getKey(), ordinals) != null) {
           continue;
         }
-        localBytes += ordinals.ramBytesUsed();
+        localBytes += ordinals.bitmapBytes();
         var cursor = new LocalCursor(values.termsEnum(), ordinals, sequentialSteps);
         if (cursor.next()) {
           localQueue.add(cursor);
@@ -181,7 +181,7 @@ public final class OrdinalJoinPreparation {
       while (!localQueue.isEmpty() && localQueue.peek().term.compareTo(key) <= 0) {
         var target = localQueue.remove();
         if (target.term.equals(key)) {
-          target.ordinals.set(target.terms.ord());
+          target.ordinals.add(target.terms.ord());
           if (target.next()) {
             localQueue.add(target);
           }
@@ -230,11 +230,11 @@ public final class OrdinalJoinPreparation {
 
   private static final class LocalCursor {
     private final TermsEnum terms;
-    private final LongBitSet ordinals;
+    private final OrdinalJoinMembership.Leaf ordinals;
     private final int sequentialSteps;
     private BytesRef term = new BytesRef();
 
-    private LocalCursor(TermsEnum terms, LongBitSet ordinals, int sequentialSteps) {
+    private LocalCursor(TermsEnum terms, OrdinalJoinMembership.Leaf ordinals, int sequentialSteps) {
       this.terms = terms;
       this.ordinals = ordinals;
       this.sequentialSteps = sequentialSteps;

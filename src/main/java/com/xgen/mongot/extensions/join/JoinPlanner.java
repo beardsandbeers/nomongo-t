@@ -413,10 +413,13 @@ public class JoinPlanner {
       return Optional.empty();
     }
     var localStats = inspectOrdinals(plan, localPartitions.get(), localField, field.type(), true);
-    if (localStats.isEmpty() || localStats.get().entries() == 0) {
+    if (localStats.isEmpty()) {
       return Optional.empty();
     }
     var local = localStats.get();
+    if (local.entries() == 0) {
+      return Optional.of(new JoinMembership.EmptyLocal());
+    }
     var source = foreignStats.get();
     // Large repeated local dictionaries increase merge and probe setup. Give exhaustive searches
     // more room when their collector can amortize the translation.

@@ -347,8 +347,9 @@ same numeric options, then use the existing `localField` / `foreignField` syntax
 ```
 
 Integer joins compare BSON int32 and int64 by value across the full signed 64-bit range. Strings
-and doubles do not match integer keys. Existing indexes with this mapping can be reused; changing
-the mapping requires reingestion. See [integer join keys](docs/join-design-guide.md#integer-join-keys)
+and doubles do not match integer keys. Existing indexes with this mapping can be reused. When
+adding a new join field, upsert the documents whose keys should be searchable.
+See [integer join keys](docs/join-design-guide.md#integer-join-keys)
 for examples and the distinction between join equality and upsert/delete identity. Collections with
 mixed `_id` types can map both fields as `[{"type":"token"},{"type":"objectId"},
 {"type":"number","representation":"int64","indexDoubles":false}]`; the same join predicate covers
@@ -537,8 +538,10 @@ See the [operating guide](docs/standalone-mongot.md) for all settings and index-
   Sequence requests and retries that modify the same IDs. Bound client concurrency and back off
   on `RESOURCE_EXHAUSTED`. See the [ingestion guide](docs/standalone-mongot-grpc-guide.md) for
   concurrency limits and protocol compatibility.
-- Updating an index mapping creates an empty index generation. Reingest your content after the
-  new revision becomes ready.
+- Compatible mapping updates preserve indexed documents. Upsert existing documents to populate
+  newly mapped fields. An explicit rebuild or an incompatible update in `AUTO` mode creates an
+  empty generation. Reingest the desired documents once that generation is ready.
+  See the [index lifecycle guide](docs/standalone-mongot.md#mapping-changes-and-index-lifecycle).
 - Run one server per data volume. To back up, stop the container cleanly and copy the entire
   volume. Keep the volume when upgrading or recreating the container.
 

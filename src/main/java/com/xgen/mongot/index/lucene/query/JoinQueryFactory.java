@@ -5,6 +5,7 @@ import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.query.custom.NumericJoinQuery;
 import com.xgen.mongot.index.query.operators.JoinField;
 import com.xgen.mongot.index.query.operators.JoinKeySet;
+import com.xgen.mongot.index.query.operators.JoinMembership;
 import com.xgen.mongot.index.query.operators.MaterializedJoinOperator;
 import com.xgen.mongot.index.query.operators.OrdinalJoinMembership;
 import java.util.Optional;
@@ -28,11 +29,15 @@ final class JoinQueryFactory {
             operator.field().type().name(),
             operator.exhaustive(),
             operator.countThreshold());
-    if (operator.membership().size() == 0) {
-      explain.ifPresent(trace -> trace.strategy("empty", "noForeignKeys"));
-      return new MatchNoDocsQuery("No foreign join keys");
-    }
     return switch (operator.membership()) {
+      case JoinMembership.EmptyLocal ignored -> {
+        explain.ifPresent(trace -> trace.strategy("empty", "noLocalKeys"));
+        yield new MatchNoDocsQuery("No local join keys");
+      }
+      case JoinMembership keys when keys.size() == 0 -> {
+        explain.ifPresent(trace -> trace.strategy("empty", "noForeignKeys"));
+        yield new MatchNoDocsQuery("No foreign join keys");
+      }
       case OrdinalJoinMembership ordinals -> {
         explain.ifPresent(trace -> trace.strategy("ordinalBitmap", ordinals.selectionReason()));
         yield new OrdinalJoinQuery(field, ordinals, explain);

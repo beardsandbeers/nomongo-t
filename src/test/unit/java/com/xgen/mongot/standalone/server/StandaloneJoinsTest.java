@@ -1618,6 +1618,44 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_emptyLocalDictionaryAfterHashLimit_matchesNoLocalKeys() throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(200_000, 2_000_000))) {
+      String mapping =
+          "{storedSource:true,mappings:{dynamic:false,fields:{key:{type:'objectId'}}}}";
+      String foreign = f.create("foreign", mapping);
+      String local = f.create("local", mapping);
+      var keys = new org.bson.BsonArray();
+      java.util.stream.IntStream.range(0, 128).forEach(i -> keys.add(new org.bson.BsonObjectId()));
+      f.upsert(
+          foreign,
+          new BsonDocument("_id", new org.bson.BsonString("f")).append("key", keys).toJson());
+      f.upsert(local, "{_id:'missing'}");
+      String query =
+          """
+          {compound:{filter:[{join:{from:'foreign',localField:'key',foreignField:'key',
+            operator:{exists:{path:'key'}}}}]},returnStoredSource:true,count:{type:'total'}}
+          """;
+
+      var included =
+          f.queries.search(
+              request(local, query, 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+      var excluded = f.search(local, query.replace("filter:", "mustNot:"), 100);
+
+      assertThat(ids(included)).isEmpty();
+      assertThat(ids(excluded)).containsExactly("missing");
+      var explain =
+          new RawBsonDocument(included.getExplainBson().toByteArray()).getDocument("joins");
+      var source = preparation(included).getArray("sources").getFirst().asDocument();
+      assertThat(source.getInt64("reservedBytes").getValue()).isEqualTo(0);
+      var execution = explain.getArray("execution").getFirst().asDocument();
+      assertThat(execution.getString("selectionReason").getValue()).isEqualTo("noLocalKeys");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
   public void search_segmentedFirstPageAboveHashCap_retriesOrdinalsAndPreservesCursor()
       throws Exception {
     try (var f = new Fixture(data(), List.of(), new MemoryLimits(1L << 28, 1L << 29))) {

@@ -82,8 +82,10 @@ MongoDB source-document lookup.
 Index management and document mutations remain source-specific. Direct CreateIndex creates a
 standalone index. Direct UpdateIndex, DropIndex, Upsert, Delete, and DeleteByQuery (including dry
 runs) reject replicated IDs with `NOT_FOUND`. An index has one writer source for its lifetime.
-Ownership conversion and detached replication are not supported. Local mapping updates continue
-to create an empty generation that must be reingested.
+Ownership conversion and detached replication are not supported. Compatible local mapping updates
+preserve indexed documents. Upsert existing documents to populate newly mapped fields. A rebuild
+creates an empty generation that must be refilled. See the
+[index lifecycle guide](standalone-mongot.md#mapping-changes-and-index-lifecycle).
 
 Existing direct `*` grants now include replicated reads. Standalone bearer grants are independent
 of MongoDB collection permissions; review those grants when upgrading. The implicit loopback

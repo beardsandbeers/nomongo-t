@@ -37,5 +37,7 @@ see [the mapping export example](https://github.com/beardsandbeers/nomongo-t/blo
 `GetIndexStats` and `GetIndexFieldStats` provide document counts, storage averages, and
 field storage/memory diagnostics with explicit shared and unknown attribution.
 
-This API manages indexes and pushes BSON to Lucene. Schema updates require reingestion. The
-collection-backed 0.2.x API and data directories are incompatible; use a new data directory.
+Compatible mapping updates preserve indexed documents. To populate newly mapped fields, upsert
+the affected documents again. An explicit rebuild or an incompatible update in `AUTO` mode
+creates an empty generation. Reingest the desired documents once that generation is ready.
+Use a new data directory when migrating from the collection-backed 0.2.x API.

@@ -27,15 +27,15 @@ The standalone server exposes gRPC without a MongoDB aggregation executor.
 Each index owns its documents and receives writes directly through `Upsert` and
 `Delete`. `CreateIndex` takes a name, type, and mapping; names are instance-wide.
 There is no shared source document store, automatic write fan-out, or replay log.
-Applications write related content to each index themselves. `UpdateIndex`
-creates an empty generation that callers must refill from their own source.
+Applications write related content to each index themselves. Compatible mapping updates
+preserve existing documents. A rebuild creates an empty generation to refill from the source.
 
 | Area | Existing behavior | Consequence for joins |
 | --- | --- | --- |
 | Runtime/build | Java 21 and Bazel | Uses the existing build, without a separate Maven application. |
 | Lucene | Upstream modules at 10.4.0; core and join overridden by fork 10.4.0-5 | Verify against the pinned fork, rather than the original guide's 10.6.0 examples. |
 | Catalog | `LocalIndexCatalog`, instance-wide index names, index ObjectIds, live generations | Resolve a foreign name once, then pin its stable index/generation identity. |
-| Ingestion | Writes target one index; mapping updates create empty generations | Joins search indexed content; they do not fan out writes or trigger automatic backfill. |
+| Ingestion | Writes target one index. Compatible mapping updates preserve its content. | Upsert existing documents to populate newly mapped join keys. |
 | Search | `SearchQuery`, `JoinOperator`, and standalone join planning | Parses the foreign predicate separately from executing it against another index. |
 | Token fields | Exact postings and `SortedSetDocValues` | Reuse these for string join keys, including scalars and arrays. |
 | Identity | Internal `$meta/_id` uses BSON-encoded bytes | Token keys are not directly compatible with internal ID bytes. |
@@ -312,8 +312,8 @@ local index to use the same native binary representation:
 
 The local mapping contains `"accountId": { "type": "objectId" }`. Use
 `localField: "accountId", foreignField: "_id"` with the existing `join` syntax.
-For string IDs, explicitly map both sides as `token`. Adding a mapping requires
-reingesting documents into the new generation. No application shadow key or
+For string IDs, explicitly map both sides as `token`. After adding a join field in place,
+upsert existing documents to populate its keys. No application shadow key or
 change to the internal update/delete ID encoding is needed. A hexadecimal string never matches
 an ObjectId.
 
@@ -380,8 +380,8 @@ eight-byte membership keys, and deduplicates them under the existing query budge
 use `NumericJoinQuery` on that same column, choosing numeric points or DocValues using Lucene's
 numeric cost rule. Both point traversal and per-document value scans check cancellation. The
 DocValues branch reuses bounded binary-hash membership, including for adversarial integer keys. No additional on-disk join fields or index-format changes are needed.
-Indexes already using this mapping can be reused. Changing a mapping creates a new generation
-that must be reingested.
+Indexes already using this mapping can be reused. Changing an existing field's numeric
+representation requires a rebuild and reingestion.
 
 Join equality is numeric across integer widths. Upsert/delete identity still preserves the
 original BSON type, so `Int32(42)` and `Int64(42)` are separate stored IDs that both qualify
@@ -581,9 +581,8 @@ section. Existing explain-response limits and cursor cleanup apply.
 - Different indexes own independent documents and reader views. Successful
   `VISIBLE` writes apply to one index; separately writing/refreshing both sides
   does not create an atomic cross-index transaction snapshot.
-- Mapping updates create empty generations. Fresh joins use query-ready live
-  generations and see only the content the application has ingested into them;
-  readiness does not imply that application-level reingestion is complete.
+- Compatible mapping updates preserve the generation and its open cursors. A rebuild
+  creates an empty generation. Fresh joins see documents as the application reingests them.
 - Materialize keys once. Release foreign searchers after collection if the plan
   owns only copied bytes. Keep membership and local readers for the cursor.
 - `GetMore` never reruns the foreign predicate. Foreign changes affect fresh
@@ -971,9 +970,9 @@ python3 scripts/perf/ordinal_join_benchmark.py \
   --case low-overlap --case sparse-objectid
 ```
 
-The runner checks that `/hdd` is mounted, configures persistent Bazel caches there,
-and stops its build server before timing. Rebuild the comparison from preserved
-samples without rerunning queries:
+The runner uses Bazel's default cache. Pass `--bazel-cache-dir PATH` to choose another
+cache directory, or `--skip-build` to run the existing executable under `bazel-bin`.
+To rebuild the comparison from preserved samples, run
 
 ```bash
 python3 scripts/perf/ordinal_join_benchmark.py \
@@ -1032,6 +1031,9 @@ other queries keep their reservations. Both attempts count toward the same work
 limit, and cancellation is propagated. If ordinal admission is unavailable, the
 original hash-limit error is returned. Explain reports the selection reason
 `hashAdmissionLimitExceeded` after a successful retry.
+
+If inspection finds no local keys for an equality domain, that domain matches no
+documents. Explain reports the empty strategy with the reason `noLocalKeys`.
 
 #### Follow-up design
 

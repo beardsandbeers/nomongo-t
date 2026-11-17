@@ -131,6 +131,9 @@ def main():
     parser.add_argument("--warmups", type=int, default=15)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--scan-before-seek", type=int, default=0)
+    parser.add_argument(
+        "--bazel-cache-dir", type=Path, help="Override Bazel's output user root for the build"
+    )
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--summarize-only", action="store_true")
     parser.add_argument("--html-output", type=Path)
@@ -142,30 +145,26 @@ def main():
         if args.html_output:
             write_chart(summary, args.html_output)
         return
-    if not os.path.ismount("/hdd"):
-        raise RuntimeError("/hdd is not mounted; cannot create or use persistent build caches")
     cases = args.case or list(CASES)
     existing = list(output.glob("*-fork*.csv"))
     if existing:
         raise FileExistsError(f"Choose a fresh output directory; existing samples: {existing[0]}")
-    cache = Path("/hdd/michael/dev-cache")
-    output_base = cache / "mongot/worktrees" / ROOT.name / "bazel-output"
-    bazel = ["bazel", f"--output_base={output_base}"]
     if not args.skip_build:
+        bazel = ["bazel"]
+        if args.bazel_cache_dir:
+            bazel.append(f"--output_user_root={args.bazel_cache_dir.resolve()}")
         subprocess.run(
             [
                 *bazel,
                 "build",
-                f"--repository_cache={cache / 'bazel-repository'}",
                 "--lockfile_mode=off",
+                "--worker_quit_after_build",
                 "--jobs=4",
                 TARGET,
             ],
             cwd=ROOT,
             check=True,
         )
-        # Release compiler workers before timing and avoid their retained heap competing with tests.
-        subprocess.run([*bazel, "shutdown"], cwd=ROOT, check=True)
     metadata = {
         "platform": platform.platform(),
         "cpu_count": os.cpu_count(),

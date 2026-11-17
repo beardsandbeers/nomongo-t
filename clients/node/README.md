@@ -6,7 +6,9 @@ Run `npm test` to build the client and run the gRPC read-contract compatibility 
 Version 0.11.0 uses this push API and is incompatible with the older collection-backed 0.2.x API. Use the matching server.
 
 Upsert replaces BSON documents by `_id`; Delete sends BSON `_id` wrappers. No source documents,
-request ledger or collection catalog are maintained outside Lucene. Reingest after mapping changes.
+request ledger or collection catalog are maintained outside Lucene. Compatible mapping updates
+preserve indexed documents. Upsert existing documents to populate newly mapped fields. After an
+empty rebuild, reingest the documents you want to keep.
 
 Use `GetIndexMappings` to export configured fields and observed dynamic field types as a static
 mapping, including mixed types per field. The response also includes a complete reusable index
