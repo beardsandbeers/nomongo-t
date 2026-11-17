@@ -456,7 +456,8 @@ docker run --detach --name nomongo-t \
 
 `--config` selects your YAML file instead of automatic credential generation. The
 `MONGOT_CONTROL_*` variables configure `mongotctl` and Docker's health check; the server itself
-reads its settings from YAML.
+reads its settings from YAML, with optional environment overrides for
+[join memory limits](docs/join-design-guide.md#limits-and-errors).
 
 For a certificate issued only to a service hostname such as `search.example.com`, replace the
 control address above and add a container-local hostname mapping:
@@ -503,7 +504,14 @@ ingestion:
   commitIntervalMillis: 1000
 querying:
   refreshIntervalMillis: 1000
+  joins:
+    maxQueryBytes: 33554432
+    maxConcurrentBytes: 268435456
 ```
+
+`MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES` override the
+respective join memory settings. With a MongoDB `syncSource`, configure these YAML
+settings under `standalone.querying.joins`. Both APIs share the retained-memory budget.
 
 See the [operating guide](docs/standalone-mongot.md) for all settings and index-level permissions.
 

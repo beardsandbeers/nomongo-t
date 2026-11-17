@@ -37,6 +37,21 @@ public class CoexistenceConfigTest {
   }
 
   @Test
+  public void fromFile_joinMemoryLimits_preservesSharedPlannerConfiguration() throws Exception {
+    var file =
+        config(
+            "standalone:\n"
+                + "  querying:\n"
+                + "    joins: {maxQueryBytes: 67108864, maxConcurrentBytes: 536870912}\n");
+
+    var parsed =
+        CoexistenceConfig.fromFile(Optional.of(file), data(), address(), false).orElseThrow();
+
+    assertThat(parsed.joinMemoryLimits().maxQueryBytes()).isEqualTo(67108864L);
+    assertThat(parsed.joinMemoryLimits().maxConcurrentBytes()).isEqualTo(536870912L);
+  }
+
+  @Test
   public void fromFile_unknownExtensionSetting_rejectsTypo() throws Exception {
     var file = config("standalone:\n  ingestoin: {}\n");
 

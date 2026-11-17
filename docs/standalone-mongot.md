@@ -37,7 +37,15 @@ ingestion:
   commitIntervalMillis: 1000
 querying:
   refreshIntervalMillis: 1000
+  joins:
+    maxQueryBytes: 33554432
+    maxConcurrentBytes: 268435456
 ```
+
+The join memory limits are estimated bytes per query and across all retained join cursors.
+`MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES` override the respective
+YAML values at startup. Values must be positive integer byte counts; see
+[join limits and errors](join-design-guide.md#limits-and-errors).
 
 Non-loopback listeners require TLS and bearer authentication. Paths resolve relative to the YAML file.
 Unknown and duplicate configuration keys are rejected. Configure index grants by ObjectId hex ID:

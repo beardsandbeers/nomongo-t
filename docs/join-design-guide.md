@@ -621,7 +621,7 @@ do not assume document-level tenant isolation.
 
 ### Limits and errors
 
-The server applies these fixed admission limits without extra configuration:
+The server applies these admission limits by default:
 
 | Limit | Value |
 | --- | --- |
@@ -630,6 +630,26 @@ The server applies these fixed admission limits without extra configuration:
 | Estimated build/retained memory per query | 32 MiB |
 | Estimated memory across concurrent joins and their cursors | 256 MiB |
 | Foreign-work checkpoints across predicates | 10,000,000 |
+
+Configure the memory limits at startup in standalone YAML:
+
+```yaml
+querying:
+  joins:
+    maxQueryBytes: 33554432
+    maxConcurrentBytes: 268435456
+```
+
+With a MongoDB `syncSource`, put the same `querying.joins` block under `standalone`
+(`standalone.querying.joins`). Both APIs then use these limits and share the process
+reservation counter. `maxConcurrentBytes` includes membership retained by idle cursors.
+
+`MONGOT_JOIN_MAX_QUERY_BYTES` and `MONGOT_JOIN_MAX_CONCURRENT_BYTES` override their
+respective YAML values. Each setting is optional and must be a positive integer
+byte count within the signed 64-bit range. Omitted values retain the defaults above.
+Changes require a restart. Explain reports the effective limits in
+`joins.preparation.limits`; memory-limit errors include the limit, currently
+reserved bytes, and the requested additional reservation.
 
 Memory reservations conservatively account for query metadata, pooled binary
 keys, ordinal deduplication, probe state, and term-query/rewrite copies per

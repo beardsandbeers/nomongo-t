@@ -46,6 +46,19 @@ public class JoinPlanner {
   public static final long MAX_CONCURRENT_BYTES = 256L * 1024 * 1024;
   public static final long MAX_FOREIGN_WORK = 10_000_000;
 
+  /** Estimated retained-memory limits, shared by direct and coupled query adapters. */
+  public record MemoryLimits(long maxQueryBytes, long maxConcurrentBytes) {
+    public MemoryLimits {
+      if (maxQueryBytes <= 0 || maxConcurrentBytes <= 0) {
+        throw new IllegalArgumentException("Join memory limits must be positive byte counts");
+      }
+    }
+
+    public static MemoryLimits defaults() {
+      return new MemoryLimits(MAX_QUERY_BYTES, MAX_CONCURRENT_BYTES);
+    }
+  }
+
   public interface Environment {
     String resolve(JoinSource source) throws Exception;
 
@@ -82,9 +95,15 @@ public class JoinPlanner {
   // One conservative admission budget across both architectures in this process.
   private static final AtomicLong RETAINED_BYTES = new AtomicLong();
   private final Environment environment;
+  private final MemoryLimits memoryLimits;
 
   public JoinPlanner(Environment environment) {
+    this(environment, MemoryLimits.defaults());
+  }
+
+  public JoinPlanner(Environment environment, MemoryLimits memoryLimits) {
     this.environment = environment;
+    this.memoryLimits = memoryLimits;
   }
 
   public static double retainedBytes() {
@@ -251,9 +270,9 @@ public class JoinPlanner {
                       "keys",
                       (long) MAX_KEYS,
                       "memoryBytes",
-                      MAX_QUERY_BYTES,
+                      this.memoryLimits.maxQueryBytes(),
                       "concurrentMemoryBytes",
-                      MAX_CONCURRENT_BYTES,
+                      this.memoryLimits.maxConcurrentBytes(),
                       "workUnits",
                       MAX_FOREIGN_WORK),
                   plan.work,
@@ -433,15 +452,37 @@ public class JoinPlanner {
     }
 
     private void reserveBytes(long estimate) {
-      if (this.bytes + estimate > MAX_QUERY_BYTES) {
-        throw exhausted("Join query-memory limit exceeded");
+      var limits = JoinPlanner.this.memoryLimits;
+      if (this.bytes > limits.maxQueryBytes() - estimate) {
+        throw memoryExhausted(
+            "Join query-memory limit exceeded", limits.maxQueryBytes(), this.bytes, estimate);
       }
-      long total = RETAINED_BYTES.addAndGet(estimate);
-      if (total > MAX_CONCURRENT_BYTES) {
-        RETAINED_BYTES.addAndGet(-estimate);
-        throw exhausted("Concurrent join-memory limit exceeded");
+      // Check before adding so even limits near Long.MAX_VALUE cannot overflow the counter.
+      long retained =
+          RETAINED_BYTES.getAndUpdate(
+              current ->
+                  current > limits.maxConcurrentBytes() - estimate ? current : current + estimate);
+      if (retained > limits.maxConcurrentBytes() - estimate) {
+        throw memoryExhausted(
+            "Concurrent join-memory limit exceeded",
+            limits.maxConcurrentBytes(),
+            retained,
+            estimate);
       }
       this.bytes += estimate;
+    }
+
+    private RuntimeException memoryExhausted(
+        String message, long limit, long reserved, long requested) {
+      return exhausted(
+          message
+              + " (limit: "
+              + limit
+              + " bytes, reserved: "
+              + reserved
+              + " bytes, requested: "
+              + requested
+              + " bytes)");
     }
 
     @Override

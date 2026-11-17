@@ -1,10 +1,12 @@
 package com.xgen.mongot.standalone.config;
 
 import com.fasterxml.jackson.core.StreamReadFeature;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.google.common.net.HostAndPort;
+import com.xgen.mongot.extensions.join.JoinPlanner.MemoryLimits;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -18,6 +20,7 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -36,7 +39,8 @@ public record StandaloneConfig(
     Duration maxRpcDuration,
     Optional<Tls> tls,
     List<Principal> principals,
-    boolean sharedListener) {
+    boolean sharedListener,
+    MemoryLimits joinMemoryLimits) {
 
   public record Limits(
       int maxDocumentBytes, int maxDepth, int maxBatchDocuments, int maxBatchBytes) {
@@ -99,10 +103,41 @@ public record StandaloneConfig(
         false);
   }
 
+  /** Configuration with default join memory limits. */
+  public StandaloneConfig(
+      Path dataPath,
+      InetSocketAddress address,
+      Limits documentLimits,
+      int maxInFlightRequests,
+      long maxInFlightBytes,
+      long minFreeDiskBytes,
+      Duration commitInterval,
+      Duration refreshInterval,
+      Duration maxRpcDuration,
+      Optional<Tls> tls,
+      List<Principal> principals,
+      boolean sharedListener) {
+    this(
+        dataPath,
+        address,
+        documentLimits,
+        maxInFlightRequests,
+        maxInFlightBytes,
+        minFreeDiskBytes,
+        commitInterval,
+        refreshInterval,
+        maxRpcDuration,
+        tls,
+        principals,
+        sharedListener,
+        MemoryLimits.defaults());
+  }
+
   /** Validates resource limits and external-listener security before starting any services. */
   @SuppressWarnings("Var") // A compact record constructor normalizes its final component value.
   public StandaloneConfig {
     principals = List.copyOf(principals);
+    Objects.requireNonNull(joinMemoryLimits);
     if (address.isUnresolved()
         || (!sharedListener
             && !address.getAddress().isLoopbackAddress()
@@ -149,10 +184,17 @@ public record StandaloneConfig(
 
   private static StandaloneConfig fromText(String text, Path configPath, boolean sharedListener)
       throws IOException {
+    return fromText(text, configPath, sharedListener, System.getenv());
+  }
+
+  static StandaloneConfig fromText(
+      String text, Path configPath, boolean sharedListener, Map<String, String> environment)
+      throws IOException {
     var mapper =
         JsonMapper.builder(
                 YAMLFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
             .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS)
+            .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT)
             .build();
     var raw = mapper.readValue(text, FileConfig.class);
     if (!or(raw.mode(), "standalone").equals("standalone")) {
@@ -211,7 +253,9 @@ public record StandaloneConfig(
     }
     var ingestion =
         or(raw.ingestion(), new Ingestion(null, null, null, null, null, null, null, null));
-    var querying = or(raw.querying(), new Querying(null));
+    var querying = or(raw.querying(), new Querying(null, null));
+    var joins = or(querying.joins(), new Joins(null, null));
+    var defaultJoinLimits = MemoryLimits.defaults();
     return new StandaloneConfig(
         resolve(base, storage.dataPath()),
         address,
@@ -228,7 +272,32 @@ public record StandaloneConfig(
         Duration.ofMillis(or(grpc.maxRpcDurationMillis(), 60000L)),
         tls,
         principals,
-        sharedListener);
+        sharedListener,
+        new MemoryLimits(
+            memoryLimit(
+                environment,
+                "MONGOT_JOIN_MAX_QUERY_BYTES",
+                or(joins.maxQueryBytes(), defaultJoinLimits.maxQueryBytes())),
+            memoryLimit(
+                environment,
+                "MONGOT_JOIN_MAX_CONCURRENT_BYTES",
+                or(joins.maxConcurrentBytes(), defaultJoinLimits.maxConcurrentBytes()))));
+  }
+
+  private static long memoryLimit(Map<String, String> environment, String name, long fallback) {
+    String value = environment.get(name);
+    if (value == null) {
+      return fallback;
+    }
+    try {
+      long bytes = Long.parseLong(value);
+      if (bytes > 0) {
+        return bytes;
+      }
+    } catch (NumberFormatException ignored) {
+      // Report the setting name for malformed and overflowing values alike.
+    }
+    throw new IllegalArgumentException(name + " must be a positive integer byte count");
   }
 
   public static StandaloneConfig development(Path dataPath, int port) {
@@ -276,7 +345,9 @@ public record StandaloneConfig(
   private record PrincipalConfig(
       String name, String tokenFile, List<String> roles, List<String> indexes) {}
 
-  private record Querying(@Nullable Long refreshIntervalMillis) {}
+  private record Querying(@Nullable Long refreshIntervalMillis, @Nullable Joins joins) {}
+
+  private record Joins(@Nullable Long maxQueryBytes, @Nullable Long maxConcurrentBytes) {}
 
   private record Ingestion(
       @Nullable Integer maxInFlightRequests,

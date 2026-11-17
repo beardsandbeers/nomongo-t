@@ -25,6 +25,7 @@ import com.xgen.mongot.index.InitializedSearchIndex;
 import com.xgen.mongot.index.MetaResults;
 import com.xgen.mongot.index.SearchIndexReader;
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
+import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.query.QueryOptimizationFlags;
 import com.xgen.mongot.index.query.SearchQuery;
 import com.xgen.mongot.index.query.operators.JoinField;
@@ -45,6 +46,21 @@ import org.junit.Test;
 
 /** Exercises the real coupled resolver and dependency checks, rather than a planner environment. */
 public class CoupledJoinLifecycleTest {
+  @Test
+  public void prepare_configuredConcurrentBudget_preservesExistingReservation() throws Exception {
+    try (var fixture = new Fixture(new JoinPlanner.MemoryLimits(200000L, 200000L))) {
+      double retained = JoinPlanner.retainedBytes();
+
+      var error = assertThrows(CoupledJoinService.Failure.class, fixture::prepare);
+
+      assertThat(error)
+          .hasMessageThat()
+          .contains("Concurrent join-memory limit exceeded (limit: 200000 bytes, reserved: ");
+      assertThat(JoinPlanner.retainedBytes()).isEqualTo(retained);
+    }
+    assertThat(JoinPlanner.retainedBytes()).isEqualTo(0.0);
+  }
+
   @Test
   public void continuation_replicationHostChanges_preservesPinnedProducer() throws Exception {
     try (var fixture = new Fixture()) {
@@ -130,9 +146,15 @@ public class CoupledJoinLifecycleTest {
     final BatchProducer producer = mock(BatchProducer.class);
     final CoupledJoinService service;
     final CoupledJoinService.Prepared prepared;
+    final SearchIndexDefinition definition;
+    final SearchQuery query;
     BatchProducer batch;
 
     Fixture() throws Exception {
+      this(JoinPlanner.MemoryLimits.defaults());
+    }
+
+    Fixture(JoinPlanner.MemoryLimits memoryLimits) throws Exception {
       var connection = ConnectionStringUtil.toConnectionInfo("mongodb://localhost");
       this.config =
           SyncSourceConfig.builder()
@@ -141,11 +163,11 @@ public class CoupledJoinLifecycleTest {
               .mongodSingleHostReplicationUri(connection)
               .build();
       this.source = new AtomicReference<>(new SyncSourceSnapshot(0, Optional.of(this.config)));
-      var definition =
+      this.definition =
           SearchIndexDefinitionBuilder.builder().defaultMetadata().dynamicMapping().build();
-      var id = new GenerationId(definition.getIndexId(), Generation.CURRENT);
+      var id = new GenerationId(this.definition.getIndexId(), Generation.CURRENT);
       var index = mock(InitializedSearchIndex.class);
-      when(index.getDefinition()).thenReturn(definition);
+      when(index.getDefinition()).thenReturn(this.definition);
       when(index.getGenerationId()).thenReturn(id);
       when(index.getStatus()).thenReturn(IndexStatus.steady());
       when(index.asSearchIndex()).thenReturn(index);
@@ -160,7 +182,7 @@ public class CoupledJoinLifecycleTest {
           .thenReturn(
               new SearchIndexReader.SearchProducerAndMetaResults(this.producer, MetaResults.EMPTY));
       var generation = mock(IndexGeneration.class);
-      when(generation.getDefinition()).thenReturn(definition);
+      when(generation.getDefinition()).thenReturn(this.definition);
       when(generation.getGenerationId()).thenReturn(id);
       when(generation.getIndex()).thenReturn(index);
       this.catalog.addIndex(generation);
@@ -175,19 +197,26 @@ public class CoupledJoinLifecycleTest {
               this.config,
               this.source::get,
               new SimpleMeterRegistry(),
+              memoryLimits,
               mock(MongoClient.class));
-      var query =
+      this.query =
           SearchQuery.fromBson(
               BsonDocument.parse(
                   """
                   {compound:{filter:[{join:{localField:'parent',foreignField:'key',
                     operator:{equals:{path:'office',value:'Berlin'}}}}]}}
                   """));
-      this.prepared =
-          this.service
-              .prepare(
-                  definition.getDatabase(), definition.getCollectionUuid(), Optional.empty(), query)
-              .orElseThrow();
+      this.prepared = prepare();
+    }
+
+    CoupledJoinService.Prepared prepare() throws Exception {
+      return this.service
+          .prepare(
+              this.definition.getDatabase(),
+              this.definition.getCollectionUuid(),
+              Optional.empty(),
+              this.query)
+          .orElseThrow();
     }
 
     SearchIndexReader.SearchProducerAndMetaResults execute() throws Exception {

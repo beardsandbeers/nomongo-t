@@ -7,6 +7,7 @@ import com.google.protobuf.ByteString;
 import com.xgen.mongot.cursor.CursorQuery;
 import com.xgen.mongot.cursor.batch.BatchCursorOptions;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
+import com.xgen.mongot.extensions.join.JoinPlanner.MemoryLimits;
 import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.lucene.explain.information.JoinExplainInformation;
 import com.xgen.mongot.index.query.OperatorQuery;
@@ -1580,6 +1581,61 @@ public class StandaloneJoinsTest {
   }
 
   @Test
+  public void search_largerConfiguredQueryBudget_acceptsMembershipAboveDefaultLimit()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(67108864L, 134217728L))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, keyDocument(120, 7000));
+      f.upsert(local, "{_id:'match',parent:'" + "x".repeat(7000) + "0'}");
+
+      var response =
+          f.queries.search(
+              request(local, JOIN, 100).toBuilder()
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS)
+                  .build());
+
+      assertThat(ids(response)).containsExactly("match");
+      var preparation =
+          new RawBsonDocument(response.getExplainBson().toByteArray())
+              .getDocument("joins")
+              .getDocument("preparation");
+      var limits = preparation.getDocument("limits");
+      assertThat(limits.getInt64("memoryBytes").getValue()).isEqualTo(67108864L);
+      assertThat(limits.getInt64("concurrentMemoryBytes").getValue()).isEqualTo(134217728L);
+      assertThat(preparation.getInt64("reservedBytes").getValue()).isGreaterThan(33554432L);
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
+  public void search_configuredConcurrentBudget_rejectsUntilRetainedCursorCloses()
+      throws Exception {
+    try (var f = new Fixture(data(), List.of(), new MemoryLimits(300000L, 300000L))) {
+      String foreign = f.create("foreign", MAPPING);
+      String local = f.create("local", MAPPING);
+      f.upsert(foreign, "{_id:'p',key:'a',office:'Berlin'}");
+      f.upsert(local, "{_id:'first',parent:'a'}");
+      f.upsert(local, "{_id:'second',parent:'a'}");
+      var first = f.search(local, JOIN, 1);
+      double reserved = reservedBytes(f);
+
+      var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(error.getStatus().getDescription())
+          .contains("Concurrent join-memory limit exceeded (limit: 300000 bytes, reserved: ");
+      assertThat(error.getStatus().getDescription()).contains("bytes, requested: ");
+      assertThat(reservedBytes(f)).isEqualTo(reserved);
+
+      f.queries.killCursor(KillCursorRequest.newBuilder().setCursorId(first.getCursorId()).build());
+
+      assertThat(ids(f.search(local, JOIN, 100))).containsExactly("first", "second");
+      assertThat(reservedBytes(f)).isEqualTo(0.0);
+    }
+  }
+
+  @Test
   public void search_repeatedMemoryBudgetFailures_releasesReservationsForLaterQueries()
       throws Exception {
     try (var f = new Fixture(data(), List.of())) {
@@ -1610,6 +1666,9 @@ public class StandaloneJoinsTest {
     for (int attempt = 0; attempt < 10; attempt++) {
       var error = assertThrows(StatusRuntimeException.class, () -> f.search(local, JOIN, 100));
       assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      assertThat(error.getStatus().getDescription())
+          .contains("Join query-memory limit exceeded (limit: 33554432 bytes, reserved: ");
+      assertThat(error.getStatus().getDescription()).contains("bytes, requested: ");
     }
   }
 
@@ -1942,6 +2001,21 @@ public class StandaloneJoinsTest {
 
     private Fixture(Path data, List<StandaloneConfig.Principal> principals, long minFreeDiskBytes)
         throws Exception {
+      this(data, principals, minFreeDiskBytes, MemoryLimits.defaults());
+    }
+
+    private Fixture(
+        Path data, List<StandaloneConfig.Principal> principals, MemoryLimits memoryLimits)
+        throws Exception {
+      this(data, principals, 0, memoryLimits);
+    }
+
+    private Fixture(
+        Path data,
+        List<StandaloneConfig.Principal> principals,
+        long minFreeDiskBytes,
+        MemoryLimits memoryLimits)
+        throws Exception {
       var base = StandaloneConfig.development(data, 0);
       var config =
           new StandaloneConfig(
@@ -1955,7 +2029,9 @@ public class StandaloneJoinsTest {
               base.refreshInterval(),
               base.maxRpcDuration(),
               base.tls(),
-              principals);
+              principals,
+              false,
+              memoryLimits);
       this.runtime = new StandaloneRuntime(config);
       this.server = new StandaloneGrpcServer(this.runtime).start();
       this.channel =
