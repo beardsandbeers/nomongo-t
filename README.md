@@ -8,6 +8,10 @@ Use it for keyword search with mongot's mappings and analyzers, vector similarit
 your own embeddings, or both. Indexes persist on disk. Clients are available for
 [Python, Rust, Java, and TypeScript](clients/README.md).
 
+The 0.11.0 source includes the direct-read cursor fixes from 0.10.0 and adds
+heap-based join memory limits and adaptive ordinal joins. See the
+[join guide](docs/join-design-guide.md#limits-and-errors) for configuration.
+
 Version 0.10.0 adds direct gRPC reads of replicated indexes, standalone SearchMeta,
 schema-preserving index updates, and expanded join and explain support. See the
 [release notes](docs/releases/standalone-0.10.0.md) for upgrade and rollback guidance.
