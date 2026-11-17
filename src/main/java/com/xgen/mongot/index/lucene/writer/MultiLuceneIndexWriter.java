@@ -76,6 +76,17 @@ public class MultiLuceneIndexWriter implements LuceneIndexWriter {
   }
 
   @Override
+  public Runnable prepareSchemaUpdate(
+      org.apache.lucene.analysis.Analyzer analyzer,
+      com.xgen.mongot.index.definition.SearchFieldDefinitionResolver resolver) {
+    var updates =
+        this.indexWriters.stream()
+            .map(writer -> writer.prepareSchemaUpdate(analyzer, resolver))
+            .toList();
+    return () -> updates.forEach(Runnable::run);
+  }
+
+  @Override
   public void deleteDocuments(
       List<byte[]> encodedIds, Runnable check, java.util.function.IntConsumer applied)
       throws IOException {
@@ -89,6 +100,24 @@ public class MultiLuceneIndexWriter implements LuceneIndexWriter {
     }
     for (int i = 0; i < partitions.size(); i++) {
       this.indexWriters.get(i).deleteDocuments(partitions.get(i), check, applied);
+    }
+  }
+
+  @Override
+  public void validateCommittedData() throws IOException {
+    for (var writer : this.indexWriters) {
+      writer.validateCommittedData();
+    }
+  }
+
+  @Override
+  public void copyCommittedData(java.nio.file.Path destination) throws IOException {
+    for (@com.google.errorprone.annotations.Var int partition = 0;
+        partition < this.indexWriters.size();
+        partition++) {
+      this.indexWriters
+          .get(partition)
+          .copyCommittedData(destination.resolve(Integer.toHexString(partition)));
     }
   }
 

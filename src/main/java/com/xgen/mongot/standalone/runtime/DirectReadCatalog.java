@@ -265,6 +265,7 @@ public final class DirectReadCatalog {
                   .setActiveDefinitionBson(encodeDefinition(definition))
                   .setQueryable(ready)
                   .setSourceStatus(status.getStatusCode().name())
+                  .setFailureMessage(status.getMessage().orElse(""))
                   .setLifecycleState(
                       switch (status.getStatusCode()) {
                         case STEADY -> "READY";
@@ -282,18 +283,35 @@ public final class DirectReadCatalog {
         .staged
         .getIndex(id)
         .ifPresent(
-            staged ->
-                result
-                    .setLifecycleState("BUILDING")
-                    .setBuild(
-                        IndexBuild.newBuilder()
-                            .setGenerationId(staged.getGenerationId().uniqueString())
-                            .setVersion(version(staged.getDefinition()))
-                            .setDefinitionBson(encodeDefinition(staged.getDefinition()))
-                            .setState(staged.getIndex().getStatus().getStatusCode().name())));
+            staged -> {
+              var status = staged.getIndex().getStatus();
+              result
+                  .setLifecycleState(
+                      status.getStatusCode() == IndexStatus.StatusCode.FAILED
+                          ? "FAILED"
+                          : "BUILDING")
+                  .setBuild(
+                      IndexBuild.newBuilder()
+                          .setGenerationId(staged.getGenerationId().uniqueString())
+                          .setVersion(version(staged.getDefinition()))
+                          .setDefinitionBson(encodeDefinition(staged.getDefinition()))
+                          .setState(status.getStatusCode().name()));
+              if (status.getStatusCode() == IndexStatus.StatusCode.FAILED) {
+                result.setFailureMessage(status.getMessage().orElse("Index initialization failed"));
+              }
+            });
+    if (standalone) {
+      this.local
+          .migration(id.toHexString())
+          .filter(migration -> !migration.failure().isEmpty())
+          .ifPresent(
+              migration ->
+                  result.setLifecycleState("FAILED").setFailureMessage(migration.failure()));
+    }
     return result.build();
   }
 
+  /** Resolves a query-ready generation, enforcing an optional physical generation fence. */
   public IndexGeneration resolve(String id, String expected) {
     LocalIndexCatalog.validateIndexId(id);
     var key = new ObjectId(id);
@@ -355,6 +373,7 @@ public final class DirectReadCatalog {
     return generation;
   }
 
+  /** Pins the current definition and logical reader while retaining its physical resources. */
   public GenerationReadLeases.Lease acquire(String id, String expected) {
     // Snapshot providers may take the coordinator lock. Never call them under the manager lock.
     IndexGeneration resolved;

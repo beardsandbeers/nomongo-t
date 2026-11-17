@@ -2,11 +2,14 @@ load("//bazel/java:test.bzl", "mongot_java_unit_test_suite")
 
 mongot_java_unit_test_suite(
     name = "lib",
+    timeouts = {"StandaloneIndexUpdatesCrashTest.java": "moderate"},
     deps = [
         "//src/main/java/com/xgen/mongot/catalog",
         "//src/main/java/com/xgen/mongot/config/backup",
         "//src/main/java/com/xgen/mongot/config/manager",
         "//src/main/java/com/xgen/mongot/embedding/config",
+        "//src/main/java/com/xgen/mongot/featureflag",
+        "//src/main/java/com/xgen/mongot/featureflag/dynamic",
         "//src/main/java/com/xgen/mongot/index",
         "//src/main/java/com/xgen/mongot/index/autoembedding",
         "//src/main/java/com/xgen/mongot/index/definition",

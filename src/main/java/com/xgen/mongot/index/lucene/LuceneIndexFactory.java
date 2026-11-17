@@ -70,6 +70,127 @@ import org.slf4j.LoggerFactory;
 import oshi.SystemInfo;
 
 public class LuceneIndexFactory implements IndexFactory {
+  private java.util.function.Predicate<GenerationId> liveSchemas = unused -> false;
+
+  /** Opt-in for API-owned physical indexes; native replicated indexes retain immutable schemas. */
+  public void allowSchemaUpdatesFor(java.util.function.Predicate<GenerationId> owner) {
+    this.liveSchemas = owner;
+  }
+
+  /** Prepares only mapping/analyzer/query objects. Applying requires the owner's mutation gate. */
+  public Runnable prepareSchemaUpdate(InitializedIndex index, SearchIndexDefinition definition)
+      throws InvalidAnalyzerDefinitionException {
+    Check.checkState(
+        this.liveSchemas.test(index.getGenerationId()), "Schema updates require a local owner");
+    var registry =
+        this.analyzerRegistryFactory.create(
+            definition.getAnalyzers(),
+            this.featureFlags.isEnabled(Feature.TRUNCATE_AUTOCOMPLETE_TOKENS));
+    return Check.instanceOf(index, InitializedLuceneSearchIndex.class)
+        .prepareSchemaUpdate(definition, registry);
+  }
+
+  private com.xgen.mongot.util.functionalinterfaces.CheckedConsumer<
+          IndexDefinitionGeneration, IOException>
+      initializationValidator = unused -> {};
+
+  /** Validates externally prepared data before initialization can open or modify its files. */
+  public void validateInitializationsWith(
+      com.xgen.mongot.util.functionalinterfaces.CheckedConsumer<
+              IndexDefinitionGeneration, IOException>
+          validator) {
+    this.initializationValidator = validator;
+  }
+
+  private java.util.function.Predicate<GenerationId> commitNewIndexes = unused -> false;
+
+  /** Makes a new empty push index durable before it becomes ready for schema updates. */
+  public void commitNewIndexesFor(java.util.function.Predicate<GenerationId> predicate) {
+    this.commitNewIndexes = predicate;
+  }
+
+  private com.xgen.mongot.util.functionalinterfaces.CheckedConsumer<
+          IndexDefinitionGeneration, IOException>
+      initializationCompleter = unused -> {};
+  private java.util.function.Consumer<IndexDefinitionGeneration> generationReservation =
+      unused -> {};
+  private java.util.function.Predicate<GenerationId> prohibitEmptyRecovery = unused -> false;
+
+  public void completeNewIndexesWith(
+      com.xgen.mongot.util.functionalinterfaces.CheckedConsumer<
+              IndexDefinitionGeneration, IOException>
+          completer) {
+    this.initializationCompleter = completer;
+  }
+
+  public void reserveGenerationsWith(
+      java.util.function.Consumer<IndexDefinitionGeneration> reservation) {
+    this.generationReservation = reservation;
+  }
+
+  @Override
+  public void generationReserved(IndexDefinitionGeneration generation) {
+    this.generationReservation.accept(generation);
+  }
+
+  public void prohibitEmptyRecoveryFor(java.util.function.Predicate<GenerationId> predicate) {
+    this.prohibitEmptyRecovery = predicate;
+  }
+
+  @Override
+  public boolean prohibitsEmptyRecovery(GenerationId generation) {
+    return this.prohibitEmptyRecovery.test(generation);
+  }
+
+  private InitializedIndex commitEmptyIndexIfNeeded(
+      InitializedIndex index, IndexDefinitionGeneration generation, boolean commit)
+      throws IOException {
+    if (commit) {
+      try {
+        index.getWriter().commit(EncodedUserData.EMPTY);
+        this.initializationCompleter.accept(generation);
+      } catch (IOException | RuntimeException error) {
+        try {
+          index.close();
+        } catch (IOException closeError) {
+          error.addSuppressed(closeError);
+        }
+        throw error;
+      }
+    }
+    return index;
+  }
+
+  private java.util.function.Predicate<GenerationId> requireExistingData = unused -> false;
+  private java.util.function.Function<
+          com.xgen.mongot.index.definition.IndexDefinitionGenerationProducer,
+          Optional<IndexDefinitionGeneration>>
+      preparedGenerations = unused -> Optional.empty();
+
+  public void preparedGenerationsFrom(
+      java.util.function.Function<
+              com.xgen.mongot.index.definition.IndexDefinitionGenerationProducer,
+              Optional<IndexDefinitionGeneration>>
+          provider) {
+    this.preparedGenerations = provider;
+  }
+
+  @Override
+  public Optional<IndexDefinitionGeneration> getPreparedGeneration(
+      com.xgen.mongot.index.definition.IndexDefinitionGenerationProducer producer) {
+    return this.preparedGenerations.apply(producer);
+  }
+
+  /** Configured before lifecycle startup for generations that must never reopen as empty. */
+  public void requireExistingDataFor(java.util.function.Predicate<GenerationId> predicate) {
+    this.requireExistingData = predicate;
+  }
+
+  @Override
+  public boolean requiresExistingData(GenerationId generationId) {
+    return this.requireExistingData.test(generationId);
+  }
+
   private static final Logger LOG = LoggerFactory.getLogger(LuceneIndexFactory.class);
   private static final long CACHE_WARMER_MAX_UPTIME_MINUTES = 30L; // VM likely rebooted
 
@@ -650,6 +771,7 @@ public class LuceneIndexFactory implements IndexFactory {
   public InitializedIndex getInitializedIndex(
       Index index, IndexDefinitionGeneration definitionGeneration, IndexTypeTag indexTypeTag)
       throws IOException {
+    this.initializationValidator.accept(definitionGeneration);
     try {
       FileUtils.mkdirIfNotExist(
           this.indexDirectoryHelper.getIndexMetadataPath(definitionGeneration));
@@ -672,6 +794,15 @@ public class LuceneIndexFactory implements IndexFactory {
             Optional.of(this.cacheWarmerTimer));
     GenerationId generationId = definitionGeneration.getGenerationId();
 
+    if (this.requireExistingData.test(generationId)) {
+      directoryFactory.requireExistingData();
+    }
+
+    if (this.prohibitEmptyRecovery.test(generationId)) {
+      directoryFactory.protectData();
+    }
+    boolean commitEmptyIndex = this.commitNewIndexes.test(generationId);
+
     BooleanSupplier useIdBloomFilter =
         BloomCodecPolicy.getBloomFilterEnabledForIdField(
             this.dynamicFeatureFlagRegistry,
@@ -686,28 +817,37 @@ public class LuceneIndexFactory implements IndexFactory {
         return initializeCustomVectorEngineIndex(index, generationId, directoryFactory);
       }
       var luceneVectorIndex = Check.instanceOf(index, LuceneVectorIndex.class);
-      return InitializedLuceneVectorIndex.create(
-          luceneVectorIndex,
-          generationId,
-          directoryFactory,
-          this.indexDirectoryHelper,
-          luceneIndexSnapshotter,
-          this.featureFlags,
-          this.dynamicFeatureFlagRegistry,
-          useIdBloomFilter,
-          indexTypeTag);
+      return commitEmptyIndexIfNeeded(
+          InitializedLuceneVectorIndex.create(
+              luceneVectorIndex,
+              generationId,
+              directoryFactory,
+              this.indexDirectoryHelper,
+              luceneIndexSnapshotter,
+              this.featureFlags,
+              this.dynamicFeatureFlagRegistry,
+              useIdBloomFilter,
+              indexTypeTag),
+          definitionGeneration,
+          commitEmptyIndex);
     } else {
       var luceneSearchIndex = Check.instanceOf(index, LuceneSearchIndex.class);
-      return InitializedLuceneSearchIndex.create(
-          luceneSearchIndex,
-          generationId,
-          directoryFactory,
-          this.indexDirectoryHelper,
-          luceneIndexSnapshotter,
-          this.featureFlags,
-          this.dynamicFeatureFlagRegistry,
-          useIdBloomFilter,
-          indexTypeTag);
+      if (this.liveSchemas.test(generationId)) {
+        luceneSearchIndex.enableSchemaUpdates();
+      }
+      return commitEmptyIndexIfNeeded(
+          InitializedLuceneSearchIndex.create(
+              luceneSearchIndex,
+              generationId,
+              directoryFactory,
+              this.indexDirectoryHelper,
+              luceneIndexSnapshotter,
+              this.featureFlags,
+              this.dynamicFeatureFlagRegistry,
+              useIdBloomFilter,
+              indexTypeTag),
+          definitionGeneration,
+          commitEmptyIndex);
     }
   }
 

@@ -36,6 +36,12 @@ class StagedIndexesSwapper {
                     return true;
                   }
 
+                  if (configState.indexFactory.requiresExistingData(staged.getGenerationId())
+                      || configState.indexFactory.prohibitsEmptyRecovery(
+                          staged.getGenerationId())) {
+                    return false;
+                  }
+
                   Optional<IndexGeneration> mainIndexOpt =
                       configState.indexCatalog.getIndexById(staged.getDefinition().getIndexId());
 

@@ -15,6 +15,25 @@ public interface IndexFactory extends Closeable {
   Index getIndex(IndexDefinitionGeneration definitionGeneration)
       throws IOException, InvalidAnalyzerDefinitionException;
 
+  /** Optional reserved generation with already prepared content for an accepted definition. */
+  default Optional<IndexDefinitionGeneration> getPreparedGeneration(
+      com.xgen.mongot.index.definition.IndexDefinitionGenerationProducer producer) {
+    return Optional.empty();
+  }
+
+  /** A generation with preserved content must not be recovered by creating an empty attempt. */
+  default boolean requiresExistingData(GenerationId generationId) {
+    return false;
+  }
+
+  /** Persists owner-specific authorization before a newly allocated generation is journaled. */
+  default void generationReserved(IndexDefinitionGeneration generation) {}
+
+  /** Owner-managed data must not be retried as an empty attempt or published before readiness. */
+  default boolean prohibitsEmptyRecovery(GenerationId generationId) {
+    return false;
+  }
+
   /**
    * Creates a new InitializedIndex for the specified index. Can result in errors if index is
    * already initialized.

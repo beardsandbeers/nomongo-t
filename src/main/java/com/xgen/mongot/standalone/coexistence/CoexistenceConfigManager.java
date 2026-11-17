@@ -126,23 +126,36 @@ public final class CoexistenceConfigManager
     return java.util.Collections.unmodifiableMap(copies);
   }
 
+  /** Reconciles remote metadata together with local physical/schema recovery bindings. */
   public synchronized void reconcileLocal() {
-    // Replication updates lastObservedCollectionName in its working definitions. Keep accepted
-    // desired state separate so source observation cannot mutate the snapshot used during outages.
-    var union = new ArrayList<>(snapshot());
-    union.addAll(this.local.definitions());
-    this.delegate.update(
-        union.stream()
-            .filter(VectorIndexDefinition.class::isInstance)
-            .map(VectorIndexDefinition.class::cast)
-            .toList(),
-        union.stream()
-            .filter(SearchIndexDefinition.class::isInstance)
-            .map(SearchIndexDefinition.class::cast)
-            .toList(),
-        this.analyzers,
-        this.collections,
-        this.unreadable);
+    synchronized (this.delegate) {
+      // Replication updates lastObservedCollectionName in its working definitions. Keep accepted
+      // desired state separate so source observation cannot mutate the snapshot used during
+      // outages.
+      var union = new ArrayList<>(snapshot());
+      union.addAll(
+          this.local.reconciliationDefinitions(
+              this.delegate.getLiveIndexes().stream()
+                  .collect(
+                      Collectors.toMap(
+                          index -> index.getIndexId().toHexString(),
+                          java.util.function.Function.identity(),
+                          (first, second) -> {
+                            throw new IllegalStateException("Duplicate physical index identity");
+                          }))));
+      this.delegate.update(
+          union.stream()
+              .filter(VectorIndexDefinition.class::isInstance)
+              .map(VectorIndexDefinition.class::cast)
+              .toList(),
+          union.stream()
+              .filter(SearchIndexDefinition.class::isInstance)
+              .map(SearchIndexDefinition.class::cast)
+              .toList(),
+          this.analyzers,
+          this.collections,
+          this.unreadable);
+    }
   }
 
   private static IndexDefinition copy(IndexDefinition definition) {

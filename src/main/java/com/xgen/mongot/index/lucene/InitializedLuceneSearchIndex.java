@@ -11,7 +11,6 @@ import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
 import com.xgen.mongot.index.EncodedUserData;
 import com.xgen.mongot.index.IndexClosedException;
-import com.xgen.mongot.index.IndexMetricValuesSupplier;
 import com.xgen.mongot.index.IndexMetrics;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.IndexTypeData;
@@ -57,7 +56,13 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
   final LuceneSearchIndex index;
   final List<Directory> directories;
   final IndexWriter writer;
-  final SearchIndexReader reader;
+  volatile SearchIndexReader reader;
+  private java.util.function.BiFunction<
+          SearchIndexDefinition, com.xgen.mongot.index.analyzer.AnalyzerRegistry, Runnable>
+      schemaPreparer =
+          (definition, registry) -> {
+            throw new UnsupportedOperationException("Live schemas are not enabled for this index");
+          };
   final Closeable refresher;
   final ImmutableList<ReferenceManager<?>> searcherManagers;
   final IndexMetricsUpdater indexMetricsUpdater;
@@ -147,6 +152,9 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
           .log("Completed initializing index");
       return ret;
     } catch (Exception e) {
+      if (directoryFactory.protectsData()) {
+        throw e;
+      }
       var isIndexDropped = index.getStatus().isIndexDropped();
       if (!indexDirectoryHelper.attemptToRecoverUnreadableIndex(
           generationId,
@@ -186,6 +194,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
       throws IOException {
     var definition = index.getDefinition();
     var searchIndexProperties = index.getSearchIndexProperties();
+    var liveSchema = index.liveSchema();
     var indexMetricsUpdaterBuilder =
         new IndexMetricsUpdater.Builder(
             index.getDefinition(),
@@ -203,6 +212,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
             searchIndexProperties.tokenFacetingCardinalityLimit,
             indexMetricsUpdaterBuilder.getQueryingMetricsUpdater(),
             dynamicFeatureFlagRegistry);
+    liveSchema.ifPresent(schema -> searcherFactory.useLiveSimilarity(schema.writerSimilarity()));
     // TODO(CLOUDP-250488): Handle subindexes for blobstore upload.
 
     var indexResources =
@@ -224,14 +234,15 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
                     searchIndexProperties.ramBufferSizeMb,
                     searchIndexProperties.fieldLimit,
                     searchIndexProperties.docsLimit,
-                    indexAnalyzer,
+                    liveSchema.map(LiveSearchSchema::writerAnalyzer).orElse(indexAnalyzer),
                     definition.createFieldDefinitionResolver(
                         searchIndexProperties.indexFormatVersion),
                     indexMetricsUpdaterBuilder.getIndexingMetricsUpdater(),
                     luceneIndexSnapshotter.map(
                         snapshotter -> snapshotter.getSnapshotDeletionPolicy(indexPartitionId)),
                     featureFlags,
-                    useIdBloomFilter),
+                    useIdBloomFilter,
+                    liveSchema.map(LiveSearchSchema::writerSimilarity)),
             luceneIndexWriter ->
                 LuceneSearcherManager.create(
                     luceneIndexWriter.getLuceneWriter(),
@@ -278,7 +289,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
                     ? searchIndexProperties.concurrentSearchExecutor
                     : Optional.empty());
 
-    IndexMetricValuesSupplier indexMetricValuesSupplier =
+    LuceneSearchIndexMetricValuesSupplier indexMetricValuesSupplier =
         LuceneSearchIndexMetricValuesSupplier.create(
             index.getStatusRef(),
             searchIndexProperties.indexBackingStrategy,
@@ -311,15 +322,82 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
     Closeable refresher =
         searchIndexProperties.indexBackingStrategy.createIndexRefresher(
             index.getStatusRef(), ImmutableList.copyOf(indexResources.luceneSearcherManagers));
-    return new InitializedLuceneSearchIndex(
-        generationId,
-        index,
-        indexResources.directories,
-        writer,
-        reader,
-        refresher,
-        ImmutableList.copyOf(indexResources.luceneSearcherManagers),
-        indexMetricsUpdater);
+    var initialized =
+        new InitializedLuceneSearchIndex(
+            generationId,
+            index,
+            indexResources.directories,
+            writer,
+            reader,
+            refresher,
+            ImmutableList.copyOf(indexResources.luceneSearcherManagers),
+            indexMetricsUpdater);
+    liveSchema.ifPresent(
+        schema ->
+            initialized.schemaPreparer =
+                (nextDefinition, registry) -> {
+                  var next = schema.prepare(nextDefinition, registry);
+                  var writeUpdate =
+                      indexResources.luceneIndexWriter.prepareSchemaUpdate(
+                          next.analyzer(), next.resolver());
+                  var metricsUpdate =
+                      indexMetricValuesSupplier.prepareSchemaUpdate(
+                          next.resolver(), next.definition().getAnalyzers());
+                  var readers = new ArrayList<LuceneSearchIndexReader>();
+                  for (int partition = 0;
+                      partition < indexResources.luceneSearcherManagers.size();
+                      partition++) {
+                    readers.add(
+                        LuceneSearchIndexReader.create(
+                            indexResources.luceneSearcherManagers.get(partition),
+                            next.definition(),
+                            searchIndexProperties.indexFormatVersion,
+                            next.registry(),
+                            searchIndexProperties.synonymRegistry,
+                            next.analyzer(),
+                            indexMetricsUpdater.getQueryingMetricsUpdater(),
+                            searchIndexProperties.concurrentSearchExecutor,
+                            searchIndexProperties.concurrentVectorRescoringExecutor,
+                            searchIndexProperties.enableTextOperatorNewSynonymsSyntax,
+                            searchIndexProperties.aggregationMaxBuckets,
+                            partition,
+                            featureFlags,
+                            dynamicFeatureFlagRegistry));
+                  }
+                  SearchIndexReader newReader =
+                      readers.size() == 1
+                          ? readers.getFirst()
+                          : new MultiLuceneSearchIndexReader(
+                              readers,
+                              dynamicFeatureFlagRegistry,
+                              featureFlags.isEnabled(Feature.CONCURRENT_INDEX_PARTITION_SEARCH)
+                                  ? searchIndexProperties.concurrentSearchExecutor
+                                  : Optional.empty());
+                  var metered =
+                      new MeteredSearchIndexReader(
+                          newReader,
+                          indexMetricsUpdater.getQueryingMetricsUpdater(),
+                          () ->
+                              dynamicFeatureFlagRegistry.evaluateClusterInvariant(
+                                  DynamicFeatureFlags.ENABLE_TOTAL_FACET_BUCKETS));
+                  return () -> {
+                    writeUpdate.run();
+                    // Old logical readers own no directories/managers. Existing requests retain
+                    // their
+                    // immutable query configuration; their normal reference counting releases
+                    // Lucene readers.
+                    initialized.reader = metered;
+                    schema.publish(next);
+                    metricsUpdate.run();
+                  };
+                });
+    return initialized;
+  }
+
+  Runnable prepareSchemaUpdate(
+      SearchIndexDefinition definition, com.xgen.mongot.index.analyzer.AnalyzerRegistry registry) {
+    ensureOpen("prepareSchemaUpdate");
+    return this.schemaPreparer.apply(definition, registry);
   }
 
   @Override

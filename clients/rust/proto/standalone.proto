@@ -3,8 +3,9 @@ package mongot.standalone.v1;
 option java_multiple_files = true;
 option java_package = "com.xgen.mongot.standalone.grpc";
 
-// Push mode manages indexes only. Mapping updates replace an index with an empty generation;
-// callers must reingest their source content. There is no source document store or replay log.
+// Compatible mapping updates keep the same physical index and generation; schema revision advances.
+// Existing content is retained without backfilling added fields.
+// Other updates rebuild empty unless REQUIRE_PRESERVE is requested. There is no source replay log.
 service CatalogService {
   rpc CreateIndex(CreateIndexRequest) returns (IndexDescription);
   rpc UpdateIndex(UpdateIndexRequest) returns (IndexDescription);
@@ -42,12 +43,18 @@ message UpdateIndexRequest {
   string index_id = 1;
   uint64 expected_revision = 2;
   bytes definition_bson = 3;
+  IndexUpdateMode update_mode = 4;
+}
+enum IndexUpdateMode {
+  INDEX_UPDATE_MODE_AUTO = 0;
+  INDEX_UPDATE_MODE_REQUIRE_PRESERVE = 1;
+  INDEX_UPDATE_MODE_REBUILD_EMPTY = 2;
 }
 message DropIndexRequest { string index_id = 1; uint64 expected_revision = 2; }
 message GetIndexRequest { string index_id = 1; }
 message GetIndexMappingsRequest {
   string index_id = 1;
-  string generation_id = 2; // Optional fence against a schema change.
+  string generation_id = 2; // Optional fence against physical index replacement; compatible schema updates retain it.
 }
 // Search mappings or vector fields from one active generation. Search export refreshes readers.
 // Includes configured fields and observed dynamic types; dynamic is false at every document level.
@@ -253,7 +260,7 @@ enum DocumentWriteConcern {
 message UpsertRequest {
   string index_id = 1;
   repeated bytes documents_bson = 2;
-  string generation_id = 3; // Optional fence against a schema change.
+  string generation_id = 3; // Optional fence against physical index replacement; compatible schema updates retain it.
   // Omitted concern defaults to INDEXED; explicit VISIBLE waits for reader refresh.
   optional DocumentWriteConcern write_concern = 4;
 }

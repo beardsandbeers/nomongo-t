@@ -15,6 +15,7 @@ import com.xgen.mongot.index.definition.VectorIndexDefinition;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.index.version.UserIndexVersion;
 import com.xgen.mongot.metrics.MetricsFactory;
+import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.bson.JsonCodec;
 import io.micrometer.core.instrument.Tags;
 import java.io.IOException;
@@ -413,11 +414,23 @@ class DesiredConfigStateUpdater {
    */
   private IndexDefinitionGeneration newUserVersion(
       IndexDefinitionGenerationProducer generationProducer) {
+    var prepared = this.configState.indexFactory.getPreparedGeneration(generationProducer);
+    if (prepared.isPresent()) {
+      Check.checkState(
+          generationProducer
+              .createIndexDefinitionGeneration(prepared.get().generation())
+              .equals(prepared.get()),
+          "Prepared generation does not match the desired definition");
+      return prepared.get();
+    }
     UserIndexVersion userIndexVersion =
         this.configState.getNewUserIndexVersion(
             generationProducer.getIndexDefinition().getIndexId());
-    return generationProducer.createIndexDefinitionGeneration(
-        generationProducer.getIndexDefinition().newGeneration(userIndexVersion));
+    var generation =
+        generationProducer.createIndexDefinitionGeneration(
+            generationProducer.getIndexDefinition().newGeneration(userIndexVersion));
+    this.configState.indexFactory.generationReserved(generation);
+    return generation;
   }
 
   private void persistCurrentState() throws IOException, Invariants.InvariantException {

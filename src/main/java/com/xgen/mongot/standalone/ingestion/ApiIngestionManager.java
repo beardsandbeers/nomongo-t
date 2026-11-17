@@ -51,30 +51,48 @@ public final class ApiIngestionManager implements ReplicationManager {
     private volatile boolean retired;
     // Serializes explicit/background commits, including multipart writers, without blocking writes.
     private final Object commitLock = new Object();
+    // Compatible schema publication waits only for executing mutation batches. New writes queue
+    // on this fair gate instead of being rejected or waiting for an index-sized copy.
+    private final java.util.concurrent.locks.ReentrantReadWriteLock schemaGate =
+        new java.util.concurrent.locks.ReentrantReadWriteLock(true);
     // Accessed under the ingestion monitor. A completed batch advances the version even on failure.
     private long writeVersion;
     private long committedVersion;
+    private boolean quiescing;
 
     private IndexState(InitializedIndex index) {
       this.index = index;
     }
   }
 
+  private enum LeaseKind {
+    READ,
+    MUTATION,
+    UPDATE
+  }
+
   private static final class Leases {
-    private int count;
-    private final CompletableFuture<Void> drained = new CompletableFuture<>();
+    private int resources;
+    private int mutations;
+    private boolean updateHeld;
+    private final CompletableFuture<Void> resourcesDrained = new CompletableFuture<>();
+    private CompletableFuture<Void> mutationsDrained = CompletableFuture.completedFuture(null);
   }
 
   /** Pins a generation while writes, queries or statistics use its reader/writer resources. */
   public final class IndexLease implements AutoCloseable {
     private final GenerationId generation;
     private final IndexState state;
+    private final Leases group;
+    private final LeaseKind kind;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
         new java.util.concurrent.atomic.AtomicBoolean();
 
-    private IndexLease(GenerationId generation, IndexState state) {
+    private IndexLease(GenerationId generation, IndexState state, Leases group, LeaseKind kind) {
       this.generation = generation;
       this.state = state;
+      this.group = group;
+      this.kind = kind;
     }
 
     public InitializedIndex index() {
@@ -91,39 +109,128 @@ public final class ApiIngestionManager implements ReplicationManager {
       if (!this.closed.compareAndSet(false, true)) {
         return;
       }
-      CompletableFuture<Void> drained;
+      CompletableFuture<Void> mutationDrain;
+      boolean mutationsDone;
+      boolean resourcesDone;
       synchronized (ApiIngestionManager.this) {
-        String id = this.generation.uniqueString();
-        var leases = ApiIngestionManager.this.leases.get(id);
-        leases.count--;
-        if (leases.count != 0) {
-          return;
+        mutationsDone = this.kind == LeaseKind.MUTATION && --this.group.mutations == 0;
+        mutationDrain = this.group.mutationsDrained;
+        if (this.kind == LeaseKind.UPDATE) {
+          this.group.updateHeld = false;
         }
-        ApiIngestionManager.this.leases.remove(id);
-        drained = leases.drained;
+        resourcesDone = --this.group.resources == 0;
+        if (resourcesDone) {
+          ApiIngestionManager.this.leases.remove(this.generation.uniqueString(), this.group);
+        }
       }
-      // Completing this future may close and delete Lucene resources. Never run those lifecycle
-      // continuations while holding the ingestion monitor.
-      drained.complete(null);
+      // Continuations can acquire other locks or retire Lucene resources. Complete outside
+      // the monitor, using the mutation epoch captured before another writer could arrive.
+      if (mutationsDone) {
+        mutationDrain.complete(null);
+      }
+      if (resourcesDone) {
+        this.group.resourcesDrained.complete(null);
+      }
     }
   }
 
   public synchronized IndexLease acquireStatisticsLease(GenerationId generation) {
+    if (!isGenerationReady(generation) || this.indexes.get(generation.uniqueString()).quiescing) {
+      throw Status.UNAVAILABLE
+          .withDescription("Index is not ready for statistics")
+          .asRuntimeException();
+    }
     return acquireQueryLease(generation);
   }
 
-  /** Prevents generation resources from retiring until query readers have drained. */
+  /** Read pins preserve resources but never hold up the migration's mutation barrier. */
   public synchronized IndexLease acquireQueryLease(GenerationId generation) {
-    if (!isGenerationReady(generation)) {
+    if (!isGenerationReady(generation)
+        || this.liveIndexes
+            .getIndexById(generation.indexId)
+            .filter(index -> index.getGenerationId().equals(generation))
+            .isEmpty()) {
       throw Status.UNAVAILABLE.withDescription("Index is not ready").asRuntimeException();
     }
-    return acquireLease(generation);
+    return acquireLease(generation, LeaseKind.READ);
   }
 
-  private IndexLease acquireLease(GenerationId generation) {
+  /** Stops new mutations, retaining old-schema query readiness even after migration failure. */
+  public synchronized CompletableFuture<Void> quiesce(GenerationId generation) {
+    if (!isGenerationReady(generation)) {
+      throw Status.UNAVAILABLE
+          .withDescription("Source generation is not ready")
+          .asRuntimeException();
+    }
+    this.indexes.get(generation.uniqueString()).quiescing = true;
+    var current = this.leases.get(generation.uniqueString());
+    return current == null ? CompletableFuture.completedFuture(null) : current.mutationsDrained;
+  }
+
+  /** Exclusively pins update work once mutations have drained, regardless of active readers. */
+  public synchronized IndexLease acquireUpdateLease(GenerationId generation) {
+    var current = this.leases.get(generation.uniqueString());
+    if (!isGenerationReady(generation)
+        || !this.indexes.get(generation.uniqueString()).quiescing
+        || (current != null && (current.mutations != 0 || current.updateHeld))) {
+      throw Status.UNAVAILABLE
+          .withDescription("Source generation has not drained")
+          .asRuntimeException();
+    }
+    return acquireLease(generation, LeaseKind.UPDATE);
+  }
+
+  /** Checks a committed baseline without flushing pending mutations or holding shared monitors. */
+  public void validateCommittedData(IndexLease lease) throws java.io.IOException {
+    synchronized (lease.state.commitLock) {
+      lease.index().getWriter().validateCommittedData();
+    }
+  }
+
+  /** Caller enters this gate before taking any catalog/config/ingestion monitor. */
+  public <T> T publishSchema(IndexLease lease, Supplier<T> publication) {
+    var gate = lease.state.schemaGate.writeLock();
+    gate.lock();
+    try {
+      if (lease.retired()) {
+        throw Status.UNAVAILABLE
+            .withDescription("Index is retiring or unavailable")
+            .asRuntimeException();
+      }
+      return publication.get();
+    } finally {
+      gate.unlock();
+    }
+  }
+
+  /** Forces every partition, even an empty one, to have a durable commit before copying. */
+  public void commitForUpdate(IndexLease lease) throws java.io.IOException {
+    synchronized (lease.state.commitLock) {
+      lease.index().getWriter().commit(EncodedUserData.EMPTY);
+      synchronized (this) {
+        lease.state.committedVersion = lease.state.writeVersion;
+      }
+    }
+  }
+
+  public void copyCommittedData(IndexLease lease, java.nio.file.Path destination)
+      throws java.io.IOException {
+    synchronized (lease.state.commitLock) {
+      lease.index().getWriter().copyCommittedData(destination);
+    }
+  }
+
+  private IndexLease acquireLease(GenerationId generation, LeaseKind kind) {
     String id = generation.uniqueString();
-    this.leases.computeIfAbsent(id, ignored -> new Leases()).count++;
-    return new IndexLease(generation, this.indexes.get(id));
+    var group = this.leases.computeIfAbsent(id, ignored -> new Leases());
+    group.resources++;
+    if (kind == LeaseKind.MUTATION && group.mutations++ == 0) {
+      group.mutationsDrained = new CompletableFuture<>();
+    }
+    if (kind == LeaseKind.UPDATE) {
+      group.updateHeld = true;
+    }
+    return new IndexLease(generation, this.indexes.get(id), group, kind);
   }
 
   public ApiIngestionManager(
@@ -283,6 +390,8 @@ public final class ApiIngestionManager implements ReplicationManager {
     Supplier<String> work =
         () -> {
           var previous = context.attach();
+          var gate = lease.state.schemaGate.readLock();
+          gate.lock();
           try {
             if (context.isCancelled()) {
               throw Status.CANCELLED.asRuntimeException();
@@ -292,6 +401,7 @@ public final class ApiIngestionManager implements ReplicationManager {
             }
             return operation.apply(lease);
           } finally {
+            gate.unlock();
             context.detach(previous);
           }
         };
@@ -327,12 +437,13 @@ public final class ApiIngestionManager implements ReplicationManager {
           .asRuntimeException();
     }
     if (!isGenerationReady(generation.getGenerationId())
+        || this.indexes.get(id).quiescing
         || generation.getDefinition().getDefinitionVersion().orElse(1L) != desiredRevision) {
       throw Status.UNAVAILABLE
           .withDescription("Index schema is changing or index is unavailable")
           .asRuntimeException();
     }
-    return acquireLease(generation.getGenerationId());
+    return acquireLease(generation.getGenerationId(), LeaseKind.MUTATION);
   }
 
   private String applyBatch(
@@ -423,18 +534,24 @@ public final class ApiIngestionManager implements ReplicationManager {
       throw new IllegalArgumentException("Unknown write concern");
     }
     try (var lease = acquireWriteLease(indexId, revision, requestedGeneration)) {
-      if (Context.current().isCancelled()) {
-        throw Status.CANCELLED.asRuntimeException();
-      }
+      var gate = lease.state.schemaGate.readLock();
+      gate.lock();
       try {
-        if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED) {
-          commit(lease.state);
-        } else if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE) {
-          lease.index().getReader().refresh();
+        if (Context.current().isCancelled()) {
+          throw Status.CANCELLED.asRuntimeException();
         }
-      } catch (java.io.IOException | com.xgen.mongot.index.ReaderClosedException e) {
-        lease.index().setStatus(IndexStatus.failed("Lucene completion failed"));
-        throw Status.UNAVAILABLE.withCause(e).asRuntimeException();
+        try {
+          if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_COMMITTED) {
+            commit(lease.state);
+          } else if (concern == DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE) {
+            lease.index().getReader().refresh();
+          }
+        } catch (java.io.IOException | com.xgen.mongot.index.ReaderClosedException e) {
+          lease.index().setStatus(IndexStatus.failed("Lucene completion failed"));
+          throw Status.UNAVAILABLE.withCause(e).asRuntimeException();
+        }
+      } finally {
+        gate.unlock();
       }
     }
   }
@@ -470,16 +587,22 @@ public final class ApiIngestionManager implements ReplicationManager {
     for (var generation : generations) {
       IndexLease lease;
       synchronized (this) {
-        if (this.stopping || !this.indexes.containsKey(generation.uniqueString())) {
+        if (this.stopping
+            || !this.indexes.containsKey(generation.uniqueString())
+            || this.indexes.get(generation.uniqueString()).quiescing) {
           continue;
         }
-        lease = acquireLease(generation);
+        lease = acquireLease(generation, LeaseKind.MUTATION);
       }
       try (lease) {
+        var gate = lease.state.schemaGate.readLock();
+        gate.lock();
         try {
           commit(lease.state);
         } catch (java.io.IOException e) {
           lease.index().setStatus(IndexStatus.failed("Lucene commit failed"));
+        } finally {
+          gate.unlock();
         }
       }
     }
@@ -493,7 +616,8 @@ public final class ApiIngestionManager implements ReplicationManager {
       state.retired = true;
     }
     var leases = this.leases.get(id);
-    var drained = leases == null ? CompletableFuture.<Void>completedFuture(null) : leases.drained;
+    var drained =
+        leases == null ? CompletableFuture.<Void>completedFuture(null) : leases.resourcesDrained;
     return this.stopping ? CompletableFuture.allOf(drained, this.shutdownFuture) : drained;
   }
 
@@ -529,7 +653,7 @@ public final class ApiIngestionManager implements ReplicationManager {
       drained =
           CompletableFuture.allOf(
               this.leases.values().stream()
-                  .map(leases -> leases.drained)
+                  .map(leases -> leases.resourcesDrained)
                   .toArray(CompletableFuture<?>[]::new));
     }
     // Retirement waits for shutdownFuture, so these generations remain open for the final commit.

@@ -101,6 +101,9 @@ public class LuceneIndexResourcesInitializer {
             singleLuceneIndexWriterCreator.create(
                 directories.get(indexPartitionId), indexPartitionId);
         singleLuceneIndexWriters.add(writer);
+        if (directoryFactory.protectsData() && writer.getInternalWriterData().isCleared()) {
+          throw new IOException("Preserved index contains an interrupted-clear marker");
+        }
       }
       // Handle unclean mongot shutdown.
       if (numPartitions > 1

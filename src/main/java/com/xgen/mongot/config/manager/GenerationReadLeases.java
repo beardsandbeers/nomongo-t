@@ -34,6 +34,7 @@ public final class GenerationReadLeases {
 
   public final class Lease implements AutoCloseable {
     private final InitializedIndex index;
+    private final com.xgen.mongot.index.IndexReader reader;
     private final IndexGeneration generation;
     private final State state;
     private final List<Runnable> callbacks = new ArrayList<>();
@@ -42,11 +43,17 @@ public final class GenerationReadLeases {
     private Lease(IndexGeneration generation, InitializedIndex index, State state) {
       this.generation = generation;
       this.index = index;
+      this.reader = index.getReader();
       this.state = state;
     }
 
     public InitializedIndex index() {
       return this.index;
+    }
+
+    /** Logical reader captured with the definition under the publication monitor. */
+    public com.xgen.mongot.index.IndexReader reader() {
+      return this.reader;
     }
 
     public IndexDefinition definition() {
@@ -109,8 +116,9 @@ public final class GenerationReadLeases {
     if (state.invalidated) {
       throw new IllegalStateException("Direct read generation is retiring");
     }
+    var lease = new Lease(generation, index, state);
     state.readers++;
-    return new Lease(generation, index, state);
+    return lease;
   }
 
   /** Close admission at the catalog transition; callbacks release idle cursors asynchronously. */

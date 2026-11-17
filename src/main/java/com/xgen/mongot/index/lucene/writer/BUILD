@@ -20,6 +20,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/ingestion",
         "//src/main/java/com/xgen/mongot/index/lucene/codec",
         "//src/main/java/com/xgen/mongot/index/lucene/commit",
+        "//src/main/java/com/xgen/mongot/index/lucene/directory",
         "//src/main/java/com/xgen/mongot/index/lucene/document",
         "//src/main/java/com/xgen/mongot/index/lucene/document/builder",
         "//src/main/java/com/xgen/mongot/index/lucene/document/context",

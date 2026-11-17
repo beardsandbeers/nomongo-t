@@ -18,6 +18,8 @@ import org.bson.types.ObjectId;
 
 /** Streams root IDs into bounded native delete batches; ingestion may interleave. */
 final class StandaloneDeleteByQuery {
+  private record ScanSchema(IndexReader reader, long revision) {}
+
   private final StandaloneRuntime runtime;
   private final Semaphore capacity = new Semaphore(1);
   private static final java.util.Set<String> OPERATORS =
@@ -38,6 +40,12 @@ final class StandaloneDeleteByQuery {
 
   StandaloneDeleteByQuery(StandaloneRuntime runtime) {
     this.runtime = runtime;
+  }
+
+  // The captured physical-generation fence still rejects rebuild/drop. Compatible schema changes
+  // do not invalidate a scan's already selected IDs or interrupt its remaining delete batches.
+  private long currentRevision(String indexId) {
+    return this.runtime.catalog().getIndex(indexId).getDesiredRevision();
   }
 
   private static void validateSearch(BsonDocument document) {
@@ -67,14 +75,6 @@ final class StandaloneDeleteByQuery {
     } else if (name.equals("embeddedDocument")) {
       validateSearch(body.getDocument("operator"));
     }
-  }
-
-  private long requireRevision(String indexId, long expected) {
-    long revision = this.runtime.catalog().getIndex(indexId).getDesiredRevision();
-    if (revision != expected) {
-      throw Status.FAILED_PRECONDITION.asRuntimeException();
-    }
-    return revision;
   }
 
   DeleteByQueryResponse execute(DeleteByQueryRequest request) {
@@ -157,7 +157,12 @@ final class StandaloneDeleteByQuery {
       try (lease) {
         var generation = lease.index().getGenerationId();
         String id = generation.uniqueString();
-        long revision = lease.index().getDefinition().getDefinitionVersion().orElse(1L);
+        var scan =
+            ingestion.coordinate(
+                () ->
+                    new ScanSchema(
+                        lease.index().getReader(),
+                        lease.index().getDefinition().getDefinitionVersion().orElse(1L)));
         var context = Context.current();
         Runnable check =
             () -> {
@@ -208,7 +213,7 @@ final class StandaloneDeleteByQuery {
             try {
               ingestion.deleteDocuments(
                   request.getIndexId(),
-                  () -> requireRevision(request.getIndexId(), revision),
+                  () -> currentRevision(request.getIndexId()),
                   id,
                   this.batch,
                   check);
@@ -222,13 +227,10 @@ final class StandaloneDeleteByQuery {
         }
 
         long matched =
-            lease
-                .index()
-                .getReader()
-                .collectDocumentIds(predicate, vector, all, DeleteBatches::new, check);
+            scan.reader().collectDocumentIds(predicate, vector, all, DeleteBatches::new, check);
         ingestion.completeWrite(
             request.getIndexId(),
-            () -> requireRevision(request.getIndexId(), revision),
+            () -> currentRevision(request.getIndexId()),
             id,
             request.getDryRun()
                 ? DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_INDEXED
@@ -236,7 +238,7 @@ final class StandaloneDeleteByQuery {
         return DeleteByQueryResponse.newBuilder()
             .setIndexId(request.getIndexId())
             .setGenerationId(id)
-            .setActiveRevision(revision)
+            .setActiveRevision(scan.revision())
             .setMatchedCount(matched)
             .setProcessedCount(request.getDryRun() ? 0 : matched)
             .setDryRun(request.getDryRun())

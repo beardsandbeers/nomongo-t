@@ -20,6 +20,15 @@ public class LuceneSearcherFactory {
   protected final Optional<Integer> tokenFacetingCardinalityLimit;
   private final IndexMetricsUpdater.QueryingMetricsUpdater queryingMetricsUpdater;
   private final DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry;
+  private Optional<org.apache.lucene.search.similarities.Similarity> liveSimilarity =
+      Optional.empty();
+
+  /**
+   * Set before constructing any searcher managers; existing-field similarities remain immutable.
+   */
+  public void useLiveSimilarity(org.apache.lucene.search.similarities.Similarity similarity) {
+    this.liveSimilarity = Optional.of(similarity);
+  }
 
   public LuceneSearcherFactory(
       IndexDefinition indexDefinition,
@@ -61,7 +70,7 @@ public class LuceneSearcherFactory {
               newReader,
               this.queryCacheProvider,
               previousSearcher,
-              Optional.of(LuceneSimilarity.from(def)),
+              Optional.of(this.liveSimilarity.orElseGet(() -> LuceneSimilarity.from(def))),
               def.isStringFacetsFieldIndexed(),
               this.enableFacetingOverTokenFields,
               this.tokenFacetingCardinalityLimit,

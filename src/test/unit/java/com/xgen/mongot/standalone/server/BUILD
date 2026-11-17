@@ -16,6 +16,7 @@ mongot_java_unit_test_suite(
         "//src/main/java/com/xgen/mongot/index/analyzer/definition",
         "//src/main/java/com/xgen/mongot/index/definition",
         "//src/main/java/com/xgen/mongot/index/lucene/explain/information",
+        "//src/main/java/com/xgen/mongot/index/lucene/field",
         "//src/main/java/com/xgen/mongot/index/lucene/vector",
         "//src/main/java/com/xgen/mongot/index/query",
         "//src/main/java/com/xgen/mongot/index/query/operators",

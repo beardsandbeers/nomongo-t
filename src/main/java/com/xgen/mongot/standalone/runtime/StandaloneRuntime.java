@@ -13,7 +13,6 @@ import com.xgen.mongot.cursor.CursorConfig;
 import com.xgen.mongot.cursor.MongotCursorManagerImpl;
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
-import com.xgen.mongot.index.InitializedSearchIndex;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.SearchIndexReader;
 import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
@@ -40,6 +39,7 @@ import com.xgen.mongot.standalone.grpc.GetIndexMappingsResponse;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
 import com.xgen.mongot.standalone.grpc.ServiceMetric;
 import com.xgen.mongot.standalone.grpc.ServiceStatus;
+import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.ingestion.ApiIngestionManager;
 import com.xgen.mongot.standalone.metrics.StandaloneMetrics;
 import io.grpc.Status;
@@ -106,6 +106,7 @@ public final class StandaloneRuntime implements Closeable {
         definition);
   }
 
+  private final StandaloneIndexUpdates updates;
   private final DefaultConfigManager configManager;
   private final MeterAndFtdcRegistry metrics;
   private final StandaloneMetrics serviceMetrics;
@@ -134,6 +135,7 @@ public final class StandaloneRuntime implements Closeable {
     this.catalog = new LocalIndexCatalog(config.dataPath());
     this.resources.addFirst(this.catalog);
     try {
+      StandaloneIndexUpdates.recover(config.dataPath(), this.catalog);
       var previous =
           ConfigJournalV1.fromFileIfExists(
               config.dataPath().resolve("configJournal.json"), QuarantinePolicy.QUARANTINE);
@@ -172,6 +174,7 @@ public final class StandaloneRuntime implements Closeable {
               Optional.empty(),
               AnalyzerRegistry.factory(),
               diskMonitor);
+      StandaloneIndexUpdates.configureFactory(factory, this.catalog, config.dataPath());
       this.resources.addFirst(factory);
       this.cursors =
           MongotCursorManagerImpl.fromConfig(
@@ -219,6 +222,16 @@ public final class StandaloneRuntime implements Closeable {
           this.catalog.definitions().stream()
               .map(index -> index.getIndexId())
               .collect(Collectors.toSet());
+      var retirements =
+          java.util.concurrent.Executors.newFixedThreadPool(
+              2, Thread.ofPlatform().name("standalone-retirement-", 0).factory());
+      this.resources.addFirst(
+          () -> {
+            retirements.shutdown();
+            if (!retirements.awaitTermination(30, TimeUnit.SECONDS)) {
+              throw new IOException("Standalone retirements did not drain");
+            }
+          });
       this.configManager =
           DefaultConfigManager.initialize(
               this.liveIndexes,
@@ -235,25 +248,26 @@ public final class StandaloneRuntime implements Closeable {
               flags,
               config.dataPath().resolve("dynamicFeatureFlags.json"),
               dynamicFlags);
+      synchronized (this.configManager) {
+        this.configManager.configState.enableDeferredRetirement(retirements);
+      }
       // The config manager now owns these three resources, including their drain/close ordering.
       this.resources.remove(factory);
       this.resources.remove(cursorOwner);
       this.resources.remove(lifecycleOwner);
-      var retirements =
-          java.util.concurrent.Executors.newFixedThreadPool(
-              2, Thread.ofPlatform().name("standalone-retirement-", 0).factory());
-      this.configManager.configState.enableDeferredRetirement(retirements);
-      this.resources.addFirst(
-          () -> {
-            retirements.shutdown();
-            if (!retirements.awaitTermination(30, TimeUnit.SECONDS)) {
-              throw new IOException("Read retirements did not drain");
-            }
-          });
       this.resources.addFirst(this.configManager::close);
       this.reads =
           new DirectReadCatalog(this.catalog, this.configManager, this.liveIndexes, initialized);
       this.reads.observe(this.serviceMetrics);
+      this.updates =
+          new StandaloneIndexUpdates(
+              config,
+              this.catalog,
+              this.liveIndexes,
+              this.ingestion,
+              this.configManager,
+              this.serviceMetrics);
+      this.resources.addFirst(this.updates);
       this.statistics =
           new StandaloneIndexStatistics(this.reads, config.maxRpcDuration(), this.serviceMetrics);
       this.resources.addFirst(this.statistics);
@@ -313,6 +327,10 @@ public final class StandaloneRuntime implements Closeable {
             remoteDefinitions,
             metadataMonitor);
     this.reads.observe(this.serviceMetrics);
+    this.updates =
+        new StandaloneIndexUpdates(
+            config, catalog, indexes, ingestion, manager, this.serviceMetrics);
+    this.resources.addFirst(this.updates);
     this.statistics =
         new StandaloneIndexStatistics(this.reads, config.maxRpcDuration(), this.serviceMetrics);
     this.resources.addFirst(this.statistics);
@@ -350,6 +368,22 @@ public final class StandaloneRuntime implements Closeable {
     return this.catalog;
   }
 
+  public IndexDescription updateIndex(UpdateIndexRequest request) {
+    var result = this.updates.update(request);
+    return result.getDesiredRevision() == request.getExpectedRevision()
+        ? describeIndex(request.getIndexId())
+        : result;
+  }
+
+  StandaloneIndexUpdates updatesForTesting() {
+    return this.updates;
+  }
+
+  /** Publication notifications identify only the retired source generation. */
+  public void onIndexPublication(java.util.function.Consumer<String> listener) {
+    this.updates.onPublication(listener);
+  }
+
   public ApiIngestionManager ingestion() {
     return this.ingestion;
   }
@@ -373,12 +407,12 @@ public final class StandaloneRuntime implements Closeable {
     if (lease.retired()) {
       throw Status.UNAVAILABLE.withDescription("Query generation was retired").asRuntimeException();
     }
-    if (!(lease.index() instanceof InitializedSearchIndex search)) {
+    if (!(lease.reader() instanceof SearchIndexReader reader)) {
       throw Status.INVALID_ARGUMENT
           .withDescription("Query snapshots require search indexes")
           .asRuntimeException();
     }
-    return search.getReader().acquireQuerySnapshot(concurrent);
+    return reader.acquireQuerySnapshot(concurrent);
   }
 
   /** Exports one active generation under a producer-independent resource lease. */
@@ -392,8 +426,7 @@ public final class StandaloneRuntime implements Closeable {
               .setGenerationId(lease.index().getGenerationId().uniqueString())
               .setActiveRevision(this.reads.revision(definition))
               .setActiveVersion(this.reads.version(definition));
-      if (lease.index() instanceof InitializedSearchIndex search) {
-        var reader = search.getReader();
+      if (lease.reader() instanceof SearchIndexReader reader) {
         reader.refresh();
         var mappings =
             LuceneIndexMappingExporter.export(
@@ -455,23 +488,35 @@ public final class StandaloneRuntime implements Closeable {
   }
 
   private void reconcile() throws Exception {
+    this.updates.reconcile();
     if (this.externalReconcile.isPresent()) {
       this.externalReconcile.get().run();
       return;
     }
-    var desired = this.catalog.definitions();
-    this.configManager.update(
-        desired.stream()
-            .filter(VectorIndexDefinition.class::isInstance)
-            .map(VectorIndexDefinition.class::cast)
-            .toList(),
-        desired.stream()
-            .filter(SearchIndexDefinition.class::isInstance)
-            .map(SearchIndexDefinition.class::cast)
-            .toList(),
-        List.of(),
-        Set.of(),
-        Set.of());
+    synchronized (this.configManager) {
+      var desired =
+          this.catalog.reconciliationDefinitions(
+              this.liveIndexes.getIndexes().stream()
+                  .collect(
+                      java.util.stream.Collectors.toMap(
+                          index -> index.getGenerationId().indexId.toHexString(),
+                          com.xgen.mongot.index.IndexGeneration::getDefinition,
+                          (first, second) -> {
+                            throw new IllegalStateException("Duplicate physical index identity");
+                          })));
+      this.configManager.update(
+          desired.stream()
+              .filter(VectorIndexDefinition.class::isInstance)
+              .map(VectorIndexDefinition.class::cast)
+              .toList(),
+          desired.stream()
+              .filter(SearchIndexDefinition.class::isInstance)
+              .map(SearchIndexDefinition.class::cast)
+              .toList(),
+          List.of(),
+          Set.of(),
+          Set.of());
+    }
   }
 
   public boolean managementReady() {

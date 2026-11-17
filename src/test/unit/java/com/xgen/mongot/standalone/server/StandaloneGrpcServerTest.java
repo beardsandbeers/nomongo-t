@@ -12,7 +12,9 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagConfig;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
+import com.xgen.mongot.index.IndexMetricValuesSupplier;
 import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
+import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.vector.Similarity;
 import com.xgen.mongot.index.version.Generation;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
@@ -65,6 +67,280 @@ import org.junit.rules.TemporaryFolder;
 
 public class StandaloneGrpcServerTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  private static void awaitFieldTypeMetrics(
+      IndexMetricValuesSupplier supplier, Map<FieldName.TypeField, Double> expected)
+      throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (!supplier.getNumFieldsPerDatatype().equals(expected) && System.nanoTime() < deadline) {
+      Thread.sleep(20);
+    }
+    assertThat(supplier.getNumFieldsPerDatatype()).isEqualTo(expected);
+  }
+
+  @Test
+  public void mappingUpdate_delayedPublication_preservesNewGenerationCursorAndStatisticsPages()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("delayed-publication", "{mappings:{fields:{title:{type:'string'}}}}");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setBatchSize(1)
+              .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+              .build();
+      var oldCursor = f.queries.search(request);
+
+      var accepted =
+          f.catalog.updateIndex(
+              UpdateIndexRequest.newBuilder()
+                  .setIndexId(id)
+                  .setExpectedRevision(1)
+                  .setUpdateMode(
+                      com.xgen.mongot.standalone.grpc.IndexUpdateMode
+                          .INDEX_UPDATE_MODE_REBUILD_EMPTY)
+                  .setDefinitionBson(
+                      bson("{mappings:{fields:{title:{type:'string'},category:{type:'token'}}}}"))
+                  .build());
+      var ready = f.ready(id, 2);
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var currentCursor = f.queries.search(request);
+      var fields = f.fieldStats(id, 1);
+      String retired = oldCursor.getGenerationId();
+
+      assertThat(retired).isEqualTo(oldCursor.getGenerationId());
+      assertThat(accepted.getGenerationId()).isEqualTo(retired);
+      assertThat(fields.getNextPageToken()).isNotEmpty();
+      f.server.generationRetired(retired);
+
+      assertThat(
+              assertThrows(
+                      StatusRuntimeException.class,
+                      () ->
+                          f.queries.getMore(
+                              GetMoreRequest.newBuilder()
+                                  .setCursorId(oldCursor.getCursorId())
+                                  .build()))
+                  .getStatus()
+                  .getCode())
+          .isEqualTo(Status.Code.NOT_FOUND);
+      var more =
+          f.queries.getMore(
+              GetMoreRequest.newBuilder().setCursorId(currentCursor.getCursorId()).build());
+      assertThat(more.getGenerationId()).isEqualTo(ready.getGenerationId());
+      assertThat(new RawBsonDocument(more.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(
+              f.catalog
+                  .getIndexFieldStats(
+                      GetIndexFieldStatsRequest.newBuilder()
+                          .setIndexId(id)
+                          .setPageSize(1)
+                          .setPageToken(fields.getNextPageToken())
+                          .build())
+                  .getIndexStats()
+                  .getSnapshotId())
+          .isEqualTo(fields.getIndexStats().getSnapshotId());
+    }
+  }
+
+  @Test
+  public void mappingUpdate_inPlace_keepsWriterFilesCursorsAndPublishesNewAnalyzer()
+      throws Exception {
+    String id;
+    String physical;
+    Path root = data();
+    try (var f = new Fixture(root)) {
+      id = f.create("in-place", "{numPartitions:2,mappings:{fields:{title:{type:'string'}}}}");
+      physical = f.ready(id, 1).getGenerationId();
+      f.upsert(id, "{_id:'a',title:'coffee',label:'CAPS Word'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var cursor =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+      assertThat(f.stats(id).getActiveRevision()).isEqualTo(1);
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId());
+          var direct = f.runtime.reads().acquire(id, physical)) {
+        var originalReader = direct.reader();
+        var writer = pin.index().getWriter();
+        var updated =
+            f.catalog.updateIndex(
+                UpdateIndexRequest.newBuilder()
+                    .setIndexId(id)
+                    .setExpectedRevision(1)
+                    .setDefinitionBson(
+                        bson(
+                            "{numPartitions:2,mappings:{fields:{title:{type:'string'},"
+                                + "label:{type:'string',analyzer:'lucene.keyword'},"
+                                + "tag:{type:'token',normalizer:'lowercase'}}}}"))
+                    .build());
+
+        assertThat(updated.getLifecycleState()).isEqualTo("READY");
+        assertThat(updated.getGenerationId()).isEqualTo(physical);
+        assertThat(updated.getActiveRevision()).isEqualTo(2);
+        assertThat(pin.index().getWriter()).isSameInstanceAs(writer);
+        assertThat(pin.retired()).isFalse();
+        assertThat(direct.retired()).isFalse();
+        assertThat(direct.definition().getDefinitionVersion()).hasValue(1L);
+        assertThat(direct.reader()).isSameInstanceAs(originalReader);
+        try (var current = f.runtime.reads().acquire(id, physical)) {
+          assertThat(current.definition().getDefinitionVersion()).hasValue(2L);
+          assertThat(current.reader()).isNotSameInstanceAs(originalReader);
+        }
+        try (var oldSnapshot = f.runtime.acquireQuerySnapshot(direct, false)) {
+          assertThrows(
+              com.xgen.mongot.index.query.InvalidQueryException.class,
+              () -> oldSnapshot.joinFields(com.xgen.mongot.util.FieldPath.parse("tag")));
+        }
+
+        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+            .isEmpty();
+        f.upsert(id, "{_id:'c',title:'coffee',label:'CAPS Word',tag:'UPPER'}");
+        assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+            .hasSize(1);
+        assertThat(f.query(id, "{equals:{path:'tag',value:'upper'}}").getArray("results"))
+            .hasSize(1);
+        assertThat(
+                new RawBsonDocument(
+                        f.queries
+                            .getMore(
+                                GetMoreRequest.newBuilder()
+                                    .setCursorId(cursor.getCursorId())
+                                    .build())
+                            .getBatchBson()
+                            .toByteArray())
+                    .getArray("results"))
+            .hasSize(1);
+        assertThat(
+                f.catalog
+                    .getIndexStats(GetIndexStatsRequest.newBuilder().setIndexId(id).build())
+                    .getActiveRevision())
+            .isEqualTo(2);
+        assertThat(f.stats(id).getDocumentCount()).isEqualTo(3);
+        try (var files = Files.list(root)) {
+          assertThat(
+                  files.filter(path -> path.getFileName().toString().startsWith(id + "_")).toList())
+              .hasSize(1);
+        }
+        assertThat(f.runtime.catalog().migrations()).isEmpty();
+      }
+    }
+    try (var f = new Fixture(root)) {
+      assertThat(f.ready(id, 2).getGenerationId()).isEqualTo(physical);
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+          .hasSize(1);
+      f.upsert(id, "{_id:'d',title:'coffee',label:'CAPS Word'}");
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS Word'}}").getArray("results"))
+          .hasSize(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_customAnalyzerAndMulti_preservesSortedEmbeddedDataAndMatchesFreshIndex()
+      throws Exception {
+    String before =
+        "{storedSource:true,sort:{rank:1},mappings:{fields:{"
+            + "rank:{type:'number'},title:{type:'string'},"
+            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
+    String after =
+        "{storedSource:true,sort:{rank:1},analyzers:[{name:'exact',tokenizer:{type:'keyword'}}],"
+            + "mappings:{fields:{rank:{type:'number'},title:{type:'string',"
+            + "multi:{exact:{type:'string',analyzer:'exact'}}},"
+            + "label:{type:'string',analyzer:'exact',similarity:{type:'boolean'}},"
+            + "items:{type:'embeddedDocuments',fields:{name:{type:'string'}}}}}}";
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.withDefaults().enable(Feature.SORTED_INDEX).build(),
+            DynamicFeatureFlagRegistry.communityDefault())) {
+      String id = f.create("mutable-sorted", before);
+      String fresh = f.create("fresh-sorted", after);
+      String physical = f.ready(id, 1).getGenerationId();
+      String old = "{_id:'a',rank:2,title:'Old',items:[{name:'retained'}]}";
+      f.upsert(id, old);
+      f.upsert(fresh, old);
+
+      var updated =
+          f.catalog.updateIndex(
+              UpdateIndexRequest.newBuilder()
+                  .setIndexId(id)
+                  .setExpectedRevision(1)
+                  .setDefinitionBson(bson(after))
+                  .build());
+      String added = "{_id:'b',rank:1,title:'CAPS Word',label:'CAPS Word',items:[{name:'added'}]}";
+      f.upsert(id, added);
+      f.upsert(fresh, added);
+
+      assertThat(updated.getGenerationId()).isEqualTo(physical);
+      String labelQuery = "{text:{path:'label',query:'CAPS Word'},returnStoredSource:true}";
+      assertThat(f.query(id, labelQuery).getArray("results"))
+          .isEqualTo(f.query(fresh, labelQuery).getArray("results"));
+      assertThat(f.query(id, "{text:{path:'label',query:'CAPS'}}").getArray("results")).isEmpty();
+      assertThat(
+              f.query(id, "{text:{path:{value:'title',multi:'exact'},query:'CAPS Word'}}")
+                  .getArray("results"))
+          .hasSize(1);
+      assertThat(
+              f.query(
+                      id,
+                      "{embeddedDocument:{path:'items',operator:{"
+                          + "text:{path:'items.name',query:'retained'}}}}")
+                  .getArray("results"))
+          .hasSize(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_queryAnalyzer_refreshesFieldTypeMetricsWithoutRestart()
+      throws Exception {
+    var flags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            flags)) {
+      String id = f.create("field-counts", "{mappings:{fields:{title:{type:'string'}}}}");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      // Populate the old-schema cache after visibility, rather than sampling the empty index.
+      flags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.NUM_FIELDS_PER_DATATYPE_METRIC)));
+      var generation =
+          f.runtime.liveIndexes().getIndexById(new org.bson.types.ObjectId(id)).orElseThrow();
+      try (var pin = f.runtime.ingestion().acquireQueryLease(generation.getGenerationId())) {
+        var supplier = pin.index().getMetricsUpdater().getIndexMetricValuesSupplier();
+        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.STRING, 1.0));
+
+        var updated =
+            f.catalog.updateIndex(
+                UpdateIndexRequest.newBuilder()
+                    .setIndexId(id)
+                    .setExpectedRevision(1)
+                    .setDefinitionBson(
+                        bson(
+                            "{analyzers:[{name:'edge',tokenizer:{type:'edgeGram',"
+                                + "minGram:2,maxGram:15}}],mappings:{fields:{"
+                                + "title:{type:'string',searchAnalyzer:'edge'}}}}"))
+                    .build());
+
+        assertThat(updated.getGenerationId())
+            .isEqualTo(generation.getGenerationId().uniqueString());
+        assertThat(updated.getActiveRevision()).isEqualTo(2);
+        awaitFieldTypeMetrics(supplier, Map.of(FieldName.TypeField.AUTOCOMPLETE, 1.0));
+      }
+    }
+  }
 
   @Test
   public void vectorSearch_autoNumCandidatesDisabled_requiresExplicitCandidates() throws Exception {
@@ -1161,6 +1437,173 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void mappingUpdate_additiveFields_preservesContentAndDeletionsAcrossRestart()
+      throws Exception {
+    Path directory = data();
+    String id;
+    String next =
+        "{numPartitions:2,storedSource:true,mappings:{dynamic:false,fields:"
+            + "{title:{type:'string'},category:{type:'token'}}}}";
+    try (var f = new Fixture(directory)) {
+      id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("preserved")
+                      .setType(IndexType.INDEX_TYPE_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{numPartitions:2,storedSource:true,mappings:{dynamic:false,fields:"
+                                  + "{title:{type:'string'}}}}"))
+                      .build())
+              .getIndexId();
+      String previous = f.ready(id, 1).getGenerationId();
+      f.upsert(id, "{_id:'a',title:'coffee',category:'books'}");
+      f.upsert(id, "{_id:'b',title:'coffee',category:'books'}");
+      f.docs.delete(
+          DeleteRequest.newBuilder()
+              .setIndexId(id)
+              .addIdsBson(bson("{_id:'b'}"))
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .build());
+
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(id)
+              .setExpectedRevision(1)
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode
+                      .INDEX_UPDATE_MODE_REQUIRE_PRESERVE)
+              .setDefinitionBson(bson(next))
+              .build());
+      var changed = f.ready(id, 2);
+
+      assertThat(changed.getGenerationId()).isEqualTo(previous);
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(1);
+      assertThat(f.query(id, "{equals:{path:'category',value:'books'}}").getArray("results"))
+          .isEmpty();
+      assertThat(
+              f.query(id, "{text:{path:'title',query:'coffee'},returnStoredSource:true}")
+                  .getArray("results")
+                  .getFirst()
+                  .asDocument()
+                  .getDocument("storedSource")
+                  .getString("category")
+                  .getValue())
+          .isEqualTo("books");
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .setGenerationId(previous)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .addDocumentsBson(bson("{_id:'a',title:'coffee',category:'books'}"))
+              .build());
+      f.upsert(id, "{_id:'a',title:'coffee',category:'books'}");
+      assertThat(f.query(id, "{equals:{path:'category',value:'books'}}").getArray("results"))
+          .hasSize(1);
+    }
+
+    try (var f = new Fixture(directory)) {
+      f.ready(id, 2);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(1);
+      assertThat(f.query(id, "{equals:{path:'category',value:'books'}}").getArray("results"))
+          .hasSize(1);
+      f.upsert(id, "{_id:'c',title:'coffee',category:'books'}");
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_identicalDefinition_retainsRevisionGenerationAndCursor()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("no-op");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      f.upsert(id, "{_id:'b',title:'coffee'}");
+      var original = f.ready(id, 1);
+      var cursor =
+          f.queries.search(
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(1)
+                  .setQueryBson(bson("{text:{path:'title',query:'coffee'}}"))
+                  .build());
+
+      var result =
+          f.catalog.updateIndex(
+              UpdateIndexRequest.newBuilder()
+                  .setIndexId(id)
+                  .setExpectedRevision(1)
+                  .setDefinitionBson(original.getDesiredDefinitionBson())
+                  .build());
+
+      assertThat(result.getDesiredRevision()).isEqualTo(1);
+      assertThat(result.getGenerationId()).isEqualTo(original.getGenerationId());
+      assertThat(
+              new RawBsonDocument(
+                      f.queries
+                          .getMore(
+                              GetMoreRequest.newBuilder().setCursorId(cursor.getCursorId()).build())
+                          .getBatchBson()
+                          .toByteArray())
+                  .getArray("results"))
+          .hasSize(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(2);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_queryAnalyzer_changesMatchingWithoutReindexing() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("query-analysis");
+      f.upsert(id, "{_id:'a',title:'Coffee'}");
+      assertThat(f.results(id, "COFFEE").getArray("results")).hasSize(1);
+
+      f.catalog.updateIndex(
+          UpdateIndexRequest.newBuilder()
+              .setIndexId(id)
+              .setExpectedRevision(1)
+              .setDefinitionBson(bson("{mappings:{dynamic:true},searchAnalyzer:'lucene.keyword'}"))
+              .build());
+      f.ready(id, 2);
+
+      assertThat(f.results(id, "COFFEE").getArray("results")).isEmpty();
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(1);
+      assertThat(f.stats(id).getDocumentCount()).isEqualTo(1);
+    }
+  }
+
+  @Test
+  public void mappingUpdate_requirePreserve_rejectsIncompatibleDefinitionWithoutMutation()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String id = f.create("reject-change");
+      f.upsert(id, "{_id:'a',title:'coffee'}");
+      var original = f.ready(id, 1);
+
+      var error =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.catalog.updateIndex(
+                      UpdateIndexRequest.newBuilder()
+                          .setIndexId(id)
+                          .setExpectedRevision(1)
+                          .setUpdateMode(
+                              com.xgen.mongot.standalone.grpc.IndexUpdateMode
+                                  .INDEX_UPDATE_MODE_REQUIRE_PRESERVE)
+                          .setDefinitionBson(
+                              bson("{mappings:{dynamic:true},analyzer:'lucene.keyword'}"))
+                          .build()));
+
+      assertThat(error.getStatus().getCode()).isEqualTo(Status.Code.FAILED_PRECONDITION);
+      assertThat(f.ready(id, 1).getGenerationId()).isEqualTo(original.getGenerationId());
+      assertThat(f.results(id, "coffee").getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
   public void search_queryPlanner_returnsPlanWithoutHitsOrCursor() throws Exception {
     try (var f = new Fixture(data())) {
       String id = f.create("explain-plan");
@@ -1685,6 +2128,8 @@ public class StandaloneGrpcServerTest {
       String old = f.ready(id, 1).getGenerationId();
       f.catalog.updateIndex(
           UpdateIndexRequest.newBuilder()
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
               .setIndexId(id)
               .setExpectedRevision(1)
               .setDefinitionBson(bson("{mappings:{dynamic:true}}"))
@@ -2795,6 +3240,8 @@ public class StandaloneGrpcServerTest {
       String oldGeneration = f.ready(id, 1).getGenerationId();
       f.catalog.updateIndex(
           UpdateIndexRequest.newBuilder()
+              .setUpdateMode(
+                  com.xgen.mongot.standalone.grpc.IndexUpdateMode.INDEX_UPDATE_MODE_REBUILD_EMPTY)
               .setIndexId(id)
               .setExpectedRevision(1)
               .setDefinitionBson(

@@ -106,7 +106,6 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
   QueryResponse query(QueryRequest request, boolean vector) {
     StandaloneAuthInterceptor.requireIndex(request.getIndexId());
     var generation = this.runtime.reads().resolve(request.getIndexId(), request.getGenerationId());
-    var definition = generation.getDefinition();
     String generationId = generation.getGenerationId().uniqueString();
     if (!request.getGenerationId().isEmpty() && !generationId.equals(request.getGenerationId())) {
       throw Status.FAILED_PRECONDITION
@@ -129,6 +128,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
     try (var unused =
         Explain.setup(verbosity, Optional.of(generation.getDefinition().getNumPartitions()))) {
       readLease = this.runtime.reads().acquire(generation.getGenerationId());
+      var definition = readLease.definition();
       Explain.getQueryInfo()
           .map(
               info ->
@@ -145,7 +145,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
             .asRuntimeException();
       }
       expression.put("index", new org.bson.BsonString(definition.getName()));
-      CursorQuery query;
+      @Var CursorQuery query;
       if (vector) {
         rejectUnusedBindings(request);
         var parsed = VectorSearchQuery.fromBson(expression);
@@ -157,7 +157,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                             + Math.max(0, value.timeRemaining(TimeUnit.MILLISECONDS)));
         query =
             new CursorQuery.Vector(
-                this.runtime.materializeVectorQuery(parsed, generation.getDefinition()),
+                this.runtime.materializeVectorQuery(parsed, definition),
                 QueryExecutionContext.withDeadline(deadline));
       } else {
         @Var
@@ -167,7 +167,7 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
                 QueryOptimizationFlags.DEFAULT_OPTIONS,
                 this.runtime.searchQueryParseOptions());
         this.runtime.validateSearchQuery(parsed);
-        parsed = this.runtime.materializeSearchQuery(parsed, generation.getDefinition());
+        parsed = this.runtime.materializeSearchQuery(parsed, definition);
         if (StandaloneJoinPlanner.containsJoin(StandaloneJoinPlanner.operator(parsed))) {
           joinPlan =
               this.joinPlanner.prepare(
@@ -183,15 +183,25 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
             .withDescription("Query generation was retired")
             .asRuntimeException();
       }
-      var cursor =
-          this.runtime
-              .cursors()
-              .newCursor(
-                  generation.getGenerationId(),
-                  query,
-                  new QueryCursorOptions(Optional.empty(), Optional.of(size), false),
-                  QueryOptimizationFlags.DEFAULT_OPTIONS);
-      cursorId = cursor.cursorId;
+      com.xgen.mongot.cursor.SearchCursorInfo cursor;
+      try (var snapshot =
+          query instanceof CursorQuery.Search search && search.snapshot().isEmpty()
+              ? this.runtime.acquireQuerySnapshot(
+                  readLease, ((SearchQuery) search.query()).concurrent())
+              : null) {
+        if (snapshot != null) {
+          query = new CursorQuery.Search(query.getQuery(), Optional.of(snapshot));
+        }
+        cursor =
+            this.runtime
+                .cursors()
+                .newCursor(
+                    generation.getGenerationId(),
+                    query,
+                    new QueryCursorOptions(Optional.empty(), Optional.of(size), false),
+                    QueryOptimizationFlags.DEFAULT_OPTIONS);
+        cursorId = cursor.cursorId;
+      }
       if (joinPlan != null) {
         joinPlan.verifyDependencies();
       }
@@ -389,6 +399,18 @@ final class StandaloneQueryService extends QueryServiceGrpc.QueryServiceImplBase
         (id, lease) -> {
           if (lease.index.equals(indexId)
               || lease.joinPlan.map(plan -> plan.dependsOn(indexId)).orElse(false)) {
+            synchronized (lease) {
+              release(id, lease);
+            }
+          }
+        });
+  }
+
+  void generationRetired(String generation) {
+    this.leases.forEach(
+        (id, lease) -> {
+          if (lease.generation.equals(generation)
+              || lease.joinPlan.map(plan -> plan.dependsOnGeneration(generation)).orElse(false)) {
             synchronized (lease) {
               release(id, lease);
             }

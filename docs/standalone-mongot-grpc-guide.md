@@ -17,7 +17,9 @@ these are implementation metadata derived from index identity, with no public co
 `StandaloneRuntime` composes the existing Lucene factory, configuration manager, lifecycle,
 initialized/live index catalogs and cursor manager. `ApiIngestionManager` implements the lifecycle's
 replication interface as a push writer, with no MongoDB sync source. Lifecycle registration marks
-an initialized index ready. API writes validate the batch and apply ordinary update/delete events
+an initialized index ready only after all local partitions have durable commits and catalog-v4
+initialization authorization has been revoked. Existing data reopens strictly; missing commits
+fail the affected local generation without automatic empty recovery. API writes validate the batch and apply ordinary update/delete events
 through the current writer's BSON mapping pipeline. Index retirement and mapping changes coordinate
 with writes so a closed writer is never used.
 
@@ -25,10 +27,17 @@ Concurrent batches use the existing thread-safe Lucene writers through the bound
 (up to eight workers, bounded further by `maxInFlightRequests`). Documents in one batch execute
 in order; batches can interleave, even for the same index. Callers must serialize writes and
 retries affecting the same IDs when ordering matters. No extra indexing thread pool is created.
-Generation leases keep readers and writers open until active writes, commits and statistics drain.
-A mapping change or drop can retire a generation while an already admitted batch finishes against
-that generation; it does not redirect the batch into a new generation. Shutdown drains active
-operations and commits before permitting physical close.
+A fair per-index read/write gate gives each executing mutation batch one ingestion schema.
+Compatible schema publication briefly takes its exclusive side after preparing the new analyzers,
+resolvers, and query readers. Queued writes wait and then use the new schema; read pins and cursors
+do not delay publication. The physical writer and searcher managers remain open. The shared
+configuration journal replaces only the schema attached to the same physical generation.
+
+Typed generation leases pin resources until operations finish. Physical rebuilds and drops can
+retire a generation while an admitted batch finishes against it; such a batch is not redirected
+into the replacement. Drop and shutdown wait for every resource pin. Shutdown drains active
+operations and commits before permitting physical close. Legacy pending copy migrations retain
+their existing mutation-drain and recovery protocol.
 
 Omitted write concern defaults to `INDEXED`: completion means applied to the writer without waiting
 for refresh or commit. Explicit `VISIBLE` waits for reader refresh; `COMMITTED` waits for a durable
@@ -48,10 +57,13 @@ ordinary reader refresh operate independently. Graceful shutdown commits pending
 physical indexes close. There is no separate durable acceptance boundary, source document store,
 mutation log, sequence watermark, snapshot builder, retention pin or persisted retry result.
 
-Mapping updates create an empty generation and switch to it once initialized. The caller reingests
-content. New indexes are empty regardless of content in other indexes. Drop removes index metadata
-and schedules physical Lucene cleanup. Source ownership, replay, retry ordering and ingestion into
-multiple indexes belong to the caller.
+Compatible mapping updates change ingestion and query schemas on the same physical generation.
+Existing documents keep their old indexed fields; added fields apply to future writes and explicit
+re-upserts. Existing cursors retain their query views. Schema publication is not a document refresh
+or commit barrier. Equivalent definitions retain their revision and generation.
+Use `INDEX_UPDATE_MODE_REQUIRE_PRESERVE` to reject incompatible updates and
+`INDEX_UPDATE_MODE_REBUILD_EMPTY` for an explicit reset. Default `AUTO` updates still rebuild empty
+for incompatible changes. See the [update contract](standalone-mongot.md#mapping-changes-and-index-lifecycle).
 
 The dedicated bounded gRPC dispatcher, TLS/bearer interceptor and index grants remain. Query
 execution uses the existing readers and cursors. Source fields are returned only when the index

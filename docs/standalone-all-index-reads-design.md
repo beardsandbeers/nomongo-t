@@ -393,6 +393,13 @@ queries retain their current path. Native-supported auto-embedding and nested in
 be covered before claiming this extension serves all queryable index variants; merely listing
 them while rejecting every query is not completion.
 
+Compatible standalone schema updates keep the physical generation and existing direct cursors.
+A direct lease captures the immutable definition and logical reader together under the config
+manager monitor. Queries, join snapshots, mapping exports, and statistics use that captured reader;
+new leases observe the newly published schema. Rebuilds and drops invalidate leases and defer
+physical retirement until those leases drain. Statistics caches additionally key by schema revision,
+and collectors discard results if their captured revision is replaced during collection.
+
 Statistics use the same active-generation selection and capability adapters. Preserve the existing
 storage ledger, snapshot timestamps, cache bounds, and distinction between measured, estimated,
 and unavailable costs. A native reader that cannot supply one field measurement should report it

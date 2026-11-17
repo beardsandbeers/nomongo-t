@@ -168,6 +168,17 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
     return this.reads.resolve(index, requestedGeneration);
   }
 
+  private static String schemaKey(IndexGeneration generation) {
+    return generation.getGenerationId().uniqueString()
+        + "@"
+        + generation.getDefinition().getDefinitionVersion().orElse(1L);
+  }
+
+  private static String physicalKey(String key) {
+    int schema = key.indexOf('@');
+    return schema < 0 ? key : key.substring(0, schema);
+  }
+
   public CompletableFuture<IndexStats> summary(GetIndexStatsRequest request) {
     return summary(request, this.ticker.getAsLong());
   }
@@ -177,9 +188,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
     Job job;
     synchronized (this) {
       checkOpen();
-      var slot =
-          this.slots.computeIfAbsent(
-              generation.getGenerationId().uniqueString(), unused -> new Slot());
+      var slot = this.slots.computeIfAbsent(schemaKey(generation), unused -> new Slot());
       if (!request.getRefresh()
           && slot.summary != null
           && requestedAt - slot.sampledAt < SUMMARY_TTL_NANOS) {
@@ -276,8 +285,9 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
         }
         return page(retained, principal, selected, size, page.offset(), false);
       }
-      var slot = this.slots.computeIfAbsent(id, unused -> new Slot());
-      var retained = find(id, selected);
+      var slot = this.slots.computeIfAbsent(schemaKey(generation), unused -> new Slot());
+      var retained =
+          find(id, generation.getDefinition().getDefinitionVersion().orElse(1L), selected);
       long now = this.ticker.getAsLong();
       if (slot.fieldFailure != null
           && slot.failedPaths.equals(selected)
@@ -314,12 +324,13 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
     return measured.isEmpty() || (!requested.isEmpty() && measured.containsAll(requested));
   }
 
-  private @Nullable Retained find(String generation, List<String> paths) {
+  private @Nullable Retained find(String generation, long revision, List<String> paths) {
     var found =
         this.snapshots.values().stream()
             .filter(
                 value ->
                     value.response().getIndexStats().getGenerationId().equals(generation)
+                        && value.response().getIndexStats().getActiveRevision() == revision
                         && covers(value.paths(), paths))
             .max(java.util.Comparator.comparingLong(Retained::sampledAt))
             .orElse(null);
@@ -440,7 +451,17 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
           || this.cancelled.get()
           || StandaloneIndexStatistics.this.ticker.getAsLong() - this.deadline >= 0
           || !StandaloneIndexStatistics.this.reads.isGenerationReady(
-              this.generation.getGenerationId());
+              this.generation.getGenerationId())
+          || StandaloneIndexStatistics.this
+              .reads
+              .liveIndexes()
+              .getIndexById(this.generation.getGenerationId().indexId)
+              .filter(
+                  current ->
+                      current
+                          .getDefinitionGeneration()
+                          .equals(this.generation.getDefinitionGeneration()))
+              .isEmpty();
     }
 
     private Capture capture() {
@@ -457,8 +478,8 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
         lease.onInvalidated(() -> this.cancelled.set(true));
         try {
           var index = lease.index();
-          index.getReader().refresh();
-          var readers = index.getReader().acquireStatisticsSnapshot();
+          lease.reader().refresh();
+          var readers = lease.reader().acquireStatisticsSnapshot();
           try {
             var writerHeap = index.getWriter().getBufferHeapBytes();
             this.capturedAt = StandaloneIndexStatistics.this.ticker.getAsLong();
@@ -544,10 +565,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
       }
       synchronized (StandaloneIndexStatistics.this) {
         this.slot.job = null;
-        if (!this.cancelled.get()
-            && !StandaloneIndexStatistics.this.closed
-            && StandaloneIndexStatistics.this.reads.isGenerationReady(
-                this.generation.getGenerationId())) {
+        if (!this.cancelled.get() && !StandaloneIndexStatistics.this.closed && !stopped()) {
           if (summary != null) {
             this.slot.summary = summary;
             this.slot.sampledAt = this.capturedAt;
@@ -663,11 +681,20 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
 
   /** Cancels work and releases cached results for a retired or replaced index. */
   public synchronized void invalidate(String index) {
+    invalidateMatching(generation -> generation.startsWith(index + "-"));
+  }
+
+  /** A delayed publication must not cancel work or expire pages for a newer generation. */
+  public synchronized void invalidateGeneration(String generation) {
+    invalidateMatching(generation::equals);
+  }
+
+  private void invalidateMatching(java.util.function.Predicate<String> matches) {
     this.slots
         .entrySet()
         .removeIf(
             entry -> {
-              if (entry.getKey().startsWith(index + "-")) {
+              if (matches.test(physicalKey(entry.getKey()))) {
                 if (entry.getValue().job != null) {
                   cancel(entry.getValue().job);
                 }
@@ -678,12 +705,12 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
     var iterator = this.snapshots.values().iterator();
     while (iterator.hasNext()) {
       var value = iterator.next();
-      if (value.response().getIndexStats().getIndexId().equals(index)) {
+      if (matches.test(value.response().getIndexStats().getGenerationId())) {
         this.cachedBytes -= value.weight();
         iterator.remove();
       }
     }
-    this.pages.values().removeIf(page -> page.index().equals(index));
+    this.pages.values().removeIf(page -> matches.test(page.generation()));
   }
 
   private void cancel(Job job) {
