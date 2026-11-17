@@ -19,7 +19,7 @@ per-call deadlines, BSON helpers and all current RPCs. No automatic retries are 
 ## Python
 
 ```sh
-python3 -m pip install mongot-standalone-client==0.9.0
+python3 -m pip install mongot-standalone-client==0.10.0
 ```
 
 ```python
@@ -411,7 +411,7 @@ live replication suite on Linux with existing Docker images:
 ```sh
 clients/python/.venv/bin/python clients/tests/all_index_reads.py \
   --package /absolute/path/to/extracted/package \
-  --runtime-image mybyte/nomongo-t:0.9.0 \
+  --runtime-image mybyte/nomongo-t:0.10.0 \
   --mongodb-image mongo:8.3.17-noble \
   --output /tmp/all-index-read-results
 ```
