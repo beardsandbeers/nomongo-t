@@ -222,21 +222,61 @@ class IndexVersion(_message.Message):
     ) -> None: ...
 
 class IndexBuild(_message.Message):
-    __slots__ = ("generation_id", "version", "state", "definition_bson")
+    __slots__ = ("generation_id", "version", "state", "definition_bson", "progress", "message")
     GENERATION_ID_FIELD_NUMBER: _ClassVar[int]
     VERSION_FIELD_NUMBER: _ClassVar[int]
     STATE_FIELD_NUMBER: _ClassVar[int]
     DEFINITION_BSON_FIELD_NUMBER: _ClassVar[int]
+    PROGRESS_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
     generation_id: str
     version: IndexVersion
     state: str
     definition_bson: bytes
+    progress: IndexBuildProgress
+    message: str
     def __init__(
         self,
         generation_id: _Optional[str] = ...,
         version: _Optional[_Union[IndexVersion, _Mapping]] = ...,
         state: _Optional[str] = ...,
         definition_bson: _Optional[bytes] = ...,
+        progress: _Optional[_Union[IndexBuildProgress, _Mapping]] = ...,
+        message: _Optional[str] = ...,
+    ) -> None: ...
+
+class IndexBuildProgress(_message.Message):
+    __slots__ = ("phase", "collection_scan_documents", "collection_scan_bytes")
+    class Phase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+        __slots__ = ()
+        PHASE_UNSPECIFIED: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_PENDING: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_INITIALIZING: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_INITIAL_SYNC: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_SCANNING_COLLECTION: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_CATCHING_UP: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_COMMITTING: _ClassVar[IndexBuildProgress.Phase]
+        PHASE_PUBLISHING: _ClassVar[IndexBuildProgress.Phase]
+
+    PHASE_UNSPECIFIED: IndexBuildProgress.Phase
+    PHASE_PENDING: IndexBuildProgress.Phase
+    PHASE_INITIALIZING: IndexBuildProgress.Phase
+    PHASE_INITIAL_SYNC: IndexBuildProgress.Phase
+    PHASE_SCANNING_COLLECTION: IndexBuildProgress.Phase
+    PHASE_CATCHING_UP: IndexBuildProgress.Phase
+    PHASE_COMMITTING: IndexBuildProgress.Phase
+    PHASE_PUBLISHING: IndexBuildProgress.Phase
+    PHASE_FIELD_NUMBER: _ClassVar[int]
+    COLLECTION_SCAN_DOCUMENTS_FIELD_NUMBER: _ClassVar[int]
+    COLLECTION_SCAN_BYTES_FIELD_NUMBER: _ClassVar[int]
+    phase: IndexBuildProgress.Phase
+    collection_scan_documents: int
+    collection_scan_bytes: int
+    def __init__(
+        self,
+        phase: _Optional[_Union[IndexBuildProgress.Phase, str]] = ...,
+        collection_scan_documents: _Optional[int] = ...,
+        collection_scan_bytes: _Optional[int] = ...,
     ) -> None: ...
 
 class JoinIndexBinding(_message.Message):

@@ -1731,6 +1731,51 @@ public class IndexMetricsUpdater implements Closeable {
       private final Timer collScanBatchGetMoreTimer;
       private final Timer changeStreamBatchGetMoreTimer;
       private final Counter totalApplicableBytes;
+      private volatile Optional<BuildProgress> buildProgress = Optional.empty();
+
+      /** Tracks one initial sync attempt across scan windows and concurrent partitions. */
+      public static class BuildProgress {
+        public enum Phase {
+          PREPARING,
+          SCANNING_COLLECTION,
+          CATCHING_UP,
+          COMMITTING
+        }
+
+        public record Snapshot(
+            Phase phase, long collectionScanDocuments, long collectionScanBytes) {}
+
+        private final AtomicReference<Snapshot> current =
+            new AtomicReference<>(new Snapshot(Phase.PREPARING, 0, 0));
+
+        public void setPhase(Phase phase) {
+          this.current.updateAndGet(
+              value ->
+                  new Snapshot(
+                      phase, value.collectionScanDocuments(), value.collectionScanBytes()));
+        }
+
+        public void recordBatch(long documents, long bytes) {
+          this.current.updateAndGet(
+              value ->
+                  new Snapshot(
+                      value.phase(),
+                      value.collectionScanDocuments() + documents,
+                      value.collectionScanBytes() + bytes));
+        }
+
+        public Snapshot snapshot() {
+          return this.current.get();
+        }
+      }
+
+      public void setBuildProgress(Optional<BuildProgress> progress) {
+        this.buildProgress = progress;
+      }
+
+      public Optional<BuildProgress.Snapshot> getBuildProgress() {
+        return this.buildProgress.map(BuildProgress::snapshot);
+      }
 
       InitialSyncMetrics(PerIndexMetricsFactory metricsFactory, Tags tags) {
         this.metricsFactory = metricsFactory;

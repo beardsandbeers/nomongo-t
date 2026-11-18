@@ -535,8 +535,11 @@ public final class StandaloneRuntime implements Closeable {
             .setFailureMessage(this.reconciliationFailure.get().orElse(""))
             .setFreeDiskBytes(Files.getFileStore(this.config.dataPath()).getUsableSpace());
     for (var index : this.reads.snapshot()) {
-      result.addIndexes(
-          index.toBuilder().clearDesiredDefinitionBson().clearActiveDefinitionBson().clearBuild());
+      var summary = index.toBuilder().clearDesiredDefinitionBson().clearActiveDefinitionBson();
+      if (index.hasBuild()) {
+        summary.getBuildBuilder().clearDefinitionBson();
+      }
+      result.addIndexes(summary);
     }
     for (var meter : this.metrics.meterRegistry().getMeters()) {
       if (this.externalReconcile.isPresent()

@@ -5,7 +5,9 @@ import com.xgen.mongot.catalog.IndexCatalog;
 import com.xgen.mongot.catalog.InitializedIndexCatalog;
 import com.xgen.mongot.config.manager.DefaultConfigManager;
 import com.xgen.mongot.config.manager.GenerationReadLeases;
+import com.xgen.mongot.index.IndexClosedException;
 import com.xgen.mongot.index.IndexGeneration;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics.BuildProgress;
 import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.status.IndexStatus;
@@ -14,6 +16,8 @@ import com.xgen.mongot.server.command.management.util.IndexMapper;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import com.xgen.mongot.standalone.catalog.StandaloneDefinitionValidator;
 import com.xgen.mongot.standalone.grpc.IndexBuild;
+import com.xgen.mongot.standalone.grpc.IndexBuildProgress;
+import com.xgen.mongot.standalone.grpc.IndexBuildProgress.Phase;
 import com.xgen.mongot.standalone.grpc.IndexDescription;
 import com.xgen.mongot.standalone.grpc.IndexNamespace;
 import com.xgen.mongot.standalone.grpc.IndexOwnership;
@@ -202,7 +206,7 @@ public final class DirectReadCatalog {
           .setLifecycleState("QUARANTINED")
           .setFailureMessage("Index definition is incompatible with this server");
     }
-    if (stagedQuarantine.isPresent() && !result.hasBuild()) {
+    if (stagedQuarantine.isPresent() && staged.isEmpty()) {
       result
           .setBuild(
               IndexBuild.newBuilder()
@@ -210,6 +214,13 @@ public final class DirectReadCatalog {
                   .setState("QUARANTINED"))
           .setLifecycleState(result.getGenerationId().isEmpty() ? "QUARANTINED" : "FAILED")
           .setFailureMessage("Replacement index definition is incompatible with this server");
+    }
+    boolean rebuildingEmpty =
+        result.getLifecycleState().equals("BUILDING")
+            && result.getOwnership() == IndexOwnership.INDEX_OWNERSHIP_STANDALONE
+            && result.getActiveRevision() != result.getDesiredRevision();
+    if (!result.hasBuild() && (result.getLifecycleState().equals("PENDING") || rebuildingEmpty)) {
+      result.setBuild(pendingBuild(result.getDesiredVersion()));
     }
     return result.build();
   }
@@ -276,6 +287,13 @@ public final class DirectReadCatalog {
                       });
               if (standalone && revision(definition) != revision(desired)) {
                 result.setLifecycleState("BUILDING").setQueryable(false);
+              } else if (switch (status.getStatusCode()) {
+                case UNKNOWN, NOT_STARTED, INITIAL_SYNC -> true;
+                case FAILED ->
+                    status.getReason().filter(DirectReadCatalog::isBuildFailure).isPresent();
+                default -> false;
+              }) {
+                result.setBuild(describeBuild(generation, status, standalone));
               }
             });
     this.manager
@@ -291,11 +309,8 @@ public final class DirectReadCatalog {
                           ? "FAILED"
                           : "BUILDING")
                   .setBuild(
-                      IndexBuild.newBuilder()
-                          .setGenerationId(staged.getGenerationId().uniqueString())
-                          .setVersion(version(staged.getDefinition()))
-                          .setDefinitionBson(encodeDefinition(staged.getDefinition()))
-                          .setState(status.getStatusCode().name()));
+                      describeBuild(staged, status, standalone)
+                          .setDefinitionBson(encodeDefinition(staged.getDefinition())));
               if (status.getStatusCode() == IndexStatus.StatusCode.FAILED) {
                 result.setFailureMessage(status.getMessage().orElse("Index initialization failed"));
               }
@@ -309,6 +324,78 @@ public final class DirectReadCatalog {
                   result.setLifecycleState("FAILED").setFailureMessage(migration.failure()));
     }
     return result.build();
+  }
+
+  private static boolean isBuildFailure(IndexStatus.Reason reason) {
+    return switch (reason) {
+      case INITIALIZATION_FAILED,
+          INITIAL_SYNC_REPLICATION_FAILED,
+          INITIAL_SYNC_REPLICATION_FAILED_RETRY ->
+          true;
+      default -> false;
+    };
+  }
+
+  private static IndexBuild.Builder pendingBuild(IndexVersion version) {
+    return IndexBuild.newBuilder()
+        .setVersion(version)
+        .setState("PENDING")
+        .setProgress(IndexBuildProgress.newBuilder().setPhase(Phase.PHASE_PENDING));
+  }
+
+  private IndexBuild.Builder describeBuild(
+      IndexGeneration generation, IndexStatus status, boolean standalone) {
+    var build =
+        IndexBuild.newBuilder()
+            .setGenerationId(generation.getGenerationId().uniqueString())
+            .setVersion(version(generation.getDefinition()))
+            .setState(status.getStatusCode().name());
+    status.getMessage().ifPresent(build::setMessage);
+
+    var phase =
+        switch (status.getStatusCode()) {
+          case UNKNOWN -> Phase.PHASE_INITIALIZING;
+          case NOT_STARTED -> standalone ? Phase.PHASE_INITIALIZING : Phase.PHASE_PENDING;
+          case INITIAL_SYNC -> Phase.PHASE_INITIAL_SYNC;
+          case STEADY -> Phase.PHASE_PUBLISHING;
+          default -> Phase.PHASE_UNSPECIFIED;
+        };
+    if (phase == Phase.PHASE_UNSPECIFIED) {
+      return build;
+    }
+    var progress = build.getProgressBuilder().setPhase(phase);
+    if (status.getStatusCode() == IndexStatus.StatusCode.INITIAL_SYNC) {
+      initialSyncProgress(generation.getGenerationId())
+          .ifPresent(
+              snapshot ->
+                  progress
+                      .setPhase(
+                          switch (snapshot.phase()) {
+                            case PREPARING -> Phase.PHASE_INITIAL_SYNC;
+                            case SCANNING_COLLECTION -> Phase.PHASE_SCANNING_COLLECTION;
+                            case CATCHING_UP -> Phase.PHASE_CATCHING_UP;
+                            case COMMITTING -> Phase.PHASE_COMMITTING;
+                          })
+                      .setCollectionScanDocuments(snapshot.collectionScanDocuments())
+                      .setCollectionScanBytes(snapshot.collectionScanBytes()));
+    }
+    return build;
+  }
+
+  private Optional<BuildProgress.Snapshot> initialSyncProgress(GenerationId id) {
+    try {
+      return this.initialized
+          .getIndex(id)
+          .flatMap(
+              index ->
+                  index
+                      .getMetricsUpdater()
+                      .getReplicationMetricsUpdater()
+                      .getInitialSyncMetrics()
+                      .getBuildProgress());
+    } catch (IndexClosedException retired) {
+      return Optional.empty();
+    }
   }
 
   /** Resolves a query-ready generation, enforcing an optional physical generation fence. */

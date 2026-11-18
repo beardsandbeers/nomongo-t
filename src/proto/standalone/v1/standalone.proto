@@ -97,6 +97,25 @@ message IndexBuild {
   IndexVersion version = 2;
   string state = 3;
   bytes definition_bson = 4;
+  IndexBuildProgress progress = 5;
+  string message = 6; // Status message for this generation, when available.
+}
+message IndexBuildProgress {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PENDING = 1;
+    PHASE_INITIALIZING = 2;
+    PHASE_INITIAL_SYNC = 3;
+    PHASE_SCANNING_COLLECTION = 4;
+    PHASE_CATCHING_UP = 5;
+    PHASE_COMMITTING = 6;
+    PHASE_PUBLISHING = 7;
+  }
+  Phase phase = 1;
+  // Work applied by completed collection scan batches in the current initial sync attempt.
+  // A resumed attempt counts only new work. These are neither live document counts nor totals.
+  optional uint64 collection_scan_documents = 2;
+  optional uint64 collection_scan_bytes = 3;
 }
 message JoinIndexBinding {
   string alias = 1;

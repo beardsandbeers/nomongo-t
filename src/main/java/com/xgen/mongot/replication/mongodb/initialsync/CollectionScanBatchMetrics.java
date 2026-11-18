@@ -4,8 +4,8 @@ import com.xgen.mongot.index.DocumentEvent;
 import java.util.List;
 
 /**
- * Per-batch metrics recorded by every collection scanner once a batch is handed to the indexing
- * scheduler, so that single-cursor and parallel scans report the same counters.
+ * Per-batch metrics recorded by every collection scanner after the indexing scheduler completes a
+ * batch, so that single-cursor and parallel scans report the same counters.
  */
 final class CollectionScanBatchMetrics {
 
@@ -33,5 +33,6 @@ final class CollectionScanBatchMetrics {
         .record(byteTotal);
 
     context.getInitialSyncMetricsUpdater().getTotalApplicableBytes().increment(byteTotal);
+    context.getBuildProgress().recordBatch(batch.size(), byteTotal);
   }
 }

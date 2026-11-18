@@ -158,6 +158,14 @@ public class StandaloneQuarantineRecoveryTest {
                 .build());
         runtime.catalogChanged();
         await(() -> runtime.describeIndex(id).getLifecycleState().equals("FAILED"));
+        var build = runtime.describeIndex(id).getBuild();
+        var summary = runtime.serviceStatus().getIndexes(0);
+        assertThat(build.getState()).isEqualTo("FAILED");
+        assertThat(build.getMessage()).isNotEmpty();
+        assertThat(build.getDefinitionBson()).isNotEmpty();
+        assertThat(summary.getBuild()).isEqualTo(build.toBuilder().clearDefinitionBson().build());
+        assertThat(summary.getActiveDefinitionBson()).isEmpty();
+        assertThat(summary.getDesiredDefinitionBson()).isEmpty();
       }
       return source;
     }
