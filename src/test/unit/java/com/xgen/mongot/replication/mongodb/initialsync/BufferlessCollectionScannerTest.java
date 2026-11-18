@@ -795,5 +795,8 @@ public class BufferlessCollectionScannerTest {
                 .getTotalApplicableBytes()
                 .count()
             > 0);
+    var progress = mocks.context.getBuildProgress().snapshot();
+    Assert.assertEquals(1, progress.collectionScanDocuments());
+    Assert.assertTrue(progress.collectionScanBytes() > 0);
   }
 }

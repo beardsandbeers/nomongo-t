@@ -10,9 +10,13 @@ import static org.mockito.Mockito.when;
 
 import com.xgen.mongot.config.manager.GenerationReadLeases;
 import com.xgen.mongot.index.IndexGeneration;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics.BuildProgress;
 import com.xgen.mongot.index.status.IndexStatus;
 import com.xgen.mongot.standalone.catalog.LocalIndexCatalog;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
+import com.xgen.mongot.standalone.grpc.IndexBuildProgress.Phase;
 import com.xgen.mongot.standalone.grpc.IndexOwnership;
 import com.xgen.mongot.standalone.grpc.IndexType;
 import com.xgen.testing.mongot.config.manager.DefaultConfigManagerMocks;
@@ -350,6 +354,39 @@ public class DirectReadCatalogTest {
   }
 
   @Test
+  public void describe_firstGenerationScanning_reportsBuildProgress() throws Exception {
+    try (var fixture = new Fixture(IndexStatus.initialSync())) {
+      var initialized =
+          fixture
+              .manager
+              .mockedDependencies
+              .initializedIndexCatalog
+              .getIndex(fixture.generation.getGenerationId())
+              .orElseThrow();
+      var metrics = mock(ReplicationMetricsUpdater.class);
+      var initialSync = mock(InitialSyncMetrics.class);
+      when(initialized.getMetricsUpdater().getReplicationMetricsUpdater()).thenReturn(metrics);
+      when(metrics.getInitialSyncMetrics()).thenReturn(initialSync);
+      var progress = new BuildProgress();
+      progress.setPhase(BuildProgress.Phase.SCANNING_COLLECTION);
+      progress.recordBatch(12, 1536);
+      when(initialSync.getBuildProgress()).thenReturn(Optional.of(progress.snapshot()));
+
+      var description = fixture.reads.describe(fixture.id());
+
+      assertThat(description.getLifecycleState()).isEqualTo("BUILDING");
+      assertThat(description.getQueryable()).isFalse();
+      assertThat(description.getBuild().getGenerationId()).isEqualTo(description.getGenerationId());
+      assertThat(description.getBuild().getState()).isEqualTo("INITIAL_SYNC");
+      assertThat(description.getBuild().getProgress().getPhase())
+          .isEqualTo(Phase.PHASE_SCANNING_COLLECTION);
+      assertThat(description.getBuild().getProgress().getCollectionScanDocuments()).isEqualTo(12);
+      assertThat(description.getBuild().getProgress().getCollectionScanBytes()).isEqualTo(1536);
+      assertThat(fixture.reads.snapshot()).containsExactly(description);
+    }
+  }
+
+  @Test
   public void resolve_missingGeneration_distinguishesPendingAndUnknownIds() throws Exception {
     try (var fixture = new Fixture(IndexStatus.steady())) {
       fixture.manager.indexCatalog.removeIndex(fixture.generation.getDefinition().getIndexId());
@@ -364,6 +401,10 @@ public class DirectReadCatalogTest {
       assertThat(pending.getStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
       assertThat(missing.getStatus().getCode()).isEqualTo(Status.Code.NOT_FOUND);
       verify(fixture.remote, never()).snapshot();
+      var build = fixture.reads.describe(fixture.id()).getBuild();
+      assertThat(build.getProgress().getPhase()).isEqualTo(Phase.PHASE_PENDING);
+      assertThat(build.getProgress().hasCollectionScanDocuments()).isFalse();
+      assertThat(build.getGenerationId()).isEmpty();
     }
   }
 

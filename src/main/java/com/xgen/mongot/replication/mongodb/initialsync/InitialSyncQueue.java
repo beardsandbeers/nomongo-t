@@ -1014,14 +1014,16 @@ public class InitialSyncQueue {
                 collectionInfo,
                 request.getResumeInfo());
 
-        // Here the index's status is updated to INITIAL_SYNC, and only executes if namespace
-        // resolution above succeeds. Otherwise, so long as namespace resolution keeps failing when
-        // we're retrying it, the index's status will repeatedly be set to DOES_NOT_EXIST.
-        request.getInitialSyncStartingHandler().run();
-
-        ChangeStreamResumeInfo resumeInfo = syncManager.sync();
-
-        completeFuture = Optional.of(() -> request.getOnCompleteFuture().complete(resumeInfo));
+        var metrics = syncContext.getInitialSyncMetricsUpdater();
+        metrics.setBuildProgress(Optional.of(syncContext.getBuildProgress()));
+        try {
+          // Update the status to INITIAL_SYNC only after namespace resolution succeeds.
+          request.getInitialSyncStartingHandler().run();
+          ChangeStreamResumeInfo resumeInfo = syncManager.sync();
+          completeFuture = Optional.of(() -> request.getOnCompleteFuture().complete(resumeInfo));
+        } finally {
+          metrics.setBuildProgress(Optional.empty());
+        }
       } catch (Throwable t) {
         completeFuture = Optional.of(() -> request.getOnCompleteFuture().completeExceptionally(t));
       } finally {

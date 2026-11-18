@@ -13,6 +13,7 @@ import com.mongodb.MongoCommandException;
 import com.mongodb.MongoNamespace;
 import com.xgen.mongot.embedding.config.MaterializedViewCollectionMetadataCatalog;
 import com.xgen.mongot.embedding.exceptions.MaterializedViewNonTransientException;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics.BuildProgress.Phase;
 import com.xgen.mongot.logging.DefaultKeyValueLogger;
 import com.xgen.mongot.metrics.MetricsFactory;
 import com.xgen.mongot.replication.mongodb.common.BufferlessParallelNaturalOrderInitialSyncResumeInfo;
@@ -383,6 +384,7 @@ public class BufferlessInitialSyncManager implements InitialSyncManager {
           commitPartitionPlan();
         }
 
+        this.context.setBuildPhase(Phase.SCANNING_COLLECTION);
         while (continueSync) {
           // Update the last scanned id and whether we need to continue scanning. If we're done
           // scanning, catch up with the change stream one last time before finishing the initial
@@ -403,6 +405,9 @@ public class BufferlessInitialSyncManager implements InitialSyncManager {
 
           // Apply change stream events and update the high water mark. On the parallel path the
           // applier advances the session's mark instead, and ignores the token.
+          if (!continueSync) {
+            this.context.setBuildPhase(Phase.CATCHING_UP);
+          }
           var changeStreamTimer = Stopwatch.createStarted();
           highWaterMark =
               applyChangeStreamEvents(changeStreamApplier, lastScannedToken, continueSync);
@@ -461,6 +466,7 @@ public class BufferlessInitialSyncManager implements InitialSyncManager {
         IndexCommitUserData.createChangeStreamResume(
             changeStreamResumeInfo.get(),
             this.context.getGenerationId().generation.formatVersion.versionNumber());
+    this.context.setBuildPhase(Phase.COMMITTING);
     doFirstCommit(commitUserData);
     this.logger
         .atInfo()

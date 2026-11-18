@@ -4,6 +4,7 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.DocumentEvent;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics;
+import com.xgen.mongot.index.IndexMetricsUpdater.ReplicationMetricsUpdater.InitialSyncMetrics.BuildProgress;
 import com.xgen.mongot.index.definition.IndexDefinition;
 import com.xgen.mongot.index.definition.IndexDefinitionGeneration;
 import com.xgen.mongot.index.version.GenerationId;
@@ -42,6 +43,7 @@ public class InitialSyncContext {
   private final Gate initialSyncGate;
   private final Optional<AutoEmbeddingMaterializedViewConfig> autoEmbeddingMaterializedViewConfig;
   private final FeatureFlags featureFlags;
+  private final BuildProgress buildProgress;
 
   private InitialSyncContext(
       IndexDefinitionGeneration indexDefinitionGeneration,
@@ -57,7 +59,8 @@ public class InitialSyncContext {
       int parallelPartitionCount,
       Gate initialSyncGate,
       Optional<AutoEmbeddingMaterializedViewConfig> autoEmbeddingMaterializedViewConfig,
-      FeatureFlags featureFlags) {
+      FeatureFlags featureFlags,
+      BuildProgress buildProgress) {
 
     this.indexDefinitionGeneration = indexDefinitionGeneration;
     this.indexingWorkScheduler = indexingWorkScheduler;
@@ -76,6 +79,7 @@ public class InitialSyncContext {
     this.initialSyncGate = initialSyncGate;
     this.autoEmbeddingMaterializedViewConfig = autoEmbeddingMaterializedViewConfig;
     this.featureFlags = featureFlags;
+    this.buildProgress = buildProgress;
   }
 
   static InitialSyncContext create(
@@ -132,7 +136,8 @@ public class InitialSyncContext {
         parallelPartitionCount,
         initialSyncGate,
         autoEmbeddingMaterializedViewConfig,
-        featureFlags);
+        featureFlags,
+        new BuildProgress());
   }
 
   public FeatureFlags getFeatureFlags() {
@@ -157,6 +162,14 @@ public class InitialSyncContext {
 
   public InitialSyncMetrics getInitialSyncMetricsUpdater() {
     return this.indexMetricsUpdater.getReplicationMetricsUpdater().getInitialSyncMetrics();
+  }
+
+  BuildProgress getBuildProgress() {
+    return this.buildProgress;
+  }
+
+  void setBuildPhase(BuildProgress.Phase phase) {
+    this.buildProgress.setPhase(phase);
   }
 
   public IndexMetricsUpdater getIndexMetricsUpdater() {
@@ -320,6 +333,7 @@ public class InitialSyncContext {
         this.parallelPartitionCount,
         this.initialSyncGate,
         this.autoEmbeddingMaterializedViewConfig,
-        this.featureFlags);
+        this.featureFlags,
+        this.buildProgress);
   }
 }

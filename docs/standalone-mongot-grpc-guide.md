@@ -138,6 +138,21 @@ identifies that replacement. Its unreadable definition and unknown version are o
 summary reports `FAILED` while `queryable` and `source_status` continue to describe the active
 generation, which can remain available for queries.
 
+Poll `CatalogService.GetIndex` or `ListIndexes` for `build.state`, `build.message`, and
+`build.progress.phase`. `OperationsService.GetStatus` includes the same build summary with
+definition BSON omitted. A pending build can appear before Mongot assigns its generation ID.
+The build summary can describe a replacement while the active generation remains queryable.
+
+For replicated initial sync, `build.progress` reports collection scanning, final change-stream
+catch-up, and the first commit. `collection_scan_documents` and `collection_scan_bytes` count work
+applied by completed scan batches in the current attempt. A resumed attempt counts new batches
+from its resume point. These counters measure scan work, so they can include work that has yet to
+be committed. The API omits counters when no scan attempt is being tracked.
+
+Push-fed indexes initialize an empty generation and then accept writes. Poll `GetIndexStats`
+with `refresh: true` for the current document count during an upload. The client supplies the
+documents and owns any expected upload total.
+
 Use `index_id` for Search, VectorSearch, mappings, and statistics. Autocomplete remains a Search
 operator and requires the corresponding field mapping. Mapping export returns `mappings_json`
 for search indexes and `vector_fields_json` for vector indexes, plus the active public definition
