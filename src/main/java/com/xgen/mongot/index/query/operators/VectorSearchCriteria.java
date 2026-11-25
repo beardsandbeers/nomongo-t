@@ -113,6 +113,13 @@ public sealed interface VectorSearchCriteria extends DocumentEncodable
     public static final Field.WithDefault<Boolean> STORED_SOURCE =
         Field.builder("returnStoredSource").booleanField().optional().withDefault(false);
 
+    static final Field.Optional<StreamingOptions> STREAMING =
+        Field.builder("streaming")
+            .classField(StreamingOptions::fromBson)
+            .disallowUnknownFields()
+            .optional()
+            .noDefault();
+
     public static final Field.Optional<VectorEmbeddedOptions> NESTED_OPTIONS =
         Field.builder("nestedOptions")
             .classField(VectorEmbeddedOptions::fromBson)

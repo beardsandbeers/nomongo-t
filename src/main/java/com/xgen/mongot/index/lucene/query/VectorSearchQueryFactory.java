@@ -19,6 +19,7 @@ import com.xgen.mongot.index.lucene.query.custom.MongotKnnByteQuery;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnFloatQuery;
 import com.xgen.mongot.index.lucene.query.util.MetaIdRetriever;
 import com.xgen.mongot.index.lucene.query.util.WrappedToParentBlockJoinQuery;
+import com.xgen.mongot.index.lucene.streaming.StreamingKnnQuery;
 import com.xgen.mongot.index.lucene.util.LuceneDocumentIdEncoder;
 import com.xgen.mongot.index.query.AutoEmbedQueryVectorReconciler;
 import com.xgen.mongot.index.query.InvalidQueryException;
@@ -183,6 +184,41 @@ class VectorSearchQueryFactory {
         // otherwise it is the user-supplied value. See ApproximateVectorSearchCriteria.
         int numCandidates = approximateCriteria.resolveNumCandidates();
         int limit = approximateCriteria.limit();
+        if (approximateCriteria.streaming().isPresent()) {
+          if (embeddedRoot.isPresent()
+              || luceneParentFilter.isPresent()
+              || approximateCriteria.explainOptions().isPresent()) {
+            throw new InvalidQueryException(
+                "streaming supports root vector fields without parentFilter or tracing options");
+          }
+          var options = approximateCriteria.streaming().get();
+          childQuery =
+              switch (queryVector) {
+                case FloatVector v ->
+                    new StreamingKnnQuery.Floats(
+                        fieldName,
+                        v.getFloatVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                case ByteVector v ->
+                    new StreamingKnnQuery.Bytes(
+                        fieldName,
+                        v.getByteVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                case BitVector v ->
+                    new StreamingKnnQuery.Bytes(
+                        fieldName,
+                        v.getBitVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                default -> throw new InvalidQueryException("Unsupported streaming vector encoding");
+              };
+          break;
+        }
         ApproximateVectorQueryCreator queryCreator =
             ApproximateVectorQueryCreator.get(
                 approximateCriteria,

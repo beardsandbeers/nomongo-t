@@ -48,6 +48,7 @@ java_library(
         "SpanOrOperator.java",
         "SpanSubtractOperator.java",
         "SpanTermOperator.java",
+        "StreamingOptions.java",
         "TermBaseOperator.java",
         "TermFuzzyOperator.java",
         "TermLevelOperator.java",

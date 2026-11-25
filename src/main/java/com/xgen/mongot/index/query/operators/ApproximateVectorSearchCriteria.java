@@ -30,7 +30,8 @@ public record ApproximateVectorSearchCriteria(
     Optional<Integer> numCandidates,
     Optional<ExplainOptions> explainOptions,
     boolean returnStoredSource,
-    Optional<VectorEmbeddedOptions> embeddedOptions)
+    Optional<VectorEmbeddedOptions> embeddedOptions,
+    Optional<StreamingOptions> streaming)
     implements VectorSearchCriteria {
 
   /** Maximum value for numCandidates, whether user-supplied or auto-computed. */
@@ -41,6 +42,31 @@ public record ApproximateVectorSearchCriteria(
 
   /** Auto k/limit ratio: auto numCandidates targets 8x the requested limit before clamping. */
   public static final int AUTO_NUM_CANDIDATES_RATIO = 8;
+
+  public ApproximateVectorSearchCriteria(
+      FieldPath path,
+      Optional<Vector> queryVector,
+      Optional<VectorSearchQueryInput> query,
+      Optional<VectorSearchFilter> filter,
+      Optional<VectorSearchFilter> parentFilter,
+      int limit,
+      Optional<Integer> numCandidates,
+      Optional<ExplainOptions> explainOptions,
+      boolean returnStoredSource,
+      Optional<VectorEmbeddedOptions> embeddedOptions) {
+    this(
+        path,
+        queryVector,
+        query,
+        filter,
+        parentFilter,
+        limit,
+        numCandidates,
+        explainOptions,
+        returnStoredSource,
+        embeddedOptions,
+        Optional.empty());
+  }
 
   public ApproximateVectorSearchCriteria {
     if (numCandidates.isPresent()) {
@@ -129,7 +155,8 @@ public record ApproximateVectorSearchCriteria(
         numCandidates,
         parser.getField(Fields.EXPLAIN_OPTIONS).unwrap(),
         parser.getField(Fields.STORED_SOURCE).unwrap(),
-        parser.getField(Fields.NESTED_OPTIONS).unwrap());
+        parser.getField(Fields.NESTED_OPTIONS).unwrap(),
+        parser.getField(Fields.STREAMING).unwrap());
   }
 
   @Override
@@ -149,7 +176,8 @@ public record ApproximateVectorSearchCriteria(
         this.numCandidates,
         this.explainOptions,
         this.returnStoredSource,
-        this.embeddedOptions);
+        this.embeddedOptions,
+        this.streaming);
   }
 
   @Override
@@ -164,7 +192,8 @@ public record ApproximateVectorSearchCriteria(
         this.numCandidates,
         this.explainOptions,
         this.returnStoredSource,
-        this.embeddedOptions);
+        this.embeddedOptions,
+        this.streaming);
   }
 
   @Override
@@ -183,6 +212,7 @@ public record ApproximateVectorSearchCriteria(
             .field(Fields.EXPLAIN_OPTIONS, this.explainOptions())
             .field(Fields.STORED_SOURCE, this.returnStoredSource())
             .field(Fields.NESTED_OPTIONS, this.embeddedOptions())
+            .field(Fields.STREAMING, this.streaming)
             .join(filterDocument);
 
     if (this.parentFilter.isPresent()) {

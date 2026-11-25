@@ -89,6 +89,7 @@ java_library(
         "//src/main/java/com/xgen/mongot/index/lucene/query/values",
         "//src/main/java/com/xgen/mongot/index/lucene/query/weights",
         "//src/main/java/com/xgen/mongot/index/lucene/searcher",
+        "//src/main/java/com/xgen/mongot/index/lucene/streaming",
         "//src/main/java/com/xgen/mongot/index/lucene/util",
         "//src/main/java/com/xgen/mongot/index/path/string",
         "//src/main/java/com/xgen/mongot/index/query",

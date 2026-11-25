@@ -3379,6 +3379,82 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void vectorSearch_streamingRange_returnsSortedPassingDocuments() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var index =
+          f.catalog.createIndex(
+              CreateIndexRequest.newBuilder()
+                  .setName("streaming")
+                  .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                  .setDefinitionBson(
+                      bson(
+                          "{fields:[{type:'vector',path:'v',numDimensions:3,"
+                              + "similarity:'euclidean',quantization:'scalar'},{type:'filter',path:'price'}]}"))
+                  .build());
+      var id = index.getIndexId();
+      f.ready(id, 1);
+      f.upsert(id, "{_id:'far',v:[0.0,1.0,0.0],price:5}");
+      f.upsert(id, "{_id:'excluded',v:[1.0,0.0,0.0],price:50}");
+      f.upsert(id, "{_id:'near',v:[0.9,0.1,0.0],price:10}");
+      String fields =
+          "path:'v',queryVector:[1.0,0.0,0.0],limit:2,numCandidates:4,"
+              + "filter:{price:{$lte:10}}";
+      var request = QueryRequest.newBuilder().setIndexId(id);
+      var baseline = f.queries.vectorSearch(request.setQueryBson(bson("{" + fields + "}")).build());
+      var response =
+          f.queries.vectorSearch(
+              request
+                  .setQueryBson(bson("{" + fields + ",streaming:{warmupWidth:2,refillEvery:1}}"))
+                  .build());
+
+      var hits = new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results");
+      assertThat(hits).hasSize(2);
+      assertThat(hits.get(0).asDocument().getString("_id").getValue()).isEqualTo("near");
+      assertThat(hits.get(1).asDocument().getString("_id").getValue()).isEqualTo("far");
+      assertThat(hits)
+          .isEqualTo(
+              new RawBsonDocument(baseline.getBatchBson().toByteArray()).getArray("results"));
+      var capped =
+          assertThrows(
+              StatusRuntimeException.class,
+              () ->
+                  f.queries.vectorSearch(
+                      request
+                          .setQueryBson(bson("{" + fields + ",streaming:{maxCachedNodes:1}}"))
+                          .build()));
+      assertThat(capped.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+      assertThat(capped).hasMessageThat().contains("maxCachedNodes=1");
+    }
+  }
+
+  @Test
+  public void search_streamingVectorOperator_executesWithDefaultsAndExplain() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "default",
+              "{mappings:{dynamic:false,fields:{embedding:"
+                  + "{type:'vector',numDimensions:3,similarity:'cosine'}}}}");
+      f.upsert(id, "{_id:'near',embedding:[1.0,0.0,0.0]}");
+      var request =
+          QueryRequest.newBuilder()
+              .setIndexId(id)
+              .setQueryBson(
+                  bson(
+                      "{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],"
+                          + "limit:1,numCandidates:2,streaming:{}}}"))
+              .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS);
+      var response = f.queries.search(request.build());
+
+      assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
+          .hasSize(1);
+      assertThat(response.getExplainBson()).isNotEmpty();
+    }
+  }
+
+  @Test
   public void vectorSearch_explain_returnsPlanAndTracesPagedExecution() throws Exception {
     com.xgen.mongot.index.lucene.vector.Similarity.load();
     try (var f = new Fixture(data())) {
