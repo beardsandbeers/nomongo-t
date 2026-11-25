@@ -62,6 +62,12 @@ public interface QueryFactoryContext {
   VectorQuantization getIndexedQuantization(FieldPath fieldPath, Optional<FieldPath> embeddedRoot)
       throws InvalidQueryException;
 
+  /** Dimension included in the Lucene field name for a learned vector path. */
+  default Optional<Integer> getVectorFieldNameDimensions(
+      FieldPath path, Optional<FieldPath> embeddedRoot) {
+    return Optional.empty();
+  }
+
   /** Returns the metrics updater tied to the index that this query targets. */
   IndexMetricsUpdater.QueryingMetricsUpdater getMetrics();
 

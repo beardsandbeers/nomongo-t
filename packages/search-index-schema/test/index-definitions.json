@@ -1,5 +1,103 @@
 [
   {
+    "name": "inferred vector type set",
+    "indexType": "search",
+    "valid": true,
+    "definition": {
+      "typeSets": [
+        {
+          "name": "embeddings",
+          "types": [
+            {
+              "type": "vector",
+              "similarity": "cosine",
+              "quantization": "scalar"
+            }
+          ]
+        }
+      ],
+      "mappings": {
+        "dynamic": {
+          "typeSet": "embeddings"
+        }
+      }
+    }
+  },
+  {
+    "name": "fixed vector type set",
+    "indexType": "search",
+    "valid": true,
+    "definition": {
+      "typeSets": [
+        {
+          "name": "embeddings",
+          "types": [
+            {
+              "type": "vector",
+              "similarity": "cosine",
+              "quantization": "binary",
+              "numDimensions": 8
+            }
+          ]
+        }
+      ],
+      "mappings": {
+        "dynamic": {
+          "typeSet": "embeddings"
+        }
+      }
+    }
+  },
+  {
+    "name": "invalid binary vector dimensions",
+    "indexType": "search",
+    "valid": false,
+    "definition": {
+      "typeSets": [
+        {
+          "name": "embeddings",
+          "types": [
+            {
+              "type": "vector",
+              "similarity": "cosine",
+              "quantization": "binary",
+              "numDimensions": 3
+            }
+          ]
+        }
+      ],
+      "mappings": {
+        "dynamic": {
+          "typeSet": "embeddings"
+        }
+      }
+    }
+  },
+  {
+    "name": "invalid vector type set option",
+    "indexType": "search",
+    "valid": false,
+    "definition": {
+      "typeSets": [
+        {
+          "name": "embeddings",
+          "types": [
+            {
+              "type": "vector",
+              "similarity": "cosine",
+              "indexingMethod": "flat"
+            }
+          ]
+        }
+      ],
+      "mappings": {
+        "dynamic": {
+          "typeSet": "embeddings"
+        }
+      }
+    }
+  },
+  {
     "name": "dynamic search",
     "indexType": "search",
     "definition": {

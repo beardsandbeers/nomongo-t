@@ -16,12 +16,26 @@ import java.util.Optional;
 public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
 
   public final SearchIndexDefinition indexDefinition;
-  public final IndexCapabilities indexCapabilities;
+  public final SearchIndexCapabilities indexCapabilities;
+
+  private final VectorDimensions vectorDimensions;
+
+  public VectorDimensions vectorDimensions() {
+    return this.vectorDimensions;
+  }
+
+  public SearchFieldDefinitionResolver(
+      SearchIndexDefinition indexDefinition,
+      IndexFormatVersion indexFormatVersion,
+      VectorDimensions vectorDimensions) {
+    this.indexDefinition = indexDefinition;
+    this.indexCapabilities = indexDefinition.getIndexCapabilities(indexFormatVersion);
+    this.vectorDimensions = vectorDimensions;
+  }
 
   SearchFieldDefinitionResolver(
       SearchIndexDefinition indexDefinition, IndexFormatVersion indexFormatVersion) {
-    this.indexDefinition = indexDefinition;
-    this.indexCapabilities = indexDefinition.getIndexCapabilities(indexFormatVersion);
+    this(indexDefinition, indexFormatVersion, new VectorDimensions());
   }
 
   public Optional<FieldDefinition> getFieldDefinition(
@@ -80,8 +94,17 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
 
   @Override
   public Optional<VectorFieldSpecification> getVectorFieldSpecification(FieldPath path) {
-    return getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::vectorFieldSpecification);
+    return getVectorFieldSpecification(path, Optional.empty());
+  }
+
+  public Optional<VectorFieldSpecification> getVectorFieldSpecification(
+      FieldPath path, Optional<FieldPath> embeddedRoot) {
+    var field = getFieldDefinition(path, embeddedRoot);
+    var rule = field.flatMap(FieldDefinition::typeSetVectorFieldDefinition);
+    if (rule.isPresent() && embeddedRoot.isEmpty()) {
+      return rule.get().resolve(() -> this.vectorDimensions.get(path));
+    }
+    return field.flatMap(FieldDefinition::vectorFieldSpecification);
   }
 
   public IndexCapabilities getIndexCapabilities() {

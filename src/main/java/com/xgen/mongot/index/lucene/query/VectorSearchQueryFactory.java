@@ -516,9 +516,13 @@ class VectorSearchQueryFactory {
   private String getLuceneFieldName(
       FieldPath fieldPath, Optional<FieldPath> embeddedRoot, Vector.VectorType vectorType)
       throws InvalidQueryException {
-    return VectorTypeFieldResolver.resolveTypeField(
-            this.factoryContext.getIndexedQuantization(fieldPath, embeddedRoot), vectorType)
-        .getLuceneFieldName(fieldPath, embeddedRoot);
+    var type =
+        VectorTypeFieldResolver.resolveTypeField(
+            this.factoryContext.getIndexedQuantization(fieldPath, embeddedRoot), vectorType);
+    return this.factoryContext
+        .getVectorFieldNameDimensions(fieldPath, embeddedRoot)
+        .map(dimensions -> type.getInferredVectorFieldName(fieldPath, dimensions))
+        .orElseGet(() -> type.getLuceneFieldName(fieldPath, embeddedRoot));
   }
 
   /**

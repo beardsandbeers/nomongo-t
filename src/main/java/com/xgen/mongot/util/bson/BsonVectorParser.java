@@ -48,6 +48,17 @@ public class BsonVectorParser {
   public static final int BSON_VECTOR_HEADER_SIZE = 2;
   public static final byte VECTOR_SUB_TYPE = (byte) 0x09;
 
+  /**
+   * Dynamic Search mappings accept complete elements and the zero padding supported by the index.
+   */
+  public static boolean hasIndexableHeader(BsonBinary binary) {
+    byte[] data = binary.getData();
+    return data.length >= BSON_VECTOR_HEADER_SIZE
+        && data[1] == 0
+        && (data[0] != VectorDataType.FLOAT32_VECTOR_DATA_TYPE.getValue()
+            || (data.length - BSON_VECTOR_HEADER_SIZE) % Float.BYTES == 0);
+  }
+
   @SuppressWarnings("checkstyle:MissingJavadocMethod")
   public static Vector parse(BsonBinary bsonBinary) {
     if (bsonBinary.getType() != VECTOR_SUB_TYPE) {

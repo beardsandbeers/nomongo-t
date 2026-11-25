@@ -40,7 +40,8 @@ public record FieldDefinition(
     Optional<StringFieldDefinition> stringFieldDefinition,
     Optional<StringFacetFieldDefinition> stringFacetFieldDefinition,
     Optional<TokenFieldDefinition> tokenFieldDefinition,
-    Optional<UuidFieldDefinition> uuidFieldDefinition)
+    Optional<UuidFieldDefinition> uuidFieldDefinition,
+    Optional<TypeSetVectorFieldDefinition> typeSetVectorFieldDefinition)
     implements Encodable {
 
   private static final Value.Required<List<FieldTypeDefinition>> TYPE_VALUE =
@@ -95,7 +96,8 @@ public record FieldDefinition(
                   Collections.emptyMap())),
           Optional.empty(),
           Optional.empty(),
-          Optional.of(new UuidFieldDefinition()));
+          Optional.of(new UuidFieldDefinition()),
+          Optional.empty());
 
   // Types that can be indexed for indexing sorting.
   static final ImmutableSet<FieldTypeDefinition.Type> INDEXING_SORTABLE_TYPES =
@@ -185,7 +187,8 @@ public record FieldDefinition(
         this.stringFieldDefinition,
         this.stringFacetFieldDefinition,
         this.tokenFieldDefinition,
-        this.uuidFieldDefinition);
+        this.uuidFieldDefinition,
+        this.typeSetVectorFieldDefinition);
   }
 
   static FieldDefinition fromValidatedFieldTypeDefinitions(List<FieldTypeDefinition> definitions) {
@@ -218,6 +221,7 @@ public record FieldDefinition(
     @Var Optional<TokenFieldDefinition> tokenFieldDefinition = Optional.empty();
     @Var Optional<UuidFieldDefinition> uuidFieldDefinition = Optional.empty();
 
+    @Var Optional<TypeSetVectorFieldDefinition> typeSetVector = Optional.empty();
     for (FieldTypeDefinition definition : definitions) {
       switch (definition) {
         case AutocompleteFieldDefinition fd -> autocompleteFieldDefinition = Optional.of(fd);
@@ -244,6 +248,7 @@ public record FieldDefinition(
         case StringFieldDefinition fd -> stringFieldDefinition = Optional.of(fd);
         case StringFacetFieldDefinition fd -> stringFacetFieldDefinition = Optional.of(fd);
         case TokenFieldDefinition fd -> tokenFieldDefinition = Optional.of(fd);
+        case TypeSetVectorFieldDefinition fd -> typeSetVector = Optional.of(fd);
         case UuidFieldDefinition fd -> uuidFieldDefinition = Optional.of(fd);
       }
     }
@@ -268,7 +273,8 @@ public record FieldDefinition(
         stringFieldDefinition,
         stringFacetFieldDefinition,
         tokenFieldDefinition,
-        uuidFieldDefinition);
+        uuidFieldDefinition,
+        typeSetVector);
   }
 
   private static FieldDefinition fromUnvalidatedFieldTypeDefinitions(

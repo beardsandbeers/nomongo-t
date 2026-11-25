@@ -9,9 +9,11 @@ import com.xgen.mongot.index.definition.FieldTypeDefinition.Type;
 import com.xgen.mongot.index.definition.HierarchicalFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.FieldPath;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -20,6 +22,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.Predicate;
+import java.util.stream.StreamSupport;
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
@@ -29,9 +34,11 @@ import org.bson.BsonValue;
 /** Builds static public mappings from configured mappings and materialized Lucene field types. */
 public final class LuceneIndexMappingExporter {
   private final SearchFieldDefinitionResolver resolver;
+  private final Map<String, String> dottedMappingKeys = new HashMap<>();
   private final Map<Optional<FieldPath>, ObservedField> scopes = new HashMap<>();
 
   private static final class ObservedField {
+    private Optional<Integer> vectorDimensions = Optional.empty();
     private final EnumSet<Type> types = EnumSet.noneOf(Type.class);
     private final Map<String, ObservedField> children = new TreeMap<>();
   }
@@ -39,6 +46,11 @@ public final class LuceneIndexMappingExporter {
   private LuceneIndexMappingExporter(
       SearchIndexDefinition definition, IndexFormatVersion formatVersion) {
     this.resolver = definition.createFieldDefinitionResolver(formatVersion);
+    for (var path : definition.getFieldHierarchyContext().getRootFields().keySet()) {
+      if (path.getLeaf().contains(FieldPath.DELIMITER)) {
+        this.dottedMappingKeys.put(path.toString(), path.getLeaf());
+      }
+    }
   }
 
   /**
@@ -57,7 +69,7 @@ public final class LuceneIndexMappingExporter {
     var exporter = new LuceneIndexMappingExporter(definition, formatVersion);
     for (var partition : fieldInfos) {
       for (var field : partition) {
-        exporter.observe(field.name);
+        exporter.observe(field);
       }
     }
     return exporter.exportDocument(
@@ -67,7 +79,49 @@ public final class LuceneIndexMappingExporter {
         Optional.empty());
   }
 
-  private void observe(String name) {
+  /**
+   * Lucene can retain the FieldInfo of a rejected document in a segment with other live documents.
+   */
+  static FieldInfos publishedFields(FieldInfos fields, SearchFieldDefinitionResolver resolver) {
+    if (!fields.hasVectorValues() || resolver.indexDefinition.getTypeSetsMap().isEmpty()) {
+      return fields;
+    }
+    Predicate<FieldInfo> published =
+        field -> {
+          if (field.getVectorDimension() == 0) {
+            return true;
+          }
+          String path = FieldName.stripAnyPrefixFromLuceneFieldName(field.name);
+          boolean qualified = FieldName.TypeField.isInferredVectorField(field.name);
+          var binding = resolver.vectorDimensions().binding(path);
+          if (binding.isEmpty()) {
+            // A failed discovery by a writer using the older naming scheme can also leave metadata.
+            return !qualified
+                && resolver
+                    .getFieldDefinition(FieldPath.parse(path), Optional.empty())
+                    .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
+                    .filter(rule -> rule.numDimensions().isEmpty())
+                    .isEmpty();
+          }
+          return binding.get().dimensionInFieldName() == qualified
+              && binding.get().dimensions()
+                  == FieldName.TypeField.getTypeOf(field.name)
+                      .orElseThrow()
+                      .logicalVectorDimensions(field.getVectorDimension());
+        };
+    for (var field : fields) {
+      if (!published.test(field)) {
+        return new FieldInfos(
+            StreamSupport.stream(fields.spliterator(), false)
+                .filter(published)
+                .toArray(FieldInfo[]::new));
+      }
+    }
+    return fields;
+  }
+
+  private void observe(FieldInfo field) {
+    String name = field.name;
     var physicalType = FieldName.TypeField.getTypeOf(name);
     if (physicalType.isEmpty()) {
       return;
@@ -81,16 +135,52 @@ public final class LuceneIndexMappingExporter {
             ? Optional.of(FieldPath.parse(FieldName.getEmbeddedRootPathOrThrow(name)))
             : Optional.empty();
     var path = FieldPath.parse(physicalType.get().stripPrefix(name));
+    // Static vector definitions already contain their dimensions. Two explicitly mapped BSON
+    // paths can share a dotted spelling while using different physical vector encodings.
+    if (publicType.get() == Type.VECTOR
+        && this.resolver
+            .getFieldDefinition(path, embeddedRoot)
+            .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
+            .isEmpty()) {
+      return;
+    }
     @Var var observed = this.scopes.computeIfAbsent(embeddedRoot, ignored -> new ObservedField());
-    for (var component : path.getPathHierarchy()) {
-      // Embedded field names contain the absolute path. Their scope starts below the root.
-      if (embeddedRoot.isPresent() && !component.isChildOf(embeddedRoot.get())) {
-        continue;
-      }
-      observed =
-          observed.children.computeIfAbsent(component.getLeaf(), ignored -> new ObservedField());
+    for (var key : mappingKeys(path, embeddedRoot)) {
+      observed = observed.children.computeIfAbsent(key, ignored -> new ObservedField());
     }
     observed.types.add(publicType.get());
+    if (publicType.get() == Type.VECTOR) {
+      int dimensions = physicalType.get().logicalVectorDimensions(field.getVectorDimension());
+      if (observed.vectorDimensions.isPresent() && observed.vectorDimensions.get() != dimensions) {
+        throw new IllegalStateException("Conflicting vector dimensions for " + path);
+      }
+      observed.vectorDimensions = Optional.of(dimensions);
+    }
+  }
+
+  private Iterable<String> mappingKeys(FieldPath path, Optional<FieldPath> embeddedRoot) {
+    if (embeddedRoot.isPresent()) {
+      return path.getPathHierarchy().stream()
+          .filter(part -> part.isChildOf(embeddedRoot.get()))
+          .map(FieldPath::getLeaf)
+          .toList();
+    }
+    if (this.dottedMappingKeys.isEmpty()) {
+      return path.getSegments();
+    }
+    // Recover declared literal keys from the flattened Lucene path (e.g. "a.b" then "v").
+    var keys = new ArrayDeque<String>();
+    @Var String prefix = path.toString();
+    while (true) {
+      String key =
+          this.dottedMappingKeys.getOrDefault(
+              prefix, prefix.substring(prefix.lastIndexOf('.') + 1));
+      keys.addFirst(key);
+      if (prefix.length() == key.length()) {
+        return keys;
+      }
+      prefix = prefix.substring(0, prefix.length() - key.length() - 1);
+    }
   }
 
   private BsonDocument exportDocument(
@@ -131,6 +221,8 @@ public final class LuceneIndexMappingExporter {
       }
       BsonDocument mapping = typeDefinition.toBson();
       switch (typeDefinition) {
+        case TypeSetVectorFieldDefinition vector ->
+            mapping.putAll(vector.resolve(() -> observed.vectorDimensions).orElseThrow().toBson());
         case DocumentFieldDefinition document ->
             exportDocument(document, mapping, observed, Optional.of(path));
         case EmbeddedDocumentsFieldDefinition embedded ->
@@ -165,6 +257,8 @@ public final class LuceneIndexMappingExporter {
       case STRING -> Optional.of(Type.STRING);
       case TOKEN -> Optional.of(Type.TOKEN);
       case UUID -> Optional.of(Type.UUID);
+      case KNN_VECTOR, KNN_BYTE, KNN_BIT, KNN_F32_Q7, KNN_F32_Q1, KNN_BYTE_Q1 ->
+          Optional.of(Type.VECTOR);
       // These types are only explicitly mapped (and are retained from the definition), or have
       // no public mapping type (null). Never infer an internal storage field as a new mapping.
       case DATE_FACET,
@@ -173,12 +267,6 @@ public final class LuceneIndexMappingExporter {
           SORTABLE_DATE_BETA_V1,
           SORTABLE_NUMBER_BETA_V1,
           SORTABLE_STRING_BETA_V1,
-          KNN_VECTOR,
-          KNN_BYTE,
-          KNN_BIT,
-          KNN_F32_Q7,
-          KNN_F32_Q1,
-          KNN_BYTE_Q1,
           NULL ->
           Optional.empty();
     };

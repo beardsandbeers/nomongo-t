@@ -50,6 +50,9 @@ import com.xgen.mongot.standalone.grpc.StatsCollectionState;
 import com.xgen.mongot.standalone.grpc.UpdateIndexRequest;
 import com.xgen.mongot.standalone.grpc.UpsertRequest;
 import com.xgen.mongot.standalone.runtime.StandaloneRuntime;
+import com.xgen.mongot.util.bson.BsonVectorParser;
+import com.xgen.mongot.util.bson.FloatVector;
+import com.xgen.mongot.util.bson.Vector;
 import io.grpc.Context;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
@@ -3038,6 +3041,222 @@ public class StandaloneGrpcServerTest {
       assertThat(f.query(staticId, "{equals:{path:'object.amount',value:7}}").getArray("results"))
           .hasSize(1);
     }
+  }
+
+  @Test
+  public void search_vectorTypeSet_bindsValidBinaryValuesPerPathAndRecoversAfterRestart()
+      throws Exception {
+    Similarity.load();
+    Path directory = data();
+    String id;
+    String three = bsonFloatVector(1, 0, 0);
+    String eight = bsonFloatVector(1, 0, 0, 0, 0, 0, 0, 0);
+    String query = exactVectorQuery("nested.v", "[1,0,0]");
+    String fixedQuery = exactVectorQuery("fixed.v", "[1,0,0,0,0,0,0,0]");
+    String definition =
+        """
+        {numPartitions:2, mappings:{dynamic:{typeSet:'learn'},fields:{
+           fixed:{type:'document',dynamic:{typeSet:'fixed'}},
+           bits:{type:'document',dynamic:{typeSet:'bits'}},
+           inside:{type:'embeddedDocuments',dynamic:{typeSet:'learn'},fields:{tag:{type:'token'}}},
+           staticVector:{type:'vector',similarity:'cosine',numDimensions:3}}},
+         typeSets:[{name:'learn',types:[{type:'vector',similarity:'cosine',quantization:'scalar'}]},
+           {name:'fixed',types:[{type:'vector',similarity:'euclidean',quantization:'binary',numDimensions:8}]},
+           {name:'bits',types:[{type:'vector',similarity:'euclidean'}]}]}
+        """;
+    try (var f = new Fixture(directory)) {
+      id = f.create("discovery", definition);
+      assertThat(f.query(id, fixedQuery).getArray("results")).isEmpty();
+      // One complete float32 and one trailing byte must not bind the field to one dimension.
+      f.upsert(id, "{_id:0,nested:{v:BinData(9,'JwAAAIA/eA==')}}");
+      // A nonzero padding byte is invalid for float32 even when its three low bits are zero.
+      f.upsert(id, "{_id:-1,nested:{v:BinData(9,'JwgAAIA/')}}");
+      f.upsert(
+          id, "{_id:1,nested:{v:[0.0,1.0]},other:BinData(0,'AAAA'),staticVector:[1.0,0.0,0.0]}");
+      f.upsert(
+          id,
+          "{_id:2,nested:{v:"
+              + bsonFloatVector(0, 0)
+              + "},fixed:{v:"
+              + three
+              + "},'fixed.alias':"
+              + three
+              + ",inside:[{tag:'keep',v:"
+              + three
+              + "}]}");
+      assertThat(assertThrows(StatusRuntimeException.class, () -> f.query(id, query)))
+          .hasMessageThat()
+          .contains("must be indexed");
+      f.upsert(
+          id,
+          "{_id:3,nested:{v:"
+              + three
+              + "},other:"
+              + eight
+              + ",fixed:{v:"
+              + eight
+              + "},bits:{v:BinData(9,'EAD/')},ignored:["
+              + three
+              + "]}");
+      f.upsert(id, "{_id:4,nested:{v:" + eight + "},fixed:{v:[1,0,0,0,0,0,0,0]}}");
+
+      assertThat(f.query(id, query).getArray("results")).hasSize(1);
+      assertThat(f.query(id, exactVectorQuery("staticVector", "[1,0,0]")).getArray("results"))
+          .hasSize(1);
+      assertThat(f.query(id, fixedQuery).getArray("results")).hasSize(1);
+      var fields =
+          BsonDocument.parse(
+                  f.catalog
+                      .getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build())
+                      .getMappingsJson())
+              .getDocument("fields");
+      var revision =
+          f.catalog.updateIndex(
+              UpdateIndexRequest.newBuilder()
+                  .setIndexId(id)
+                  .setExpectedRevision(1)
+                  .setDefinitionBson(
+                      bson(
+                          definition.replace(
+                              "{numPartitions:",
+                              "{searchAnalyzer:'lucene.keyword',numPartitions:")))
+                  .build());
+      assertThat(revision.getActiveRevision()).isEqualTo(2);
+      assertThat(f.query(id, query).getArray("results")).hasSize(1);
+      assertThat(fields.containsKey("ignored")).isFalse();
+      assertThat(fields.getDocument("fixed").getDocument("fields").containsKey("alias")).isFalse();
+      assertThat(fields.getDocument("inside").getDocument("fields").keySet())
+          .containsExactly("tag");
+      assertThat(
+              fields
+                  .getDocument("bits")
+                  .getDocument("fields")
+                  .getDocument("v")
+                  .getInt32("numDimensions")
+                  .getValue())
+          .isEqualTo(8);
+      assertThat(fields.getDocument("other").getInt32("numDimensions").getValue()).isEqualTo(8);
+      assertThat(fields.getDocument("nested").getDocument("fields").getDocument("v"))
+          .isEqualTo(
+              BsonDocument.parse(
+                  "{type:'vector',similarity:'cosine',quantization:'scalar',numDimensions:3}"));
+    }
+
+    try (var f = new Fixture(directory)) {
+      f.ready(id, 2);
+      f.upsert(id, "{_id:5,nested:{v:" + eight + "}}");
+      assertThat(f.query(id, query).getArray("results")).hasSize(1);
+      assertThat(
+              assertThrows(
+                  StatusRuntimeException.class,
+                  () -> f.query(id, exactVectorQuery("nested.v", "[1,0]"))))
+          .hasMessageThat()
+          .contains("indexed with 3 dimensions");
+    }
+  }
+
+  @Test
+  public void upsert_nestedValueAliasingDottedStaticMapping_preservesConfiguredVectorSchema()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "dotted-vector",
+              """
+              {mappings:{dynamic:{typeSet:'learn'},fields:{
+                  'group.v':{type:'vector',numDimensions:3,similarity:'euclidean'}}},
+               typeSets:[{name:'learn',types:[{type:'vector',similarity:'euclidean'}]}]}
+              """);
+      f.upsert(id, "{_id:1,group:{v:" + bsonFloatVector(1, 0) + "}}");
+
+      f.upsert(id, "{_id:2,'group.v':" + bsonFloatVector(1, 0, 0) + "}");
+
+      assertThat(f.query(id, exactVectorQuery("group.v", "[1,0,0]")).getArray("results"))
+          .hasSize(1);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_vectorTypeSet_exportedDefinitionReproducesSearchResults()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var dynamic =
+          f.create(
+              "discovered-vectors",
+              """
+              {mappings:{dynamic:{typeSet:'binary'},fields:{
+                    scalar:{type:'document',dynamic:{typeSet:'scalar'}},
+                    plain:{type:'document',dynamic:{typeSet:'plain'}}}},
+               typeSets:[{name:'binary',types:[{type:'vector',similarity:'euclidean',quantization:'binary'}]},
+                         {name:'scalar',types:[{type:'vector',similarity:'euclidean',quantization:'scalar'}]},
+                         {name:'plain',types:[{type:'vector',similarity:'euclidean'}]}]}
+              """);
+      var floats = bsonFloatVector(1, 0, 0, 0, 0, 0, 0, 0);
+      String packedBits = "BinData(9,'EAD/')";
+      String document =
+          "{_id:7,v:" + floats + ",scalar:{v:" + floats + "},plain:{v:" + packedBits + "}}";
+      // A length of three cannot bind a binary-quantized field.
+      f.upsert(dynamic, "{_id:1,v:" + bsonFloatVector(1, 2, 3) + "}");
+      f.upsert(dynamic, document);
+      var exported =
+          f.catalog.getIndexMappings(
+              GetIndexMappingsRequest.newBuilder().setIndexId(dynamic).build());
+
+      var fixed = f.create("exported-vectors", exported.getDefinitionJson());
+      f.upsert(fixed, document);
+
+      String queryVector = "[1,0,0,0,0,0,0,0]";
+      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("v", queryVector));
+      assertSameVectorResults(
+          f,
+          fixed,
+          dynamic,
+          "{vectorSearch:{path:'v',queryVector:" + queryVector + ",numCandidates:16,limit:1}}");
+      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("scalar.v", queryVector));
+      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("plain.v", packedBits));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_vectorUnderLiteralDottedDocument_retainsConfiguredParent()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String dynamic =
+          f.create(
+              "dotted-parent",
+              """
+              {mappings:{dynamic:false,fields:{'a.b':{type:'document',dynamic:{typeSet:'learn'}}}},
+               typeSets:[{name:'learn',types:[{type:'vector',similarity:'euclidean'}]}]}
+              """);
+      String document = "{_id:1,'a.b':{v:" + bsonFloatVector(1, 0) + "}}";
+      f.upsert(dynamic, document);
+      var exported =
+          f.catalog.getIndexMappings(
+              GetIndexMappingsRequest.newBuilder().setIndexId(dynamic).build());
+      var fixed = f.create("static-dotted-parent", exported.getDefinitionJson());
+      f.upsert(fixed, document);
+
+      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("a.b.v", "[1,0]"));
+    }
+  }
+
+  private static void assertSameVectorResults(
+      Fixture f, String fixed, String dynamic, String query) {
+    var results = f.query(dynamic, query).getArray("results");
+    assertThat(results).hasSize(1);
+    assertThat(f.query(fixed, query).getArray("results")).isEqualTo(results);
+  }
+
+  private static String exactVectorQuery(String path, String vector) {
+    return "{vectorSearch:{path:'" + path + "',queryVector:" + vector + ",exact:true,limit:10}}";
+  }
+
+  private static String bsonFloatVector(float... values) {
+    var binary = BsonVectorParser.encode(Vector.fromFloats(values, FloatVector.OriginalType.BSON));
+    return "BinData(9,'" + java.util.Base64.getEncoder().encodeToString(binary.getData()) + "')";
   }
 
   @Test

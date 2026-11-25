@@ -161,6 +161,31 @@ A write targets exactly one index. For multiple text/vector indexes, the caller 
 to each index. There is no fan-out, cross-index transaction, collection, document read API,
 strict INSERT, request-ID deduplication, or replay endpoint.
 
+### Vector fields in Search type sets
+
+A Search index can discover single-valued BSON binary subtype 9 vectors at the root or inside
+ordinary documents. This example uses scalar quantization and learns dimensions per path.
+
+```json
+{
+  "mappings": { "dynamic": { "typeSet": "embeddings" } },
+  "typeSets": [{
+    "name": "embeddings",
+    "types": [{ "type": "vector", "similarity": "cosine", "quantization": "scalar" }]
+  }]
+}
+```
+
+Set `numDimensions` on the vector entry to require that length at every matching path.
+When omitted, the first successfully indexed vector at each path sets its length for the
+local index generation, across partitions and restarts. Subsequent vectors of a different
+length at that path are skipped. Independently built indexes can learn different lengths
+if their input mixes dimensions. Numeric arrays require an explicit static vector mapping.
+
+The supported quantization settings are `none` (default), `scalar`, and `binary`.
+The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.
+Binary quantization requires a multiple of eight in both dimension modes.
+
 ### Delete by query
 
 `DocumentService.DeleteByQuery` streams matching IDs into bounded delete batches from one index. Its

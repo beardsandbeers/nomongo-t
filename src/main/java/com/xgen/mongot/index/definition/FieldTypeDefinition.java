@@ -27,6 +27,7 @@ public sealed interface FieldTypeDefinition extends DocumentEncodable
         StringFieldDefinition,
         StringFacetFieldDefinition,
         TokenFieldDefinition,
+        TypeSetVectorFieldDefinition,
         UuidFieldDefinition {
 
   class Fields {
@@ -85,7 +86,10 @@ public sealed interface FieldTypeDefinition extends DocumentEncodable
   int hashCode();
 
   static FieldTypeDefinition fromBson(DocumentParser parser) throws BsonParseException {
-    var type = parser.getField(Fields.TYPE).unwrap();
+    return parseType(parser, parser.getField(Fields.TYPE).unwrap());
+  }
+
+  static FieldTypeDefinition parseType(DocumentParser parser, Type type) throws BsonParseException {
     return switch (type) {
       case AUTOCOMPLETE -> AutocompleteFieldDefinition.fromBson(parser);
       case AUTO_EMBED -> SearchAutoEmbedFieldDefinition.fromBson(parser);

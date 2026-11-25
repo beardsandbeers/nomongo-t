@@ -527,6 +527,27 @@ public final class SearchIndexDefinition implements IndexDefinition {
     return new SearchIndexCapabilities(version, this.indexFeatureVersion);
   }
 
+  /**
+   * Vector rules reachable through ordinary document mappings, where Search indexes BSON vectors.
+   */
+  public Stream<TypeSetVectorFieldDefinition> dynamicVectorFields() {
+    if (this.typeSetsMap.isEmpty()) {
+      return Stream.empty();
+    }
+    return Stream.concat(
+            Stream.of(getMappings()),
+            getFieldHierarchyContext().getRootFields().values().stream()
+                .flatMap(field -> field.documentFieldDefinition().stream()))
+        .map(DocumentFieldDefinition::dynamic)
+        .filter(DynamicDefinition.Document.class::isInstance)
+        .map(DynamicDefinition.Document.class::cast)
+        .map(dynamic -> this.typeSetsMap.get(dynamic.typeSet()))
+        .distinct()
+        .flatMap(set -> set.types().stream())
+        .filter(TypeSetVectorFieldDefinition.class::isInstance)
+        .map(TypeSetVectorFieldDefinition.class::cast);
+  }
+
   public boolean isStringFacetsFieldIndexed() {
     return !this.getStaticFieldDefinitionsOfType(FieldDefinition::stringFacetFieldDefinition)
         .isEmpty();

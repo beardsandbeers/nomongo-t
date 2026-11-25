@@ -34,8 +34,13 @@ import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
 import com.xgen.mongot.index.analyzer.wrapper.LuceneAnalyzer;
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.TypeSetDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorIndexDefinition;
+import com.xgen.mongot.index.definition.VectorSimilarity;
+import com.xgen.mongot.index.definition.quantization.VectorQuantization;
 import com.xgen.mongot.index.lucene.analyzer.CustomAnalyzer;
 import com.xgen.mongot.index.lucene.codec.bloom.BloomCodecPolicy;
 import com.xgen.mongot.index.lucene.config.LuceneConfig;
@@ -54,6 +59,7 @@ import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.BsonUtils;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.bson.BsonVectorParser;
 import com.xgen.mongot.util.bson.FloatVector;
 import com.xgen.mongot.util.bson.Vector;
 import com.xgen.mongot.util.regex.RegexInterruptedException;
@@ -63,7 +69,9 @@ import com.xgen.testing.TestUtils;
 import com.xgen.testing.mongot.index.analyzer.AnalyzerRegistryBuilder;
 import com.xgen.testing.mongot.index.definition.DocumentFieldDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.FieldDefinitionBuilder;
+import com.xgen.testing.mongot.index.definition.SearchIndexDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.StringFacetFieldDefinitionBuilder;
+import com.xgen.testing.mongot.index.definition.StringFieldDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.TokenFieldDefinitionBuilder;
 import com.xgen.testing.mongot.mock.index.SearchIndex;
 import com.xgen.testing.mongot.mock.index.VectorIndex;
@@ -77,6 +85,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -105,6 +114,7 @@ import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermInSetQuery;
 import org.apache.lucene.search.TermRangeQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.util.BytesRef;
@@ -287,6 +297,288 @@ public class SingleLuceneIndexWriterTest {
         Optional.empty(),
         FeatureFlags.getDefault(),
         () -> false);
+  }
+
+  public static class DynamicVectorTests {
+    private static final FieldPath PATH = FieldPath.parse("embedding");
+    private static final SearchIndexDefinition DEFINITION =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                DocumentFieldDefinitionBuilder.builder()
+                    .dynamic("vectors")
+                    .field(
+                        "text",
+                        FieldDefinitionBuilder.builder()
+                            .string(StringFieldDefinitionBuilder.builder().build())
+                            .build())
+                    .build())
+            .typeSets(
+                new TypeSetDefinition(
+                    "vectors",
+                    List.of(
+                        new TypeSetVectorFieldDefinition(
+                            Optional.empty(),
+                            VectorSimilarity.EUCLIDEAN,
+                            VectorQuantization.NONE))))
+            .build();
+
+    private static SingleLuceneIndexWriter open(
+        Directory directory, SearchFieldDefinitionResolver resolver, Optional<Integer> limit)
+        throws IOException {
+      return open(directory, resolver, limit, AnalyzerRegistryBuilder.empty());
+    }
+
+    private static SingleLuceneIndexWriter open(
+        Directory directory,
+        SearchFieldDefinitionResolver resolver,
+        Optional<Integer> limit,
+        AnalyzerRegistry registry)
+        throws IOException {
+      return SingleLuceneIndexWriter.createForSearchIndex(
+          directory,
+          createMergeScheduler(
+              new InstrumentedConcurrentMergeScheduler(new SimpleMeterRegistry()),
+              MOCK_INDEX_GENERATION_ID,
+              0,
+              1,
+              false,
+              directory),
+          new TieredMergePolicy(),
+          16D,
+          limit,
+          Optional.empty(),
+          LuceneAnalyzer.indexAnalyzer(resolver.indexDefinition, registry),
+          resolver,
+          SearchIndex.mockIndexingMetricsUpdater(DEFINITION.getType()),
+          Optional.empty(),
+          FeatureFlags.getDefault(),
+          () -> false);
+    }
+
+    private static DocumentEvent vector(int id, int dimensions) {
+      var doc =
+          BsonUtils.documentToRaw(
+              new BsonDocument("_id", new BsonInt32(id))
+                  .append(
+                      PATH.toString(),
+                      BsonVectorParser.encode(Vector.fromBytes(new byte[dimensions]))));
+      return DocumentEvent.createInsert(
+          DocumentMetadata.fromOriginalDocument(Optional.of(doc)), doc);
+    }
+
+    @Test
+    public void updateIndex_analysisRejectsFirstDocument_nextVectorCanChooseDifferentDimensions()
+        throws Exception {
+      var resolver = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      var registry = spy(AnalyzerRegistryBuilder.empty());
+      try (var analyzer =
+              CustomAnalyzer.builder(KeywordTokenizer::new)
+                  .tokenFilter(
+                      input ->
+                          new TokenFilter(input) {
+                            @Override
+                            public boolean incrementToken() {
+                              throw new RegexLimitExceededException();
+                            }
+                          })
+                  .build();
+          var directory = new ByteBuffersDirectory()) {
+        doReturn(analyzer).when(registry).getAnalyzer(anyString());
+        try (var writer = open(directory, resolver, Optional.empty(), registry)) {
+          var bad =
+              BsonUtils.documentToRaw(
+                  new BsonDocument("_id", new BsonInt32(1))
+                      .append("embedding", BsonVectorParser.encode(Vector.fromBytes(new byte[3])))
+                      .append("text", new BsonString("fails analysis")));
+          var event =
+              DocumentEvent.createInsert(
+                  DocumentMetadata.fromOriginalDocument(Optional.of(bad)), bad);
+          assertThrows(RegexLimitExceededException.class, () -> writer.updateIndex(event));
+
+          assertThat(resolver.vectorDimensions().get(PATH)).isEmpty();
+          writer.updateIndex(vector(2, 8));
+          writer.commit(EncodedUserData.EMPTY);
+        }
+        var recovered = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var writer = open(directory, recovered, Optional.empty())) {
+          writer.updateIndex(vector(3, 8));
+          try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+            var merged = org.apache.lucene.index.FieldInfos.getMergedFieldInfos(reader);
+            var published = LuceneIndexMappingExporter.publishedFields(merged, recovered);
+            var winningField = FieldName.TypeField.KNN_BYTE.getInferredVectorFieldName(PATH, 8);
+            var failedField = FieldName.TypeField.KNN_BYTE.getInferredVectorFieldName(PATH, 3);
+            assertThat(published.fieldInfo(failedField)).isNull();
+            assertThat(published.fieldInfo(winningField)).isNotNull();
+            assertThat(new IndexSearcher(reader).count(new FieldExistsQuery(winningField)))
+                .isEqualTo(2);
+          }
+        }
+      }
+    }
+
+    @Test
+    public void updateIndex_concurrentFirstWrites_bindOnlyTheSuccessfulDimension()
+        throws Exception {
+      var resolver = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      try (var a = new ByteBuffersDirectory();
+          var b = new ByteBuffersDirectory();
+          var first = open(a, resolver, Optional.empty());
+          var second = open(b, resolver, Optional.empty());
+          var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+        var start = new java.util.concurrent.CyclicBarrier(2);
+        var writeA =
+            workers.submit(
+                () -> {
+                  start.await(10, TimeUnit.SECONDS);
+                  first.updateIndex(vector(1, 3));
+                  return null;
+                });
+        var writeB =
+            workers.submit(
+                () -> {
+                  start.await(10, TimeUnit.SECONDS);
+                  second.updateIndex(vector(2, 8));
+                  return null;
+                });
+
+        writeA.get(10, TimeUnit.SECONDS);
+        writeB.get(10, TimeUnit.SECONDS);
+        var published = resolver.getVectorFieldSpecification(PATH).orElseThrow().numDimensions();
+        var name = FieldName.TypeField.KNN_BYTE.getInferredVectorFieldName(PATH, published);
+        try (var readerA = DirectoryReader.open(first.getLuceneWriter());
+            var readerB = DirectoryReader.open(second.getLuceneWriter())) {
+          assertThat(readerA.numDocs() + readerB.numDocs()).isEqualTo(2);
+          assertThat(
+                  new IndexSearcher(readerA).count(new FieldExistsQuery(name))
+                      + new IndexSearcher(readerB).count(new FieldExistsQuery(name)))
+              .isEqualTo(1);
+          assertThat(
+                  java.util.stream.Stream.of(readerA, readerB)
+                      .flatMap(reader -> reader.leaves().stream())
+                      .map(leaf -> leaf.reader().getFieldInfos().fieldInfo(name))
+                      .filter(java.util.Objects::nonNull)
+                      .map(info -> info.getVectorDimension())
+                      .toList())
+              .containsExactly(published);
+        }
+      }
+    }
+
+    @Test
+    public void reopen_legacyBinding_keepsExistingVectorsSearchableAcrossNewWrites()
+        throws Exception {
+      var name = FieldName.TypeField.KNN_BYTE.getLuceneFieldName(PATH, Optional.empty());
+      try (var directory = new ByteBuffersDirectory()) {
+        try (var writer =
+            open(
+                directory,
+                DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT),
+                Optional.empty())) {
+          // Build the physical field and dimension checkpoint produced by the original writer.
+          var document = new Document();
+          document.add(
+              new org.apache.lucene.document.KnnByteVectorField(
+                  name, new byte[3], VectorSimilarityFunction.EUCLIDEAN));
+          writer.getLuceneWriter().addDocument(document);
+          writer
+              .getLuceneWriter()
+              .setLiveCommitData(
+                  java.util.Map.of(
+                          "typeSetVectorDimensions/embedding",
+                          "3",
+                          "userData",
+                          EncodedUserData.EMPTY.asString())
+                      .entrySet());
+          writer.getLuceneWriter().commit();
+        }
+        var resolver = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var writer = open(directory, resolver, Optional.empty())) {
+          writer.updateIndex(vector(1, 3));
+          writer.updateIndex(vector(2, 8));
+          writer.commit(EncodedUserData.EMPTY);
+        }
+        var recovered = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var writer = open(directory, recovered, Optional.empty());
+            var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+          assertThat(
+                  recovered
+                      .vectorDimensions()
+                      .binding(PATH.toString())
+                      .orElseThrow()
+                      .dimensionInFieldName())
+              .isFalse();
+          assertThat(new IndexSearcher(reader).count(new FieldExistsQuery(name))).isEqualTo(2);
+        }
+      }
+    }
+
+    @Test
+    public void reopen_onlyMismatchingPartitionCommitted_restoresDimensionUsedByItsWrite()
+        throws Exception {
+      var resolver = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      try (var a = new ByteBuffersDirectory();
+          var b = new ByteBuffersDirectory()) {
+        try (var first = open(a, resolver, Optional.empty());
+            var second = open(b, resolver, Optional.empty())) {
+          first.updateIndex(vector(1, 3));
+          second.updateIndex(vector(2, 8));
+          second.commit(EncodedUserData.EMPTY);
+        }
+
+        var recovered = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var second = open(b, recovered, Optional.empty())) {
+          assertThat(recovered.vectorDimensions().get(PATH)).hasValue(3);
+          second.updateIndex(vector(3, 3));
+          try (var reader = DirectoryReader.open(second.getLuceneWriter())) {
+            assertThat(reader.numDocs()).isEqualTo(2);
+            assertThat(
+                    new IndexSearcher(reader)
+                        .count(
+                            new FieldExistsQuery(
+                                FieldName.TypeField.KNN_BYTE.getInferredVectorFieldName(PATH, 3))))
+                .isEqualTo(1);
+          }
+        }
+      }
+    }
+
+    @Test
+    public void reopen_partialCommitAfterFailedDiscovery_restoresBindingEvenAfterDeletion()
+        throws Exception {
+      var resolver = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      try (var a = new ByteBuffersDirectory();
+          var b = new ByteBuffersDirectory()) {
+        try (var first = open(a, resolver, Optional.of(1));
+            var second = open(b, resolver, Optional.empty())) {
+          first.commit(EncodedUserData.EMPTY);
+          assertThrows(FieldExceededLimitsException.class, () -> first.updateIndex(vector(1, 3)));
+          assertThat(resolver.getVectorFieldSpecification(PATH)).isEmpty();
+
+          second.updateIndex(vector(2, 8));
+          second.updateIndex(DocumentEvent.createDelete(new BsonInt32(2)));
+          second.forceMerge(1);
+          // Partition zero still has its old checkpoint.
+          second.commit(EncodedUserData.EMPTY);
+        }
+        var recovered = DEFINITION.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var first = open(a, recovered, Optional.empty());
+            var second = open(b, recovered, Optional.empty())) {
+          assertThat(recovered.getVectorFieldSpecification(PATH).orElseThrow().numDimensions())
+              .isEqualTo(8);
+          first.updateIndex(vector(3, 3));
+          first.updateIndex(vector(4, 8));
+          try (var reader = DirectoryReader.open(first.getLuceneWriter())) {
+            assertThat(
+                    new IndexSearcher(reader)
+                        .count(
+                            new FieldExistsQuery(
+                                FieldName.TypeField.KNN_BYTE.getInferredVectorFieldName(PATH, 8))))
+                .isEqualTo(1);
+          }
+        }
+      }
+    }
   }
 
   @RunWith(Theories.class)

@@ -506,6 +506,15 @@ public class IndexableFieldFactory {
       FieldPath field,
       Vector vector,
       VectorFieldSpecification specification) {
+    addKnnVectorField(document, field, vector, specification, false);
+  }
+
+  static void addKnnVectorField(
+      AbstractDocumentWrapper document,
+      FieldPath field,
+      Vector vector,
+      VectorFieldSpecification specification,
+      boolean dimensionInFieldName) {
     // This is the field name we use to check for duplicate vectors and invalid vectors. The
     // embeddedRoot is set to be empty when we are retrieving the field name for this purpose.
     String checkFieldName =
@@ -553,9 +562,11 @@ public class IndexableFieldFactory {
     }
 
     VectorSimilarityFunction similarityFunction = similarity.getLuceneSimilarityFunction();
+    var type = VectorTypeFieldResolver.resolveTypeField(quantization, vector.getVectorType());
     String vectorFieldName =
-        VectorTypeFieldResolver.resolveTypeField(quantization, vector.getVectorType())
-            .getLuceneFieldName(field, document.getEmbeddedRoot());
+        dimensionInFieldName
+            ? type.getInferredVectorFieldName(field, dimensions)
+            : type.getLuceneFieldName(field, document.getEmbeddedRoot());
     try {
       switch (vector.getVectorType()) {
         case FLOAT -> {

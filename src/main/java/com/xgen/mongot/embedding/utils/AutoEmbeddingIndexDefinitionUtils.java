@@ -52,6 +52,7 @@ public class AutoEmbeddingIndexDefinitionUtils {
           Optional.empty(),
           Optional.empty(),
           Optional.empty(),
+          Optional.empty(),
           Optional.empty());
 
   /**
@@ -398,7 +399,8 @@ public class AutoEmbeddingIndexDefinitionUtils {
         original.stringFieldDefinition(),
         original.stringFacetFieldDefinition(),
         original.tokenFieldDefinition(),
-        original.uuidFieldDefinition());
+        original.uuidFieldDefinition(),
+        original.typeSetVectorFieldDefinition());
   }
 
   private static FieldDefinition documentOnlyField(DocumentFieldDefinition document) {

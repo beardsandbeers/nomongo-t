@@ -13,6 +13,7 @@ import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.mongot.util.bson.parser.DocumentEncodable;
 import com.xgen.mongot.util.bson.parser.DocumentParser;
 import com.xgen.mongot.util.bson.parser.Field;
+import com.xgen.mongot.util.bson.parser.IntegerField;
 import com.xgen.mongot.util.bson.parser.ParsedField;
 import java.util.Objects;
 import java.util.Optional;
@@ -30,11 +31,10 @@ public class VectorFieldSpecification implements DocumentEncodable {
   public static final int MAX_DIMENSIONS = 8192;
 
   public static class Fields {
-    public static final Field.Required<Integer> NUM_DIMENSIONS =
-        Field.builder("numDimensions")
-            .intField()
-            .mustBeWithinBounds(Range.of(1, MAX_DIMENSIONS))
-            .required();
+    private static final IntegerField.FieldBuilder DIMENSIONS =
+        Field.builder("numDimensions").intField().mustBeWithinBounds(Range.of(1, MAX_DIMENSIONS));
+    public static final Field.Required<Integer> NUM_DIMENSIONS = DIMENSIONS.required();
+    static final Field.Optional<Integer> OPTIONAL_DIMENSIONS = DIMENSIONS.optional().noDefault();
     public static final Field.Required<VectorSimilarity> SIMILARITY =
         Field.builder("similarity").enumField(VectorSimilarity.class).asCamelCase().required();
 
@@ -238,12 +238,16 @@ public class VectorFieldSpecification implements DocumentEncodable {
     };
   }
 
+  static boolean validQuantizationDimensions(int dimensions, VectorQuantization quantization) {
+    return quantization != VectorQuantization.BINARY || dimensions % 8 == 0;
+  }
+
   private static void validateBinaryQuantizationDimensionsMultipleOf8(
       BsonParseContext context,
       ParsedField.Required<Integer> dimensions,
       ParsedField.WithDefault<VectorQuantization> quantization)
       throws BsonParseException {
-    if (quantization.unwrap() == VectorQuantization.BINARY && dimensions.unwrap() % 8 != 0) {
+    if (!validQuantizationDimensions(dimensions.unwrap(), quantization.unwrap())) {
       context.handleSemanticError(
           dimensions.getField()
               + " "

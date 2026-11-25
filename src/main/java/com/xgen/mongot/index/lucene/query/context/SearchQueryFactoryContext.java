@@ -21,6 +21,7 @@ import com.xgen.mongot.index.definition.SortableStringBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.definition.UuidFieldDefinition;
 import com.xgen.mongot.index.definition.VectorAutoEmbedFieldSpecification;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorAutoEmbedQuantization;
@@ -185,8 +186,7 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
 
     Optional<VectorSimilarity> vectorSimilarity =
         this.fieldDefinitionResolver
-            .getFieldDefinition(fieldPath, embeddedRoot)
-            .flatMap(FieldDefinition::vectorFieldSpecification)
+            .getVectorFieldSpecification(fieldPath, embeddedRoot)
             .map(VectorFieldSpecification::similarity);
 
     if (vectorSimilarity.isEmpty()) {
@@ -200,13 +200,22 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
   @Override
   public VectorQuantization getIndexedQuantization(
       FieldPath fieldPath, Optional<FieldPath> embeddedRoot) {
-    Optional<FieldDefinition> fieldDefinition =
-        this.fieldDefinitionResolver.getFieldDefinition(fieldPath, embeddedRoot);
-    if (fieldDefinition.isEmpty() || fieldDefinition.get().vectorFieldSpecification().isEmpty()) {
-      return VectorQuantization.NONE;
-    }
+    return this.fieldDefinitionResolver
+        .getVectorFieldSpecification(fieldPath, embeddedRoot)
+        .map(VectorFieldSpecification::quantization)
+        .orElse(VectorQuantization.NONE);
+  }
 
-    return fieldDefinition.get().vectorFieldSpecification().get().quantization();
+  @Override
+  public Optional<Integer> getVectorFieldNameDimensions(
+      FieldPath path, Optional<FieldPath> embeddedRoot) {
+    return embeddedRoot.isPresent()
+        ? Optional.empty()
+        : this.fieldDefinitionResolver
+            .vectorDimensions()
+            .binding(path.toString())
+            .filter(VectorDimensions.Binding::dimensionInFieldName)
+            .map(VectorDimensions.Binding::dimensions);
   }
 
   @Override

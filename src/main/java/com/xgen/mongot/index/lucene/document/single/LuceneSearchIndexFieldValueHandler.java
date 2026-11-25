@@ -10,12 +10,14 @@ import com.xgen.mongot.index.definition.NumberFieldDefinition;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
 import com.xgen.mongot.index.definition.SortableNumberBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.ingestion.handlers.DocumentHandler;
 import com.xgen.mongot.index.ingestion.handlers.FieldValueHandler;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.geo.LuceneGeometryFields;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.bson.BsonVectorParser;
 import com.xgen.mongot.util.bson.Vector;
 import java.io.IOException;
 import java.util.Optional;
@@ -310,6 +312,55 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
           numberFieldDefinition.options().representation());
       addNullnessFieldIfNeeded(Optional.of(numberFieldDefinition.options().representation()));
     }
+  }
+
+  @Override
+  public void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {
+    var configured = this.fieldDefinition.typeSetVectorFieldDefinition();
+    if (configured.isEmpty()
+        || this.isMultiValued
+        || this.documentWrapper.getEmbeddedRoot().isPresent()
+        || this.path.toString().isEmpty()
+        || binarySize <= BsonVectorParser.BSON_VECTOR_HEADER_SIZE
+        || binarySize
+            > BsonVectorParser.BSON_VECTOR_HEADER_SIZE
+                + Float.BYTES * VectorFieldSpecification.MAX_DIMENSIONS) {
+      return;
+    }
+    // Lucene and queries address a field by its dotted name, even for literal dots in BSON keys.
+    var canonicalPath =
+        this.path.getPathHierarchy().stream().anyMatch(part -> part.getLeaf().contains("."))
+            ? FieldPath.parse(this.path.toString())
+            : this.path;
+    var rule =
+        this.documentWrapper
+            .resolver
+            .getFieldDefinition(canonicalPath, Optional.empty())
+            .flatMap(FieldDefinition::typeSetVectorFieldDefinition);
+    if (rule.isEmpty()) {
+      return;
+    }
+    var parsed = supplier.get();
+    if (parsed.isEmpty()) {
+      return;
+    }
+    var vector = parsed.get();
+    // The partition writer checks inferred lengths so its commit can also record a binding
+    // when this partition's first occurrence of the path has a different length.
+    boolean dimensionInFieldName =
+        rule.get().numDimensions().isEmpty()
+            && this.documentWrapper
+                .resolver
+                .vectorDimensions()
+                .binding(canonicalPath.toString())
+                .map(VectorDimensions.Binding::dimensionInFieldName)
+                .orElse(true);
+    rule.get()
+        .resolve(() -> Optional.of(vector.numDimensions()))
+        .ifPresent(
+            spec ->
+                IndexableFieldFactory.addKnnVectorField(
+                    this.documentWrapper, canonicalPath, vector, spec, dimensionInFieldName));
   }
 
   @Override

@@ -110,9 +110,7 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
       FieldPath fieldPath, Optional<FieldPath> embeddedRoot, int dimensions)
       throws InvalidQueryException {
     Optional<VectorFieldSpecification> definition =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(fieldPath, embeddedRoot)
-            .flatMap(FieldDefinition::vectorFieldSpecification);
+        this.fieldDefinitionResolver.getVectorFieldSpecification(fieldPath, embeddedRoot);
 
     if (definition.isEmpty()) {
       throw new InvalidQueryException(
