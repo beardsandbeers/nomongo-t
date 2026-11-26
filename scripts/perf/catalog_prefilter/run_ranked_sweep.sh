@@ -16,6 +16,7 @@ run() {
   local name=$1 mode=$2 filter=$3 queries=$4
   shift 4
   local props=()
+  if [[ -n ${CATALOG_LIMITS:-} ]]; then props+=("-Dcatalog.limits=$CATALOG_LIMITS"); fi
   if [[ $filter != all ]]; then props+=("-Dcatalog.filter=$filter"); fi
   java "${java_args[@]}" "${props[@]}" -cp "${CLASSPATH:?Set CLASSPATH to the benchmark classpath}" \
     RankedStreamBenchmark "$mode" "$leaf0" "$leaf1" "$queries" "$@" > "$out/$name.csv"

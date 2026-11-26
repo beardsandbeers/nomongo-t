@@ -1,5 +1,8 @@
 # Filter materialization with retained int8 product embeddings
 
+**Current recall benchmarks use k = 10, 20, 50 and 100.** The original k = 48 reproduced the result limit in the supplied price-capped search plan. [Standard recall cutoffs](#recall-at-10-20-50-and-100)
+
+
 The [float32 control](../README.md) already had a one-bit HNSW graph scorer. Its raw vector file still consumed 16,616 bytes per product. Here the same 4,154 coordinates are retained as signed bytes, using 4,154 bytes per product. Mongot’s binary-quantized byte-vector codec builds the graph from their signs. The physical leaf size stays near 5 GiB while the number of products and filter values increases.
 
 **0 of 700 materializations reached 500 ms.** Across the two leaves, the seven filters actually admitted 125,958 to 851,502 products per leaf (11.1% to 75.4%). The highest per-filter p95 was 25.13 ms and the slowest observation was 29.43 ms. Both were for the combined price, rating, review-count and category predicate after requesting file eviction.
@@ -151,7 +154,7 @@ python "$src/prepare.py" "$work/cohorts" "$work/queries.i8" \
 javac -proc:none -cp "$classpath" -d "$work" "$src/CatalogPrefilter.java" \
   "$src/CatalogFilterProfile.java" "$src/RankedStreamBenchmark.java"
 for experiment in prefix stage; do
-  java -Xms1g -Xmx3g --enable-preview --add-modules jdk.incubator.vector \
+  java -Dcatalog.limits=48 -Xms1g -Xmx3g --enable-preview --add-modules jdk.incubator.vector \
     --enable-native-access=ALL-UNNAMED -cp "$work:$classpath" RankedStreamBenchmark \
     "$experiment" "$work/leaf0" "$work/leaf1" "$work/queries.i8" > "$work/results/$experiment.csv"
 done
@@ -195,7 +198,7 @@ On the six-category filter (77.45% acceptance), expanding 128 neighborhoods ever
 
 Use the same two leaves, query digest, JVM flags and exact truth procedure as above. Measurements used an i5-12600K and OpenJDK 21.0.13. Each implementation ran in a separate JVM with serial leaf execution and warm files. Within each stage run, the harness shuffled stock and streaming configurations for each query and repetition. Percentiles use the nearest rank over 48 stage observations per configuration. Prefix timings include open and were sampled once per query and configuration in the listed order. The observations cover two dense leaves and 16 independent query vectors. They leave cold latency, concurrent throughput, high segment fan-out and the production routing threshold open.
 
-Compile the **current** benchmark harness once. Put its classes first on the runtime classpath. For a checkpoint run, use the deploy JAR from `c0e870c5`. For optimized runs, use the deploy JAR containing the continuation and point membership changes. To isolate point membership, extract `com/xgen/mongot/index/lucene/streaming/PointRangeMembership*.class` from the checkpoint JAR into a fresh directory (including the visitor inner class) and put that directory before the optimized JAR. An optional JVM property `-Dcatalog.filter=categories_6` or `-Dcatalog.filter=point_only_price` restricts the stage trial to one predicate.
+Compile the current benchmark harness once. Put its classes first on the runtime classpath and pass `-Dcatalog.limits=48` to reproduce the historical cutoff. For a checkpoint run, use the deploy JAR from `c0e870c5`. For optimized runs, use the deploy JAR containing the continuation and point membership changes. To isolate point membership, extract `com/xgen/mongot/index/lucene/streaming/PointRangeMembership*.class` from the checkpoint JAR into a fresh directory (including the visitor inner class) and put that directory before the optimized JAR. An optional JVM property `-Dcatalog.filter=categories_6` or `-Dcatalog.filter=point_only_price` restricts the stage trial to one predicate.
 
 With `run` invoking `RankedStreamBenchmark` as in the streaming reproduction, supply the following arguments after the mode and three input paths.
 
@@ -295,8 +298,57 @@ dd if="$work/80.i8" of="$work/validation.i8" bs=4154 skip=16 status=none
 mkdir -p "$work/sweep-classes"
 javac -proc:none -cp "$classpath" -d "$work/sweep-classes" "$src/CatalogPrefilter.java" \
   "$src/CatalogFilterProfile.java" "$src/RankedStreamBenchmark.java"
-CLASSPATH="$work/sweep-classes:$classpath" "$src/run_ranked_sweep.sh" \
+CATALOG_LIMITS=48 CLASSPATH="$work/sweep-classes:$classpath" "$src/run_ranked_sweep.sh" \
   "$work/leaf0" "$work/leaf1" "$work/tuning.i8" "$work/validation.i8" "$work/sweep-results"
 ```
 
 The runner lists each configuration in width / visit limit / refill interval / refill size order. Stage p95 is nearest rank over three repetitions per query. Recall is the fraction of exact filtered top-48 hits in the final result. Pool recall measures how many of those hits were available before rescoring. Prefix timings use one observation per query and include open. The full set of query-level observations, including stock controls and prefix inversions, is available for reanalysis. [Runner](../../../../../scripts/perf/catalog_prefilter/run_ranked_sweep.sh) · [Stage summary](sweep-stage-summary.csv) · [Prefix summary](sweep-prefix-summary.csv) · [Raw CSV archive](sweep-observations.zip)
+
+## Recall at 10, 20, 50 and 100
+
+For each query and each k, compare the distinct returned document IDs in its first k positions with the exact filtered top k on the two catalog segments. Recall@k is the size of that intersection divided by k. Exhaustive ranking uses retained int8 similarity with document ID as the tie-breaker. The reported percentages give each query equal weight.
+
+The finite stage executes a separate search and rescore for each requested limit. Mongot’s production full-fidelity budget is the integer part of the square root of (limit × candidates). At 500 candidates, limits 10, 20, 50 and 100 therefore read 70, 100, 158 and 223 retained vectors respectively. The full-pool experiment rescores every candidate and takes the first k final hits. The generic cursor uses the first k emissions from a single walk, in delivery order. A later hit can outrank a previously delivered hit.
+
+### Six-category filter, 64 held-out queries
+
+Both finite-stage paths searched the same 2.26 million products on two warm 5.37 GB leaves. The filter admitted 77.45%. Streaming uses the previously selected traversal settings of width 1,024, visit limit 2,048 and 256 expansions every 128 deliveries. Each pair of rows uses the same candidate and full-fidelity budgets.
+
+| Candidates | Rescoring | Search | @10 | @20 | @50 | @100 |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 500 | Production | Ordinary kNN | 79.22% | 78.28% | 75.12% | 68.58% |
+| 500 | Production | Streaming | 79.38% | 77.97% | 74.38% | 67.17% |
+| 500 | Full pool | Ordinary kNN | 92.19% | 91.33% | 87.38% | 80.33% |
+| 500 | Full pool | Streaming | 91.88% | 90.70% | 86.59% | 78.88% |
+| 2,000 | Production | Ordinary kNN | 82.03% | 81.80% | 79.56% | 76.52% |
+| 2,000 | Production | Streaming | 82.50% | 81.88% | 79.53% | 76.48% |
+| 2,000 | Full pool | Ordinary kNN | 95.78% | 96.09% | 94.59% | 91.75% |
+| 2,000 | Full pool | Streaming | 95.94% | 95.86% | 94.31% | 91.39% |
+| 8,000 | Full pool | Ordinary kNN | 98.44% | 98.75% | 98.44% | 97.56% |
+| 8,000 | Full pool | Streaming | 98.44% | 98.75% | 98.47% | 97.61% |
+
+### Generic cursor on the same validation queries
+
+| Width / visits | Refill every / expansions | @10 | @20 | @50 | @100 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 64 / 1,024 | 8 / 8 | 83.75% | 81.80% | 77.94% | 74.03% |
+| 4,096 / 65,536 | 32 / 64 | 98.12% | 98.20% | 97.97% | 97.53% |
+
+### Filter and traversal sensitivity
+
+The production-budget stage comparison also covered three categories, the two equivalent price filters (doc values and points), and two categories with a price ceiling. On the price-capped compound query, streaming trailed ordinary kNN by 2.19 percentage points at 10 and by 7.36 points at 100. The two equivalent price predicates produced identical recall at all four cutoffs within each search mode. The summary includes every filter and traversal configuration.
+
+The original 16 tuning queries were replayed over the same 110 parameter combinations for both paths. Across those configurations, mean recall ranged as follows. The held-out tables above evaluate previously selected settings.
+
+| Tuning range | @10 | @20 | @50 | @100 |
+| --- | ---: | ---: | ---: | ---: |
+| Streaming stage, 500 candidates, production rescoring | 66.88–76.25% | 59.38–70.00% | 53.75–62.62% | 46.62–56.06% |
+| Generic cursor | 53.12–91.88% | 48.12–89.69% | 40.38–89.50% | 32.50–91.31% |
+
+### Reproduction
+
+Use the benchmark classpath and the 16-query tuning and 64-query validation files from the wider sweep. The Java harness defaults to the four standard cutoffs in `stage`, `recall` and `rescore` modes. Its stage CSV uses `k`, `recall_at_k` and `pool_hits_at_k`. For historical stage measurements pass `-Dcatalog.limits=48`, or set `CATALOG_LIMITS=48` when using the shell sweep runner. The prefix CSV reports all four standard cutoffs and can additionally report hit 500 using `-Dcatalog.deepPrefix=true`.
+
+For ordinary and streaming results, invoke `RankedStreamBenchmark recall leaf0 leaf1 validation.i8 1024/2048/128/256` with the JVM flags documented above. Choose `-Dcatalog.candidates=500`, `2000` or `8000`, and `-Dcatalog.rescoreAll=true` for the full-pool control. Set `-Dcatalog.filter=categories_6` for the broad-only comparison. The all-filter trial uses 500 candidates and production rescoring. The tuning grid uses the 110 configurations from the previous section with 500 candidates and production rescoring.
+
+The `recall` mode runs each cutoff/configuration once on the fixed graph. For timing, `stage` discards one warm-up and records three shuffled repetitions per query, cutoff and configuration. The archived broad 500-candidate production and 2,000-candidate full-pool comparisons use these timing trials. Repetitions count once per query in recall averages. The other stage comparisons use the single-pass mode, whose timings should be excluded from latency comparisons. For the cursor, use `prefix leaf0 leaf1 validation.i8 64/1024/8/8 4096/65536/32/64` with `-Dcatalog.shufflePrefixes=true`. [Mean recall by configuration and filter](recall-cutoffs.csv) · [Raw per-query CSVs](recall-cutoffs-raw.zip)

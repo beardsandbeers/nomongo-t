@@ -14,6 +14,7 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -36,7 +37,11 @@ import org.apache.lucene.util.NumericUtils;
 /** A/B against exact filtered retained-int8 truth on two real catalog graphs. */
 public class RankedStreamBenchmark {
   private static final int CANDIDATES = Integer.getInteger("catalog.candidates", 500);
-  private static final int LIMIT = 48;
+  private static final List<Integer> LIMITS =
+      Arrays.stream(System.getProperty("catalog.limits", "10,20,50,100").split(",", -1))
+          .map(Integer::parseInt)
+          .distinct()
+          .toList();
   private static final boolean DEEP_PREFIX = Boolean.getBoolean("catalog.deepPrefix");
   private static final Comparator<Hit> BEST =
       Comparator.comparingDouble(Hit::score).reversed().thenComparingInt(Hit::doc);
@@ -44,8 +49,6 @@ public class RankedStreamBenchmark {
       List.of(
           new StreamingOptions(32, 256, 8, 8, 250_000),
           new StreamingOptions(64, 1024, 8, 8, 250_000));
-  private static final ApproximateVectorSearchCriteria CRITERIA =
-      criteria(Boolean.getBoolean("catalog.rescoreAll") ? CANDIDATES : LIMIT);
   private static final BinaryQuantizedVectorRescorer RESCORER =
       new BinaryQuantizedVectorRescorer(Optional.empty());
 
@@ -84,7 +87,7 @@ public class RankedStreamBenchmark {
   }
 
   private static List<Hit> exact(IndexReader reader, Case filter, byte[] q) throws IOException {
-    int depth = DEEP_PREFIX ? 500 : 100;
+    int depth = Math.max(DEEP_PREFIX ? 500 : 100, Collections.max(LIMITS));
     var heap = new PriorityQueue<>(depth, BEST.reversed());
     for (var leaf : reader.leaves()) {
       var values = leaf.reader().getByteVectorValues("vector");
@@ -126,7 +129,19 @@ public class RankedStreamBenchmark {
         throw new AssertionError("Invalid hit " + hit);
       }
     }
-    return (double) hits.subList(0, k).stream().filter(truth.subList(0, k)::contains).count() / k;
+    var exactScores = new HashMap<Integer, Float>();
+    truth.subList(0, k).forEach(hit -> exactScores.put(hit.doc(), hit.score()));
+    int found = 0;
+    for (var hit : hits.subList(0, k)) {
+      Float exact = exactScores.get(hit.doc());
+      if (exact != null) {
+        if (Float.compare(exact, hit.score()) != 0) {
+          throw new AssertionError("Retained-vector score differs from exact for " + hit.doc());
+        }
+        found++;
+      }
+    }
+    return (double) found / k;
   }
 
   /** Fraction of pairs where a later hit has strictly higher similarity. */
@@ -178,7 +193,7 @@ public class RankedStreamBenchmark {
         }
         System.out.printf(
             Locale.ROOT,
-            "%d,%d,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%d,%.5f%s%n",
+            "%d,%d,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%d,%.5f%s,%.2f,%.2f%n",
             id,
             options.warmupWidth(),
             options.warmupVisits(),
@@ -190,7 +205,9 @@ public class RankedStreamBenchmark {
             first100,
             cached100,
             invertedPairs(hits.subList(0, 100)),
-            deeper);
+            deeper,
+            recall(hits, truth, 20, filter),
+            recall(hits, truth, 50, filter));
       }
     }
   }
@@ -201,18 +218,28 @@ public class RankedStreamBenchmark {
       byte[] q,
       int id,
       List<Hit> truth,
-      List<StreamingOptions> budgets)
+      List<StreamingOptions> budgets,
+      boolean recallOnly)
       throws IOException {
-    var modes = new ArrayList<Integer>();
-    for (int mode = 0; mode <= budgets.size(); mode++) {
-      modes.add(mode);
+    record Trial(
+        int mode, int limit, ApproximateVectorSearchCriteria criteria, HashSet<Integer> truthIds) {}
+    var trials = new ArrayList<Trial>();
+    for (int limit : LIMITS) {
+      var truthIds = new HashSet<Integer>();
+      truth.subList(0, limit).forEach(hit -> truthIds.add(hit.doc()));
+      var criteria = criteria(Boolean.getBoolean("catalog.rescoreAll") ? CANDIDATES : limit);
+      for (int mode = 0; mode <= budgets.size(); mode++) {
+        trials.add(new Trial(mode, limit, criteria, truthIds));
+      }
     }
-    var truthIds = new HashSet<Integer>();
-    truth.subList(0, LIMIT).forEach(hit -> truthIds.add(hit.doc()));
     var order = new Random(9137L + id);
-    for (int rep = -1; rep < 3; rep++) {
-      Collections.shuffle(modes, order);
-      for (int mode : modes) {
+    // Recall is deterministic on this fixed graph. Timing trials also warm up and repeat.
+    int repetitions = recallOnly ? 1 : 3;
+    for (int rep = recallOnly ? 0 : -1; rep < repetitions; rep++) {
+      Collections.shuffle(trials, order);
+      for (var trial : trials) {
+        int mode = trial.mode();
+        int limit = trial.limit();
         KnnByteVectorQuery query =
             mode == 0
                 ? new KnnByteVectorQuery("vector", q, CANDIDATES, filter.query)
@@ -222,22 +249,24 @@ public class RankedStreamBenchmark {
         var candidates = searcher.search(query, CANDIDATES);
         var results =
             RESCORER.rescore(
-                searcher, candidates, CRITERIA, BinaryQuantizedRescoreQuery.from(query));
-        if (results.scoreDocs.length > LIMIT) {
-          results.scoreDocs = Arrays.copyOf(results.scoreDocs, LIMIT);
+                searcher, candidates, trial.criteria(), BinaryQuantizedRescoreQuery.from(query));
+        if (results.scoreDocs.length > limit) {
+          results.scoreDocs = Arrays.copyOf(results.scoreDocs, limit);
         }
         double wall = (System.nanoTime() - start) / 1e6;
-        if (results.scoreDocs.length != LIMIT) {
+        if (results.scoreDocs.length != limit) {
           throw new AssertionError("Underfilled stage");
         }
         var hits = Arrays.stream(results.scoreDocs).map(sd -> new Hit(sd.doc, sd.score)).toList();
-        double recall = recall(hits, truth, LIMIT, filter);
+        double recall = recall(hits, truth, limit, filter);
         if (rep >= 0) {
           long poolHits =
-              Arrays.stream(candidates.scoreDocs).filter(sd -> truthIds.contains(sd.doc)).count();
+              Arrays.stream(candidates.scoreDocs)
+                  .filter(sd -> trial.truthIds().contains(sd.doc))
+                  .count();
           System.out.printf(
               Locale.ROOT,
-              "%d,%s,%d,%d,%s,%d,%d,%.3f,%.4f,%d,%d,%d%n",
+              "%d,%s,%d,%d,%s,%d,%d,%.3f,%.4f,%d,%d,%d,%d%n",
               id,
               filter.name,
               filter.allowed.cardinality(),
@@ -249,7 +278,8 @@ public class RankedStreamBenchmark {
               recall,
               mode == 0 ? 0 : budgets.get(mode - 1).refillEvery(),
               mode == 0 ? 0 : budgets.get(mode - 1).refillExpansions(),
-              poolHits);
+              poolHits,
+              limit);
         }
       }
     }
@@ -262,15 +292,16 @@ public class RankedStreamBenchmark {
       byte[] q,
       int id,
       List<Hit> truth,
-      StreamingOptions budget)
+      StreamingOptions budget,
+      int resultLimit)
       throws IOException {
     var query = new StreamingKnnQuery.Bytes("vector", q, CANDIDATES, filter.query, budget);
     var candidates = searcher.search(query, CANDIDATES);
     var rescoreQuery = BinaryQuantizedRescoreQuery.from(query);
     var limits =
         new ArrayList<>(
-            List.of(LIMIT, 125, CANDIDATES).stream()
-                .filter(limit -> limit <= CANDIDATES)
+            List.of(resultLimit, 125, CANDIDATES).stream()
+                .filter(limit -> limit >= resultLimit && limit <= CANDIDATES)
                 .distinct()
                 .toList());
     var order = new Random(9137L + id);
@@ -283,14 +314,14 @@ public class RankedStreamBenchmark {
         double wall = (System.nanoTime() - start) / 1e6;
         var hits =
             Arrays.stream(results.scoreDocs)
-                .limit(LIMIT)
+                .limit(resultLimit)
                 .map(sd -> new Hit(sd.doc, sd.score))
                 .toList();
-        double recall = recall(hits, truth, LIMIT, filter);
+        double recall = recall(hits, truth, resultLimit, filter);
         if (rep >= 0) {
           System.out.printf(
               Locale.ROOT,
-              "%d,%s,%d,%d,%d,%d,%d,%d,%.3f,%.4f%n",
+              "%d,%s,%d,%d,%d,%d,%d,%d,%.3f,%.4f,%d%n",
               id,
               filter.name,
               budget.warmupWidth(),
@@ -300,20 +331,22 @@ public class RankedStreamBenchmark {
               rep,
               (int) Math.sqrt(limit * CANDIDATES),
               wall,
-              recall);
+              recall,
+              resultLimit);
         }
       }
     }
   }
 
   public static void main(String[] args) throws Exception {
-    if (args.length < 4 || !List.of("prefix", "stage", "rescore").contains(args[0])) {
+    if (args.length < 4 || !List.of("prefix", "stage", "recall", "rescore").contains(args[0])) {
       throw new IllegalArgumentException(
-          "Expected prefix|stage|rescore leaf0 leaf1 queries.i8 [refillEvery/refillExpansions"
-              + " ...]");
+          "Expected prefix|stage|recall|rescore leaf0 leaf1 queries.i8"
+              + " [refillEvery/refillExpansions ...]");
     }
-    if (CANDIDATES < LIMIT) {
-      throw new IllegalArgumentException("Candidate count must cover the result limit");
+    if (Collections.min(LIMITS) < 1 || Collections.max(LIMITS) > CANDIDATES) {
+      throw new IllegalArgumentException(
+          "Result limits must be positive and at most the candidate count");
     }
     var budgets = new ArrayList<StreamingOptions>();
     for (int i = 4; i < args.length; i++) {
@@ -339,7 +372,8 @@ public class RankedStreamBenchmark {
       searcher.setQueryCache(null);
       var cases = new ArrayList<Case>();
       cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(6, false)));
-      if (args[0].equals("stage")) {
+      boolean recallOnly = args[0].equals("recall");
+      if (args[0].equals("stage") || recallOnly) {
         cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(3, false)));
         cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(2, true)));
         cases.add(
@@ -368,11 +402,12 @@ public class RankedStreamBenchmark {
           switch (args[0]) {
             case "prefix" ->
                 "query,width,visits,refillEvery,refillExpansions,recall10,recall100,first10_ms,first100_ms,cached,inverted_pairs100"
-                    + (DEEP_PREFIX ? ",recall500,first500_ms,cached500,inverted_pairs500" : "");
+                    + (DEEP_PREFIX ? ",recall500,first500_ms,cached500,inverted_pairs500" : "")
+                    + ",recall20,recall50";
             case "rescore" ->
-                "query,filter,width,visits,refillEvery,refillExpansions,repeat,full_fidelity_docs,rescore_ms,recall48";
+                "query,filter,width,visits,refillEvery,refillExpansions,repeat,full_fidelity_docs,rescore_ms,recall_at_k,k";
             default ->
-                "query,filter,accepted,repeat,mode,width,visits,wall_ms,recall48,refillEvery,refillExpansions,pool_hits48";
+                "query,filter,accepted,repeat,mode,width,visits,wall_ms,recall_at_k,refillEvery,refillExpansions,pool_hits_at_k,k";
           });
       for (int id = 0; ; id++) {
         byte[] q = queries.readNBytes(CatalogPrefilter.DIMS);
@@ -388,10 +423,12 @@ public class RankedStreamBenchmark {
             case "prefix" -> prefix(searcher, filter, q, id, truth, budgets);
             case "rescore" -> {
               for (var budget : budgets) {
-                rescore(searcher, filter, q, id, truth, budget);
+                for (int limit : LIMITS) {
+                  rescore(searcher, filter, q, id, truth, budget, limit);
+                }
               }
             }
-            default -> stage(searcher, filter, q, id, truth, budgets);
+            default -> stage(searcher, filter, q, id, truth, budgets, recallOnly);
           }
         }
       }
