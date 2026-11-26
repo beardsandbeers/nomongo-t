@@ -1,6 +1,6 @@
 # Filter materialization with retained int8 product embeddings
 
-**Current recall benchmarks use k = 10, 20, 50 and 100.** The original k = 48 reproduced the result limit in the supplied price-capped search plan. [Standard recall cutoffs](#recall-at-10-20-50-and-100)
+**Current recall benchmarks use k = 10, 20, 50 and 100.** The original k = 48 reproduced the result limit in the supplied price-capped search plan. [Finite-stage refinement and full-pool rescoring](#finite-stage-refinement-and-full-pool-rescoring) · [Previous cutoff comparison](#recall-at-10-20-50-and-100)
 
 
 The [float32 control](../README.md) already had a one-bit HNSW graph scorer. Its raw vector file still consumed 16,616 bytes per product. Here the same 4,154 coordinates are retained as signed bytes, using 4,154 bytes per product. Mongot’s binary-quantized byte-vector codec builds the graph from their signs. The physical leaf size stays near 5 GiB while the number of products and filter values increases.
@@ -352,3 +352,82 @@ Use the benchmark classpath and the 16-query tuning and 64-query validation file
 For ordinary and streaming results, invoke `RankedStreamBenchmark recall leaf0 leaf1 validation.i8 1024/2048/128/256` with the JVM flags documented above. Choose `-Dcatalog.candidates=500`, `2000` or `8000`, and `-Dcatalog.rescoreAll=true` for the full-pool control. Set `-Dcatalog.filter=categories_6` for the broad-only comparison. The all-filter trial uses 500 candidates and production rescoring. The tuning grid uses the 110 configurations from the previous section with 500 candidates and production rescoring.
 
 The `recall` mode runs each cutoff/configuration once on the fixed graph. For timing, `stage` discards one warm-up and records three shuffled repetitions per query, cutoff and configuration. The archived broad 500-candidate production and 2,000-candidate full-pool comparisons use these timing trials. Repetitions count once per query in recall averages. The other stage comparisons use the single-pass mode, whose timings should be excluded from latency comparisons. For the cursor, use `prefix leaf0 leaf1 validation.i8 64/1024/8/8 4096/65536/32/64` with `-Dcatalog.shufflePrefixes=true`. [Mean recall by configuration and filter](recall-cutoffs.csv) · [Raw per-query CSVs](recall-cutoffs-raw.zip)
+
+## Finite-stage refinement and full-pool rescoring
+
+The earlier six-category run located two losses. Ordinary kNN collected 5,141 of the 6,400 exact top-100 hits in its 500-candidate pools and returned 4,389 after binary rescoring. Streaming at width 1,024 collected 5,048 and returned 4,299. A hit can disappear when the finite walk stops, or when the approximate reranker decides which 223 candidates receive a retained-vector score.
+
+The finite stage now allows buffered hits from every leaf to replace weaker provisional candidates. It can explore up to one additional adjacency list per candidate across the request, choosing the best remaining frontier in batches. The existing cache cap also bounds this work. A threshold-only prototype exhausted 250,000 cached nodes on the fourth price-capped query. The bounded version completed all 64 queries on each of five predicates and improved mean recall@100 on all five at the original traversal settings.
+
+### Selecting the traversal budget
+
+On the original 64 queries, hold the candidate count at 500, the refill interval at 128 hits and the refill size at 256 expansions. All 1,280 ordinary-kNN recall and pool-hit observations across five predicates and four cutoffs reproduced the prior checkpoint. The table shows the broad predicate. Pool recall counts exact neighbors among the candidates before either rescoring pass.
+
+| Search | Warm-up width / visits | Pool recall@100 | Final recall@100, geometric rescoring |
+| --- | ---: | ---: | ---: |
+| Ordinary kNN | — | 80.33% | 68.58% |
+| Previous streaming | 1,024 / 2,048 | 78.88% | 67.17% |
+| Refined streaming | 1,024 / 2,048 | 79.31% | 67.64% |
+| Previous streaming | 2,048 / 8,192 | 80.44% | 68.44% |
+| Refined streaming | 2,048 / 8,192 | 80.73% | 68.72% |
+| Refined streaming | 4,096 / 16,384 | 81.47% | 69.44% |
+| Refined streaming | 8,192 / 32,768 | 81.69% | 69.64% |
+
+We chose 2,048 / 8,192 as the lowest tested refined setting that matched ordinary kNN's mean final recall. At the old width, the bounded finish recovered 30 more final hits across the 64 queries. At the chosen width it added 18 relative to the previous implementation at that same width. The remaining gain came from wider initial exploration. This comparison used the original validation set for tuning, so the following evaluation uses a separate query file.
+
+### Independent holdout
+
+The next 64 eligible query products in shard 223 were disjoint from all 80 earlier queries. Each path saw the same 2.26 million products, the same two 5.37 GB leaves, and the same exact filtered retained-int8 truth. The broad predicate admitted 77.45%. Stage wall time includes Lucene query rewrite, membership, graph traversal, candidate collection and mongot rescoring. Files were warm, the Lucene query cache was disabled, and requests and leaves ran serially. The timer excludes truth scans, RPC and projection. Each timed case discarded a warm-up and retained three shuffled runs per query. P95 is nearest rank over 192 observations.
+
+| Search and binary rescoring policy | Recall@10 | Recall@20 | Recall@50 | Recall@100 | p95 at k = 100 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous streaming, geometric | 73.59% | 71.88% | 68.00% | 62.83% | 10.1 ms |
+| Ordinary kNN, geometric | 73.59% | 71.95% | 68.19% | 63.19% | 47.4 ms |
+| Refined streaming, geometric | 76.09% | 74.22% | 69.69% | 64.16% | 17.7 ms |
+| Ordinary kNN, full-pool control | 86.72% | 85.39% | 80.72% | 75.72% | 52.6 ms |
+| Refined streaming, full pool | 90.47% | 88.59% | 82.94% | 77.31% | 16.2 ms |
+
+All rows use 500 candidates. In the matched full-pool comparison, streaming returned 4,948 exact top-100 hits across the 64 queries and ordinary kNN returned 4,846. Streaming improved 24 queries, tied 39 and lost one. The mean paired difference was +1.59 percentage points, with a paired query-bootstrap 95% interval of +0.80 to +2.56 points (10,000 resamples, seed 941). That interval describes variation across queries on this fixed index.
+
+### Candidate count and filter representation
+
+For a higher absolute recall target, increase the number of survivors that receive a full-vector score. At the chosen traversal settings, this also increases the finite walk's candidate and terminal exploration budgets. We added the 4,000-candidate midpoint after inspecting the 2,000 and 8,000 results on this holdout. The following broad-query results include direct full-fidelity rescoring of every survivor on both paths.
+
+| Search and candidate count | Recall@10 | Recall@20 | Recall@50 | Recall@100 | p95 at k = 100 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Ordinary kNN, 500 | 86.72% | 85.39% | 80.72% | 75.72% | 52.6 ms |
+| Streaming, 500 | 90.47% | 88.59% | 82.94% | 77.31% | 16.2 ms |
+| Ordinary kNN, 2,000 | 91.56% | 91.09% | 88.41% | 85.78% | 59.1 ms |
+| Streaming, 2,000 | 93.91% | 92.89% | 89.69% | 86.77% | 35.9 ms |
+| Ordinary kNN, 4,000 | 94.22% | 93.98% | 91.59% | 90.03% | 64.7 ms |
+| Streaming, 4,000 | 95.16% | 94.84% | 92.38% | 90.77% | 59.7 ms |
+| Ordinary kNN, 8,000 | 96.72% | 95.94% | 94.59% | 93.47% | 78.0 ms |
+| Streaming, 8,000 | 96.88% | 96.25% | 94.72% | 93.67% | 99.7 ms |
+
+Query difficulty varied. At k = 100, the number of individual queries reaching at least 90% recall was 33 of 64 at 500 candidates, 45 of 64 at 2,000 candidates, 51 of 64 at 4,000 candidates and 55 of 64 at 8,000 candidates.
+
+Filter representation changed the latency tradeoff at the same accepted count. These k = 100 comparisons use 500 candidates, full-pool rescoring and the same 64 queries. For three categories the run measured quality once. For the other predicates the p95 pairs are from interleaved, repeated timing trials.
+
+| Predicate | Acceptance | Ordinary pool recall@100 | Streaming recall@100 | Ordinary / streaming p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Six categories | 77.45% | 75.72% | 77.31% | 52.6 / 16.2 ms |
+| Three categories | 65.71% | 71.09% | 70.25% | — |
+| Two categories and price ceiling | 9.31% | 67.20% | 62.38% | 109.9 / 125.5 ms |
+| Price via doc values | 49.76% | 78.91% | 79.31% | 18.3 / 13.8 ms |
+| Price via points | 49.76% | 78.91% | 79.31% | 18.9 / 69.8 ms |
+
+Full-pool rescoring recovers the exact top k within the retrieved candidates. Expanding the pool touches more original vectors, about 1.98 MiB of vector payload at 500 candidates, 7.92 MiB at 2,000, 15.85 MiB at 4,000 and 31.69 MiB at 8,000 on this index. A warm, two-leaf measurement cannot establish cold-I/O latency or an automatic routing threshold for the production fan-out.
+
+### Reproduction
+
+Rebuild the stage driver and deploy JAR as in the wider sweep above. Use the previous checkpoint `4b9395f3` for the “previous streaming” rows. Generate the holdout from the pinned shard with the same preparation script.
+
+```sh
+python "$src/prepare.py" "$work/cohorts" "$work/144.i8" --query-count 144 \
+  --queries-from "$cache_dir"/part-00223-9336264f-afa4-46f8-b510-1aedf848eb31-c000.snappy.parquet
+dd if="$work/144.i8" of="$work/holdout.i8" bs=4154 skip=80 count=64 status=none
+```
+
+The holdout SHA-256 is `d8e857efb36bdfe7b607a04e052ed11585e7814b083f04d723ba1e75405a981d`. Use the same JVM flags as the stage benchmark. Set `-Dcatalog.filter=categories_6` and run `RankedStreamBenchmark stage leaf0 leaf1 holdout.i8 2048/8192/128/256`. The previous checkpoint uses `1024/2048/128/256`. Use `-Dcatalog.streamingRescoreAll=true` to exercise the public option. Add `-Dcatalog.matchRescore=true` to give ordinary kNN the same direct full-pool rescorer in the harness. Omit both flags for the geometric policy. The ordinary full-pool rows are benchmark controls. The request-level flag is available on the streaming stage.
+
+For the larger pools, set `-Dcatalog.candidates` to `2000`, `4000` or `8000`, run `stage` at `-Dcatalog.limits=100` for timing and `recall` at `-Dcatalog.limits=10,20,50` for quality. For the filter-quality control, omit the filter property and use `recall` at `-Dcatalog.limits=100` with streaming full rescoring. The original-width replay and the width sweep use `recall` on the previous 64-query file. [Per-query observations](candidate-refinement-raw.zip)

@@ -53,6 +53,11 @@ public class RankedStreamBenchmark {
       new BinaryQuantizedVectorRescorer(Optional.empty());
 
   private static ApproximateVectorSearchCriteria criteria(int limit) {
+    return criteria(limit, Optional.empty());
+  }
+
+  private static ApproximateVectorSearchCriteria criteria(
+      int limit, Optional<StreamingOptions> streaming) {
     return new ApproximateVectorSearchCriteria(
         FieldPath.newRoot("vector"),
         Optional.empty(),
@@ -63,7 +68,8 @@ public class RankedStreamBenchmark {
         Optional.of(CANDIDATES),
         Optional.empty(),
         false,
-        Optional.empty());
+        Optional.empty(),
+        streaming);
   }
 
   private record Case(String name, Query query, BitSet allowed) {}
@@ -224,11 +230,18 @@ public class RankedStreamBenchmark {
     record Trial(
         int mode, int limit, ApproximateVectorSearchCriteria criteria, HashSet<Integer> truthIds) {}
     var trials = new ArrayList<Trial>();
+    // Optionally give ordinary kNN the identical rescorer as a matched-cost control.
+    var baselineOptions =
+        Boolean.getBoolean("catalog.matchRescore")
+            ? Optional.of(budgets.getFirst())
+            : Optional.<StreamingOptions>empty();
     for (int limit : LIMITS) {
       var truthIds = new HashSet<Integer>();
       truth.subList(0, limit).forEach(hit -> truthIds.add(hit.doc()));
-      var criteria = criteria(Boolean.getBoolean("catalog.rescoreAll") ? CANDIDATES : limit);
       for (int mode = 0; mode <= budgets.size(); mode++) {
+        var options = mode == 0 ? baselineOptions : Optional.of(budgets.get(mode - 1));
+        var criteria =
+            criteria(Boolean.getBoolean("catalog.rescoreAll") ? CANDIDATES : limit, options);
         trials.add(new Trial(mode, limit, criteria, truthIds));
       }
     }
@@ -361,6 +374,17 @@ public class RankedStreamBenchmark {
     }
     if (budgets.isEmpty()) {
       budgets.addAll(BUDGETS);
+    }
+    if (Boolean.getBoolean("catalog.streamingRescoreAll")) {
+      budgets.replaceAll(
+          b ->
+              new StreamingOptions(
+                  b.warmupWidth(),
+                  b.warmupVisits(),
+                  b.refillEvery(),
+                  b.refillExpansions(),
+                  b.maxCachedNodes(),
+                  true));
     }
     try (var d0 = FSDirectory.open(Path.of(args[1]));
         var d1 = FSDirectory.open(Path.of(args[2]));

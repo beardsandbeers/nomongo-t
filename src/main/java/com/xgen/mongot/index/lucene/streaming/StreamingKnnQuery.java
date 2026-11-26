@@ -109,6 +109,9 @@ public final class StreamingKnnQuery {
     if (hits.isEmpty()) {
       return new MatchNoDocsQuery("empty streaming result");
     }
+    if (hits.size() == k) {
+      cursor.refineCandidates(hits);
+    }
     hits.sort(Comparator.comparingInt(RankedVectorCursor.Hit::doc));
     return new RankedHitsQuery(searcher.getIndexReader(), hits);
   }

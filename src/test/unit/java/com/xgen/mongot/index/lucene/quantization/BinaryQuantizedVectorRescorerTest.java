@@ -61,6 +61,7 @@ import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.search.join.QueryBitSetProducer;
 import org.apache.lucene.search.join.ScoreMode;
 import org.apache.lucene.store.ByteBuffersDirectory;
+import org.bson.BsonDocument;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
@@ -292,6 +293,53 @@ public class BinaryQuantizedVectorRescorerTest {
         .containsExactly(1, 0)
         .inOrder();
     assertScoresValid(subsetResult);
+  }
+
+  @Test
+  public void rescore_binaryCandidatesWithTiedApproximateScores_recoversExactNeighbor()
+      throws Exception {
+    Assume.assumeTrue(this.similarity == EUCLIDEAN);
+    // Zero centroid. The positive vectors have the same signs, sum and norm,
+    // but only the last positive vector is an exact match for the query.
+    float[] distractor = {10, 20, 30};
+    float[] target = {30, 20, 10};
+    float[] negative = {-10, -20, -30};
+    indexDocumentsAndCommit(
+        toVectors(
+            this.type,
+            distractor,
+            distractor,
+            distractor,
+            target,
+            negative,
+            negative,
+            negative,
+            new float[] {-30, -20, -10}),
+        EUCLIDEAN);
+    IndexSearcher searcher = buildSearcher();
+    var query = knnQueryResolver(target, 8);
+    var pool = searcher.search(query, 8);
+    var rescorer = new BinaryQuantizedVectorRescorer(this.executor);
+    var options =
+        VectorSearchQuery.fromBson(
+            BsonDocument.parse(
+                "{index:'idx',path:'field',queryVector:[30,20,10],limit:1,numCandidates:8,"
+                    + "streaming:{rescoreAll:true}}"));
+
+    var standard =
+        rescorer.rescore(
+            searcher, pool, createVectorSearchQuery(1, 8), BinaryQuantizedRescoreQuery.from(query));
+    var full =
+        rescorer.rescore(
+            searcher,
+            pool,
+            (ApproximateVectorSearchCriteria) options.criteria(),
+            BinaryQuantizedRescoreQuery.from(query));
+
+    assertThat(standard.scoreDocs[0].doc).isNotEqualTo(3);
+    assertThat(full.scoreDocs).hasLength(1);
+    assertThat(full.scoreDocs[0].doc).isEqualTo(3);
+    assertThat(full.scoreDocs[0].score).isEqualTo(1f);
   }
 
   @Test

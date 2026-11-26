@@ -3390,7 +3390,8 @@ public class StandaloneGrpcServerTest {
                   .setDefinitionBson(
                       bson(
                           "{fields:[{type:'vector',path:'v',numDimensions:3,"
-                              + "similarity:'euclidean',quantization:'scalar'},{type:'filter',path:'price'}]}"))
+                              + "similarity:'euclidean',quantization:'scalar'},"
+                              + "{type:'filter',path:'price'}]}"))
                   .build());
       var id = index.getIndexId();
       f.ready(id, 1);
@@ -3425,6 +3426,54 @@ public class StandaloneGrpcServerTest {
                           .build()));
       assertThat(capped.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
       assertThat(capped).hasMessageThat().contains("maxCachedNodes=1");
+    }
+  }
+
+  @Test
+  public void vectorSearch_streamingBinaryFullPool_returnsExactNeighbor() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("full-pool")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:8,"
+                                  + "similarity:'euclidean',quantization:'binary'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      String target = "[30,20,10,0,0,0,0,0]";
+      String distractor = "[10,20,30,0,0,0,0,0]";
+      String negative = "[-10,-20,-30,0,0,0,0,0]";
+      var docs =
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .addDocumentsBson(bson("{_id:'a',v:" + distractor + "}"))
+              .addDocumentsBson(bson("{_id:'b',v:" + distractor + "}"))
+              .addDocumentsBson(bson("{_id:'c',v:" + distractor + "}"))
+              .addDocumentsBson(bson("{_id:'target',v:" + target + "}"))
+              .addDocumentsBson(bson("{_id:'d',v:" + negative + "}"))
+              .addDocumentsBson(bson("{_id:'e',v:" + negative + "}"))
+              .addDocumentsBson(bson("{_id:'f',v:" + negative + "}"))
+              .addDocumentsBson(bson("{_id:'g',v:[-30,-20,-10,0,0,0,0,0]}"));
+      f.docs.upsert(docs.build());
+
+      String fields = "{path:'v',queryVector:" + target + ",limit:1,numCandidates:8,streaming:";
+      var request = QueryRequest.newBuilder().setIndexId(id);
+      var standard = f.queries.vectorSearch(request.setQueryBson(bson(fields + "{}}")).build());
+      var full =
+          f.queries.vectorSearch(request.setQueryBson(bson(fields + "{rescoreAll:true}}")).build());
+
+      var first = new RawBsonDocument(standard.getBatchBson().toByteArray()).getArray("results");
+      var hits = new RawBsonDocument(full.getBatchBson().toByteArray()).getArray("results");
+      assertThat(first.get(0).asDocument().getString("_id").getValue()).isNotEqualTo("target");
+      assertThat(hits).hasSize(1);
+      assertThat(hits.get(0).asDocument().getString("_id").getValue()).isEqualTo("target");
     }
   }
 

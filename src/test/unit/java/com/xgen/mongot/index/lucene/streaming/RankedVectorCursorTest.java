@@ -155,6 +155,51 @@ public class RankedVectorCursorTest {
   }
 
   @Test
+  public void refineCandidates_competitiveFrontier_improvesProvisionalHits() throws Exception {
+    var options = new StreamingOptions(1, 1, 1000, 8, 500);
+    int candidates = 8;
+    try (var cursor =
+        RankedVectorCursor.open(this.searcher, "v", TARGET, null, options, false, candidates)) {
+      var provisional = cursor.poll(candidates, 100).hits();
+      var refined = new ArrayList<>(provisional);
+      cursor.refineCandidates(refined);
+
+      assertThat(refined).hasSize(candidates);
+      assertThat(refined.stream().map(RankedVectorCursor.Hit::doc).distinct().count())
+          .isEqualTo(candidates);
+      assertThat(refined.stream().mapToDouble(RankedVectorCursor.Hit::score).sum())
+          .isGreaterThan(provisional.stream().mapToDouble(RankedVectorCursor.Hit::score).sum());
+    }
+  }
+
+  @Test
+  public void refineCandidates_atCacheCap_keepsBestKnownHits() throws Exception {
+    var options = new StreamingOptions(1, 1, 1000, 8, 2);
+    try (var cursor =
+        RankedVectorCursor.open(this.searcher, "v", TARGET, null, options, false, 2)) {
+      var provisional = cursor.poll(2, 2).hits();
+      var refined = new ArrayList<>(provisional);
+      cursor.refineCandidates(refined);
+
+      assertThat(cursor.cachedNodes()).isEqualTo(2);
+      assertThat(refined).containsExactlyElementsIn(provisional);
+    }
+  }
+
+  @Test
+  public void refineCandidates_oneCacheSlotLeft_stopsWithinFinalNeighborhood() throws Exception {
+    var options = new StreamingOptions(1, 1, 1000, 8, 3);
+    try (var cursor =
+        RankedVectorCursor.open(this.searcher, "v", TARGET, null, options, false, 2)) {
+      var hits = new ArrayList<>(cursor.poll(2, 2).hits());
+      cursor.refineCandidates(hits);
+
+      assertThat(hits).hasSize(2);
+      assertThat(cursor.cachedNodes()).isEqualTo(3);
+    }
+  }
+
+  @Test
   public void completedNodes_finalScoringBatchTruncated_keepsLastNeighborhoodForRefill()
       throws IOException {
     var vectors =
@@ -278,12 +323,17 @@ public class RankedVectorCursorTest {
     String fields = "{index:'idx',path:'v',limit:2,queryVector:[1.0,0.0]";
     var baseline = VectorSearchQuery.fromBson(BsonDocument.parse(fields + "}"));
     var tuned =
-        VectorSearchQuery.fromBson(BsonDocument.parse(fields + ",streaming:{refillEvery:3}}"));
+        VectorSearchQuery.fromBson(
+            BsonDocument.parse(fields + ",streaming:{refillEvery:3,rescoreAll:true}}"));
 
     assertThat(baseline.toBson().containsKey("streaming")).isFalse();
     assertThat(((ApproximateVectorSearchCriteria) tuned.criteria()).streaming().orElseThrow())
-        .isEqualTo(new StreamingOptions(64, 1024, 3, 8, 250000));
+        .isEqualTo(new StreamingOptions(64, 1024, 3, 8, 250000, true));
     assertThat(VectorSearchQuery.fromBson(tuned.toBson())).isEqualTo(tuned);
+    assertThrows(
+        BsonParseException.class,
+        () ->
+            VectorSearchQuery.fromBson(BsonDocument.parse(fields + ",streaming:{rescoreAll:2}}")));
     assertThrows(
         BsonParseException.class,
         () -> VectorSearchQuery.fromBson(BsonDocument.parse(fields + ",streaming:{unknown:1}}")));

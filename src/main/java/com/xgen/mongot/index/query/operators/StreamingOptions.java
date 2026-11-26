@@ -10,7 +10,12 @@ import org.bson.BsonDocument;
 
 /** Per-request controls for the resumable graph walk. Presence opts into streaming. */
 public record StreamingOptions(
-    int warmupWidth, int warmupVisits, int refillEvery, int refillExpansions, int maxCachedNodes)
+    int warmupWidth,
+    int warmupVisits,
+    int refillEvery,
+    int refillExpansions,
+    int maxCachedNodes,
+    boolean rescoreAll)
     implements DocumentEncodable {
   private static Field.WithDefault<Integer> option(String name, int max, int initial) {
     return Field.builder(name)
@@ -26,6 +31,18 @@ public record StreamingOptions(
   private static final Field.WithDefault<Integer> EXPAND = option("refillExpansions", 10_000, 8);
   private static final Field.WithDefault<Integer> CACHE =
       option("maxCachedNodes", Integer.MAX_VALUE, 250_000);
+
+  private static final Field.WithDefault<Boolean> RESCORE_ALL =
+      Field.builder("rescoreAll").booleanField().optional().withDefault(false);
+
+  public StreamingOptions(
+      int warmupWidth,
+      int warmupVisits,
+      int refillEvery,
+      int refillExpansions,
+      int maxCachedNodes) {
+    this(warmupWidth, warmupVisits, refillEvery, refillExpansions, maxCachedNodes, false);
+  }
 
   public StreamingOptions {
     if (warmupWidth < 1
@@ -47,17 +64,22 @@ public record StreamingOptions(
         parser.getField(VISITS).unwrap(),
         parser.getField(EVERY).unwrap(),
         parser.getField(EXPAND).unwrap(),
-        parser.getField(CACHE).unwrap());
+        parser.getField(CACHE).unwrap(),
+        parser.getField(RESCORE_ALL).unwrap());
   }
 
   @Override
   public BsonDocument toBson() {
-    return BsonDocumentBuilder.builder()
-        .field(WIDTH, this.warmupWidth)
-        .field(VISITS, this.warmupVisits)
-        .field(EVERY, this.refillEvery)
-        .field(EXPAND, this.refillExpansions)
-        .field(CACHE, this.maxCachedNodes)
-        .build();
+    var builder =
+        BsonDocumentBuilder.builder()
+            .field(WIDTH, this.warmupWidth)
+            .field(VISITS, this.warmupVisits)
+            .field(EVERY, this.refillEvery)
+            .field(EXPAND, this.refillExpansions)
+            .field(CACHE, this.maxCachedNodes);
+    if (this.rescoreAll) {
+      builder.field(RESCORE_ALL, true);
+    }
+    return builder.build();
   }
 }

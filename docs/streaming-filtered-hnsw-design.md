@@ -10,7 +10,7 @@ The target workload for automatic filter routing is a **single segment around 5 
 
 ## Running the opt-in stage
 
-Use `streaming: {}` in an approximate `$vectorSearch` stage to enable the default walk for that request. Omit the entire field to run the existing stage on the same index. For `$search`, put the same object inside the top-level `vectorSearch` operator and use a Search operator for its filter. All five parameters are optional positive integers.
+Use `streaming: {}` in an approximate `$vectorSearch` stage to enable the default walk for that request. Omit the entire field to run the existing stage on the same index. For `$search`, put the same object inside the top-level `vectorSearch` operator and use a Search operator for its filter. All fields are optional. The example uses the 4,000-candidate configuration that reached 90.77% mean recall@100 in the broad catalog benchmark.
 
 ```javascript
 db.products.aggregate([{
@@ -19,14 +19,14 @@ db.products.aggregate([{
     path: "embedding",
     queryVector: embedding,
     filter: { price: { $gte: 20, $lte: 200 } },
-    numCandidates: 500,
-    limit: 48,
+    numCandidates: 4000,
+    limit: 100,
     streaming: {
-      warmupWidth: 64,
-      warmupVisits: 1024,
-      refillEvery: 8,
-      refillExpansions: 8,
-      maxCachedNodes: 250000
+      warmupWidth: 2048,
+      warmupVisits: 8192,
+      refillEvery: 128,
+      refillExpansions: 256,
+      rescoreAll: true
     }
   }
 }])
@@ -39,12 +39,15 @@ db.products.aggregate([{
 | `refillEvery` | 8 | Global hit deliveries between lookahead turns. Empty ready queues trigger immediate exploration. |
 | `refillExpansions` | 8 | Maximum level-zero adjacency lists expanded in a single leaf refill. |
 | `maxCachedNodes` | 250,000 | Maximum distinct scored ordinals across one reader cursor. Exceeding the cap fails the request. Size this for the intended depth of a long drain. |
+| `rescoreAll` | false | On auto-binary fields with full-fidelity rescoring enabled, compare every selected candidate with its original stored vector before truncating to `limit`. |
 
-The stage takes the first `numCandidates` admitted hits from the merged stream and feeds them to the usual sorted collection and configured rescoring. An internal Java caller can instead use `RankedVectorCursor.open(searcher, field, vector, filter, options)` in try-with-resources and repeatedly call `poll(maxHits, workUnits)`. Each poll returns hits and an `exhausted` flag. An empty nonterminal batch means more work is available. Polls share traversal state, and an idle cursor performs no work. A later poll can find a higher score. A full drain covers eligible nodes reachable from the seeds. External stage pagination retains the ordinary bounded result contract. [Cursor](../src/main/java/com/xgen/mongot/index/lucene/streaming/RankedVectorCursor.java) · [Stage adapter](../src/main/java/com/xgen/mongot/index/lucene/streaming/StreamingKnnQuery.java)
+The finite stage fills a provisional pool of `numCandidates` passing hits, then lets every buffered passing hit compete for a slot by traversal score. While a leaf's best unexpanded node scores above the worst survivor, its neighborhood can supply stronger candidates. This terminal pass shares at most `numCandidates` extra adjacency expansions across leaves and stops at the remaining cache capacity. A low-scoring node can lead to a better neighbor, so the frontier comparison is a stopping heuristic. The survivors go to the existing sorted collector and configured rescorer.
+
+An internal Java caller can instead use `RankedVectorCursor.open(searcher, field, vector, filter, options)` in try-with-resources and repeatedly call `poll(maxHits, workUnits)`. Each poll returns hits and an `exhausted` flag. An empty nonterminal batch means more work is available. Polls share traversal state, and an idle cursor performs no work. A later poll can find a higher score. A full drain covers eligible nodes reachable from the seeds. External stage pagination retains the ordinary bounded result contract. [Cursor](../src/main/java/com/xgen/mongot/index/lucene/streaming/RankedVectorCursor.java) · [Stage adapter](../src/main/java/com/xgen/mongot/index/lucene/streaming/StreamingKnnQuery.java)
 
 The implementation supports root HNSW fields using raw float/int8, scalar-quantized float, auto-binary float/int8 and packed-bit vectors. It uses postings, doc values and Boolean membership over sorted candidate IDs. Legacy one-dimensional point-only ranges can intersect an existing BKD tree per batch. This uses batch-sized match storage and can repeatedly scan many points. Missing vector fields, empty ranges, graphless HNSW leaves and cheaply bounded required terms have dedicated paths. Explicit exact requests, embedded or parent aggregation, per-document tracing, unsupported filter shapes and flat-index codecs cannot select this experimental walk. Omit the option to use the existing implementation for those cases. Automatic acceptance-based routing is deferred pending comparable recall and latency measurements. [Candidate checks](../src/main/java/com/xgen/mongot/index/lucene/streaming/CandidateFilter.java) · [Paired benchmark](benchmarks/vector-prefilter/catalog/int8/README.md#streaming-stage-and-prefix-benchmark)
 
-The catalog tuning trials compare neighborhood reuse, refill cadence, initial exploration and binary rescoring depth. A larger initial search helped the generic cursor deliver a better ordered prefix. For the finite stage, deeper refills and full-fidelity reranking recovered different sets of hits. Point-only ranges still favored ordinary kNN. [Tuning results and reproduction](benchmarks/vector-prefilter/catalog/int8/README.md#continuation-filter-cost-and-rescoring)
+The catalog tuning trials compare neighborhood reuse, refill cadence, initial exploration and binary rescoring depth. A larger initial search helped the generic cursor deliver a better ordered prefix. For the finite stage, a wider warm-up and bounded refinement improved the candidate pool. Full-vector rescoring then recovered the exact neighbors still in that pool. On 64 independent queries the broad category filter favored streaming, while the price-capped compound and point-only range favored ordinary kNN at k = 100. [Held-out results and reproduction](benchmarks/vector-prefilter/catalog/int8/README.md#finite-stage-refinement-and-full-pool-rescoring)
 
 ## Open decisions
 
@@ -177,7 +180,7 @@ Give the filtered consumer one leaf-local operation that evaluates the compiled 
 
 Derive the evaluator from the existing translated query so the range endpoints, field names and array semantics come from one place. Capability is per leaf and applies to the entire expression. Legacy scalar numeric fields have a doc-values range alternative. Legacy multi-valued numeric branches can be points-only. An absent branch contributes no matches. The forced-path experiment uses per-batch BKD intersection for a populated points-only range. A future automatic planner should price that operation separately from doc-values membership. Preserve the factory’s distinction between a fused interval and two comparisons that may match different elements of an array. The same whole-filter fallback applies to unhandled wrappers or embedded scopes. Creating a generic scorer that enumerates a dense range would defeat the optimization. [Numeric range translation](../src/main/java/com/xgen/mongot/index/lucene/query/NumericRangeQueryFactory.java) · [Range representations](../src/main/java/com/xgen/mongot/index/lucene/query/range/RangeQueryUtils.java) · [Array range semantics](../src/main/java/com/xgen/mongot/index/lucene/query/RangeQueryFactory.java) · [Filter translation](../src/main/java/com/xgen/mongot/index/lucene/query/VectorSearchFilterQueryFactory.java)
 
-For quantized fields, distinguish the bounded adapter from the open-ended cursor. Today's binary top-k path reranks the global candidate pool approximately, then scores a subset sized by the geometric mean of `limit` and `numCandidates` at full fidelity. The bounded adapter returns candidates in traversal-score space and leaves both existing rerank stages in place. For the generic stream, batch admitted candidates by ascending leaf doc ID, use the configured final scorer before advertising a head, restore queue order and reuse that score for delivery. Forward-only scorers need a fresh iterator for backward-moving batches. This can fetch substantially more raw vectors. Count raw-vector reads, page faults and rescore time. Nested or multivector parent scores can change when another child is discovered. Keep those shapes on the existing top-k path until the cursor can finalize parent identity and score. [Current rescore policy](../src/main/java/com/xgen/mongot/index/lucene/quantization/BinaryQuantizedVectorRescorer.java) · [Scorer factories](../src/main/java/com/xgen/mongot/index/lucene/quantization/BinaryQuantizedRescoreQuery.java) · [Nested score aggregation](../src/main/java/com/xgen/mongot/index/lucene/query/NestedAvgVectorRescorer.java)
+For quantized fields, distinguish the bounded adapter from the open-ended cursor. Today's binary top-k path reranks the global candidate pool approximately, then scores a subset sized by the geometric mean of `limit` and `numCandidates` at full fidelity. The bounded adapter returns candidates in traversal-score space. With `streaming.rescoreAll: true`, the binary rescorer skips the approximate pass and reads a retained vector for every survivor. At `limit: 100` and `numCandidates: 500`, that increases the maximum number of full-vector comparisons from 223 to 500. For the generic stream, batch admitted candidates by ascending leaf doc ID, use the configured final scorer before advertising a head, restore queue order and reuse that score for delivery. Forward-only scorers need a fresh iterator for backward-moving batches. This can fetch substantially more raw vectors. Count raw-vector reads, page faults and rescore time. Nested or multivector parent scores can change when another child is discovered. Keep those shapes on the existing top-k path until the cursor can finalize parent identity and score. [Current rescore policy](../src/main/java/com/xgen/mongot/index/lucene/quantization/BinaryQuantizedVectorRescorer.java) · [Scorer factories](../src/main/java/com/xgen/mongot/index/lucene/quantization/BinaryQuantizedRescoreQuery.java) · [Nested score aggregation](../src/main/java/com/xgen/mongot/index/lucene/query/NestedAvgVectorRescorer.java)
 
 Audit setup for hidden full-leaf work. For example, numeric range merging can scan points into a `FixedBitSet` to establish field disjointness on a cache miss. Measure translation and rewrite from the request boundary along with the first iterator-backed `AcceptDocs.cost()`. Separate eligibility bitmap builds, auxiliary planner scans and ordinary HNSW visited storage. For streaming explain, report the fraction of tested candidates that passed. Report leaf-wide acceptance only when independently available. [Range merge check](../src/main/java/com/xgen/mongot/index/lucene/query/range/RangeQueryUtils.java)
 

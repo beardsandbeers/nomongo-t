@@ -203,7 +203,7 @@ public final class RankedVectorCursor implements Closeable {
           this.sinceRefill = 0;
           if (leaf != null) {
             this.heads.remove(leaf);
-            leaf.expand(this.options.refillExpansions());
+            leaf.expand(this.options.refillExpansions(), Integer.MAX_VALUE);
             if (!leaf.ready.isEmpty()) {
               this.heads.add(leaf);
             }
@@ -228,6 +228,41 @@ public final class RankedVectorCursor implements Closeable {
       close();
       throw e;
     }
+  }
+
+  /** Terminal operation for the finite stage, whose provisional hits use traversal scores. */
+  void refineCandidates(List<Hit> hits) throws IOException {
+    this.heads.clear();
+    var best = new PriorityQueue<Hit>(hits.size(), BEST.reversed());
+    best.addAll(hits);
+    // Every already-scored, passing hit may compete, including the final refill's buffered hits.
+    for (var leaf : this.leaves) {
+      leaf.promote(best);
+    }
+    // Spend at most k extra adjacency expansions across the entire request. A low pass
+    // rate can otherwise keep the passing cutoff below most of the graph's traversal scores.
+    @Var int expansions = hits.size();
+    while (expansions > 0) {
+      int remaining = this.options.maxCachedNodes() - cachedNodes();
+      if (remaining == 0) {
+        break;
+      }
+      @Var Leaf next = null;
+      @Var float cutoff = best.element().score;
+      for (Leaf leaf : this.leaves) {
+        if (!leaf.frontier.isEmpty() && leaf.frontier.element().score > cutoff) {
+          next = leaf;
+          cutoff = leaf.frontier.element().score;
+        }
+      }
+      if (next == null) {
+        break;
+      }
+      expansions -= next.expand(Math.min(expansions, this.options.refillExpansions()), remaining);
+      next.promote(best);
+    }
+    hits.clear();
+    hits.addAll(best);
   }
 
   /** Only queried after graph exhaustion when the finite stage still needs more candidates. */
@@ -406,18 +441,33 @@ public final class RankedVectorCursor implements Closeable {
       admit();
     }
 
-    void expand(int count) throws IOException {
+    private void promote(PriorityQueue<Hit> best) throws IOException {
+      while (!this.ready.isEmpty() && BEST.compare(this.ready.element(), best.element()) < 0) {
+        checkTime();
+        best.remove();
+        best.add(this.ready.remove());
+      }
+    }
+
+    // A finite refinement may stop in its final neighborhood when it spends its remaining cache.
+    int expand(int count, @Var int newNodes) throws IOException {
       var graph = this.vectors.graph();
-      for (int i = 0; i < count && !this.frontier.isEmpty(); i++) {
+      @Var int expanded = 0;
+      while (expanded < count && newNodes > 0 && !this.frontier.isEmpty()) {
+        expanded++;
         checkTime();
         graph.seek(0, this.frontier.remove().ord);
         for (int ord; (ord = graph.nextNeighbor()) != DocIdSetIterator.NO_MORE_DOCS; ) {
           if (!this.seen.get(ord)) {
             remember(ord, this.vectors.traversal().score(ord));
+            if (--newNodes == 0) {
+              break;
+            }
           }
         }
       }
       admit();
+      return expanded;
     }
   }
 }
