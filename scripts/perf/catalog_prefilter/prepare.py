@@ -95,8 +95,10 @@ def prepare(cache, target, int8=False):
                 raise ValueError("Insufficient unique products")
 
 
-def prepare_queries(cohorts, shard, output):
-    """Select 16 distinct, non-indexed queries from a pinned held-out catalog shard."""
+def prepare_queries(cohorts, shard, output, count=16):
+    """Select distinct, non-indexed queries from a pinned held-out catalog shard."""
+    if count < 1:
+        raise ValueError("Query count must be positive")
     indexed = set()
     for cohort in ("0", "1"):
         with (cohorts / cohort / "products.tsv").open() as metadata:
@@ -120,7 +122,7 @@ def prepare_queries(cohorts, shard, output):
                 raise ValueError(f"Invalid query embedding for {product}")
             vectors.append(codes.astype(np.int8).tobytes())
             indexed.add(product)
-            if len(vectors) == 16:
+            if len(vectors) == count:
                 with output.open("xb") as stream:
                     stream.writelines(vectors)
                 return
@@ -140,8 +142,11 @@ if __name__ == "__main__":
         metavar="SHARD",
         help="Export held-out int8 queries. Positional arguments are the existing cohorts directory and the output file.",
     )
+    parser.add_argument(
+        "--query-count", type=int, default=16, help="Number of held-out queries to export"
+    )
     args = parser.parse_args()
     if args.queries_from:
-        prepare_queries(args.cache, args.queries_from, args.target)
+        prepare_queries(args.cache, args.queries_from, args.target, args.query_count)
     else:
         prepare(args.cache, args.target, args.int8)

@@ -35,15 +35,17 @@ import org.apache.lucene.util.NumericUtils;
 
 /** A/B against exact filtered retained-int8 truth on two real catalog graphs. */
 public class RankedStreamBenchmark {
-  private static final int CANDIDATES = 500;
+  private static final int CANDIDATES = Integer.getInteger("catalog.candidates", 500);
   private static final int LIMIT = 48;
+  private static final boolean DEEP_PREFIX = Boolean.getBoolean("catalog.deepPrefix");
   private static final Comparator<Hit> BEST =
       Comparator.comparingDouble(Hit::score).reversed().thenComparingInt(Hit::doc);
   private static final List<StreamingOptions> BUDGETS =
       List.of(
           new StreamingOptions(32, 256, 8, 8, 250_000),
           new StreamingOptions(64, 1024, 8, 8, 250_000));
-  private static final ApproximateVectorSearchCriteria CRITERIA = criteria(LIMIT);
+  private static final ApproximateVectorSearchCriteria CRITERIA =
+      criteria(Boolean.getBoolean("catalog.rescoreAll") ? CANDIDATES : LIMIT);
   private static final BinaryQuantizedVectorRescorer RESCORER =
       new BinaryQuantizedVectorRescorer(Optional.empty());
 
@@ -82,7 +84,8 @@ public class RankedStreamBenchmark {
   }
 
   private static List<Hit> exact(IndexReader reader, Case filter, byte[] q) throws IOException {
-    var heap = new PriorityQueue<>(100, BEST.reversed());
+    int depth = DEEP_PREFIX ? 500 : 100;
+    var heap = new PriorityQueue<>(depth, BEST.reversed());
     for (var leaf : reader.leaves()) {
       var values = leaf.reader().getByteVectorValues("vector");
       for (int ord = 0; ord < values.size(); ord++) {
@@ -91,11 +94,11 @@ public class RankedStreamBenchmark {
           continue;
         }
         float score = VectorSimilarityFunction.EUCLIDEAN.compare(q, values.vectorValue(ord));
-        if (heap.size() == 100 && score < heap.element().score()) {
+        if (heap.size() == depth && score < heap.element().score()) {
           continue;
         }
         heap.add(new Hit(doc, score));
-        if (heap.size() > 100) {
+        if (heap.size() > depth) {
           heap.remove();
         }
       }
@@ -147,7 +150,11 @@ public class RankedStreamBenchmark {
       List<Hit> truth,
       List<StreamingOptions> budgets)
       throws IOException {
-    for (var options : budgets) {
+    var order = new ArrayList<>(budgets);
+    if (Boolean.getBoolean("catalog.shufflePrefixes")) {
+      Collections.shuffle(order, new Random(9137L + id));
+    }
+    for (var options : order) {
       long start = System.nanoTime();
       try (var cursor = RankedVectorCursor.open(searcher, "vector", q, filter.query, options)) {
         var hits = new ArrayList<Hit>();
@@ -155,9 +162,23 @@ public class RankedStreamBenchmark {
         double first10 = (System.nanoTime() - start) / 1e6;
         fill(cursor, hits, 100);
         double first100 = (System.nanoTime() - start) / 1e6;
+        int cached100 = cursor.cachedNodes();
+        String deeper = "";
+        if (DEEP_PREFIX) {
+          fill(cursor, hits, 500);
+          double first500 = (System.nanoTime() - start) / 1e6;
+          deeper =
+              String.format(
+                  Locale.ROOT,
+                  ",%.3f,%.3f,%d,%.5f",
+                  recall(hits, truth, 500, filter),
+                  first500,
+                  cursor.cachedNodes(),
+                  invertedPairs(hits));
+        }
         System.out.printf(
             Locale.ROOT,
-            "%d,%d,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%d,%.5f%n",
+            "%d,%d,%d,%d,%d,%.2f,%.2f,%.3f,%.3f,%d,%.5f%s%n",
             id,
             options.warmupWidth(),
             options.warmupVisits(),
@@ -167,8 +188,9 @@ public class RankedStreamBenchmark {
             recall(hits, truth, 100, filter),
             first10,
             first100,
-            cursor.cachedNodes(),
-            invertedPairs(hits));
+            cached100,
+            invertedPairs(hits.subList(0, 100)),
+            deeper);
       }
     }
   }
@@ -201,6 +223,9 @@ public class RankedStreamBenchmark {
         var results =
             RESCORER.rescore(
                 searcher, candidates, CRITERIA, BinaryQuantizedRescoreQuery.from(query));
+        if (results.scoreDocs.length > LIMIT) {
+          results.scoreDocs = Arrays.copyOf(results.scoreDocs, LIMIT);
+        }
         double wall = (System.nanoTime() - start) / 1e6;
         if (results.scoreDocs.length != LIMIT) {
           throw new AssertionError("Underfilled stage");
@@ -242,7 +267,12 @@ public class RankedStreamBenchmark {
     var query = new StreamingKnnQuery.Bytes("vector", q, CANDIDATES, filter.query, budget);
     var candidates = searcher.search(query, CANDIDATES);
     var rescoreQuery = BinaryQuantizedRescoreQuery.from(query);
-    var limits = new ArrayList<>(List.of(LIMIT, 125, CANDIDATES));
+    var limits =
+        new ArrayList<>(
+            List.of(LIMIT, 125, CANDIDATES).stream()
+                .filter(limit -> limit <= CANDIDATES)
+                .distinct()
+                .toList());
     var order = new Random(9137L + id);
     for (int rep = -1; rep < 3; rep++) {
       Collections.shuffle(limits, order);
@@ -281,6 +311,9 @@ public class RankedStreamBenchmark {
       throw new IllegalArgumentException(
           "Expected prefix|stage|rescore leaf0 leaf1 queries.i8 [refillEvery/refillExpansions"
               + " ...]");
+    }
+    if (CANDIDATES < LIMIT) {
+      throw new IllegalArgumentException("Candidate count must cover the result limit");
     }
     var budgets = new ArrayList<StreamingOptions>();
     for (int i = 4; i < args.length; i++) {
@@ -334,7 +367,8 @@ public class RankedStreamBenchmark {
       System.out.println(
           switch (args[0]) {
             case "prefix" ->
-                "query,width,visits,refillEvery,refillExpansions,recall10,recall100,first10_ms,first100_ms,cached,inverted_pairs100";
+                "query,width,visits,refillEvery,refillExpansions,recall10,recall100,first10_ms,first100_ms,cached,inverted_pairs100"
+                    + (DEEP_PREFIX ? ",recall500,first500_ms,cached500,inverted_pairs500" : "");
             case "rescore" ->
                 "query,filter,width,visits,refillEvery,refillExpansions,repeat,full_fidelity_docs,rescore_ms,recall48";
             default ->

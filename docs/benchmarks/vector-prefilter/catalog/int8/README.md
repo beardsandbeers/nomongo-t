@@ -209,3 +209,94 @@ With `run` invoking `RankedStreamBenchmark` as in the streaming reproduction, su
 | Six-category prefix warm-up | prefix | Optimized `8/8 128/2048/8/8 256/4096/8/8 64/1024/64/64` |
 
 A pair supplies `refillEvery/refillExpansions` with warm-up 64 / 1,024. Four values also override `warmupWidth/warmupVisits`. The reranking experiment calls the production rescorer with limits 48, 125 and 500 so its geometric rule selects 154, 250 and 500 full-fidelity candidates. It times both rescoring passes and evaluates only the first 48 results. This research setting lives in the benchmark harness. [Harness](../../../../../scripts/perf/catalog_prefilter/RankedStreamBenchmark.java)
+
+## Wider traversal and candidate-budget sweep
+
+The initial stage comparison tried four refill schedules at a fixed warm-up width and visit limit. To separate their effects, the next trial crossed four widths (16, 64, 256, 1,024), three per-leaf visit limits (256, 2,048, 16,384), three refill intervals (8, 32, 128 delivered hits) and three refill sizes (8, 64, 256 neighborhood expansions). Both the finite stage and generic cursor ran all 108 combinations plus the current default and previous 32 / 128 setting. The cache limit stayed at 250,000 distinct ordinals. A visit limit is a ceiling, so different parameter combinations can perform the same work.
+
+The screen used the original 16 non-indexed product queries and the six-category filter at 77.45% acceptance. The stage used 500 candidates, 154 full-fidelity reads and a result limit of 48. Configurations ran in shuffled order within each query with one discarded warm-up and three timed repetitions. Every result set was checked against exhaustive filtered retained-int8 truth. The prefix screen shuffled configurations by query, sampled each once and included cursor setup in the timer.
+
+### Traversal at a fixed candidate budget
+
+On the screen, the highest observed recall with p95 at or below 12 ms was 61.85% at 9.64 ms. The previous 32 / 128 setting reached the same mean at 17.08 ms. The 12 ms cutoff was an exploratory latency budget close to the current default on this fixture. In a separate edge trial, doubling the refill from 256 to 512 expansions every eight deliveries at width 1,024 and visit limit 256 raised mean recall from 63.41% to 63.54%, one additional exact hit across 768 result slots. The p95 increased from 72.26 to 137.23 ms.
+
+For validation, freeze the screening winner under 12 ms, the highest-recall setting, the fastest setting within one mean hit of that maximum, the current default and the previous 32 / 128 setting. The next 64 sampled products from the same shard had distinct IDs and vector bytes disjoint from tuning. Absolute recall differed between the cohorts, so comparisons below pair configurations on the same 64 queries. Times cover Lucene search through mongot rescoring with warm files and serial leaf execution.
+
+| Width / visit limit | Refill every / expansions | Mean recall@48 | Stage p95 | Queries losing / tying / gaining recall vs ordinary |
+| --- | --- | ---: | ---: | ---: |
+| Ordinary filtered kNN | — | 75.29% | 50.63 ms | — |
+| 64 / 1,024 (default) | 8 / 8 | 73.57% | 11.02 ms | 12 / 52 / 0 |
+| 64 / 1,024 | 32 / 128 | 75.07% | 15.49 ms | 3 / 55 / 6 |
+| 256 / 2,048 | 128 / 256 | 74.45% | 9.60 ms | 7 / 55 / 2 |
+| 1,024 / 2,048 | 128 / 256 | 74.54% | 9.52 ms | 7 / 55 / 2 |
+| 1,024 / 256 | 8 / 256 | 76.69% | 78.19 ms | 1 / 48 / 15 |
+
+The fast setting lost 0.75 percentage points of mean recall against ordinary kNN. Its paired 95% bootstrap interval was −1.95 to +0.13 points. On its worst query it returned 28 exact hits to ordinary kNN’s 41. The high-work setting gained 1.40 points (+0.59 to +2.47). Intervals resample 64 whole query pairs with replacement 10,000 times, seed 9137. [Stage summaries](sweep-stage-summary.csv)
+
+### Validation across predicates
+
+At the same traversal settings, the representation of a price range changed the latency comparison. The doc-values and point-only ranges accepted exactly the same products and gave identical recall for each mode.
+
+| Filter | Acceptance | Ordinary p95 | Fast streaming p95 | Ordinary / fast mean recall@48 |
+| --- | ---: | ---: | ---: | ---: |
+| Six categories | 77.45% | 55.2 ms | 9.4 ms | 75.29% / 74.54% |
+| Three categories | 65.71% | 62.7 ms | 18.4 ms | 68.75% / 66.99% |
+| Price, doc values | 49.76% | 20.8 ms | 6.4 ms | 75.23% / 72.92% |
+| Same price, points | 49.76% | 21.4 ms | 47.5 ms | 75.23% / 72.92% |
+| Two categories and a price ceiling | 9.31% | 110.1 ms | 144.7 ms | 56.84% / 50.78% |
+
+### Generic cursor through hit 500
+
+The finite stage uses binary traversal scores to choose candidates and then reranks them. The generic cursor scores accepted candidates against the retained vectors as it goes. Its ordering can change as new neighborhoods are explored. With a refill interval of 128, the first 100 hits can all come from the initial sorted buffer. Looking at the first 500 reveals the ordering after refills begin.
+
+| Width / visits | Refill every / expansions | Mean recall@100 / @500 | Inverted pairs at 100 / 500 | Median time to 10 / 500 | Mean cached nodes at 500 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 64 / 1,024 | 8 / 8 | 74.03% / 67.86% | 4.09% / 8.75% | 2.2 / 7.4 ms | 4,412 |
+| 256 / 4,096 | 8 / 8 | 83.02% / 73.96% | 0.38% / 4.28% | 4.2 / 9.3 ms | 6,112 |
+| 1,024 / 2,048 | 128 / 256 | 82.84% / 77.88% | 0.00% / 4.33% | 5.4 / 10.5 ms | 7,749 |
+| 1,024 / 16,384 | 8 / 256 | 94.77% / 97.00% | 1.41% / 1.85% | 12.7 / 87.2 ms | 64,258 |
+| 1,024 / 16,384 | 32 / 64 | 91.11% / 85.39% | 0.24% / 2.02% | 11.5 / 16.9 ms | 13,862 |
+| 1,024 / 16,384 | 128 / 256 | 90.70% / 84.82% | 0.00% / 1.62% | 11.5 / 15.0 ms | 13,141 |
+| 2,048 / 32,768 | 32 / 64 | 94.16% / 89.33% | 0.13% / 0.99% | 20.2 / 25.7 ms | 21,077 |
+| 4,096 / 65,536 | 32 / 64 | 97.53% / 94.65% | 0.05% / 0.13% | 33.9 / 39.8 ms | 35,003 |
+
+A final upper-bound check on the 16 tuning queries used refill 32 / 64 and increased width / visits from 4,096 / 65,536 to 8,192 / 131,072 and then 10,000 / 200,000. Recall@500 rose from 91.93% to 94.33% to 94.75%. Median time to deliver 500 rose from 49.7 to 78.6 to 87.0 ms, and mean cached nodes reached 75,572 at the largest setting. Width 10,000 is the stage parameter’s current upper bound. These are traversal and ordering measurements on the warm two-leaf fixture. [Prefix summaries](sweep-prefix-summary.csv)
+
+### Candidate pool and rescoring depth
+
+Fix traversal at 1,024 / 2,048 / 128 / 256. Vary the candidate pool size, first with the production geometric rescoring rule and then scoring the entire pool against the retained vectors. Both ordinary and streaming modes use the same pool size and reranking depth within each run. Timings include search, both scoring passes and truncation to 48. The full-pool override is a benchmark control.
+
+| Candidates | Default full-fidelity reads | Streaming recall@48, default / full | Streaming p95, default / full |
+| ---: | ---: | ---: | ---: |
+| 128 | 78 | 49.09% / 55.34% | 7.5 / 7.5 ms |
+| 500 | 154 | 61.85% / 74.74% | 12.3 / 13.1 ms |
+| 2,000 | 309 | 67.58% / 86.46% | 31.0 / 34.7 ms |
+| 8,000 | 619 | 70.96% / 93.23% | 97.8 / 119.3 ms |
+
+The table above uses the original 16 queries. The full-pool confirmation below uses the 64 fresh queries. A larger pool also lets the graph walk run longer and spends more on candidate membership. These are whole-stage tradeoffs at fixed traversal settings.
+
+| Candidates fully rescored | Ordinary recall@48 / p95 | Streaming recall@48 / p95 |
+| ---: | ---: | ---: |
+| 500 | 87.60% / 50.6 ms | 86.82% / 10.5 ms |
+| 2,000 | 94.60% / 60.4 ms | 94.37% / 31.2 ms |
+| 8,000 | 98.47% / 100.3 ms | 98.50% / 110.0 ms |
+
+The latency cost depends on file residency. Fully rescoring 8,000 catalog vectors requests roughly 31.7 MiB of retained-vector payload per query before any cache reuse. Two warm serial leaves with 64 validation queries provide a comparison of operating points. Cold reads, concurrent load, high fan-out, and leaves where filter materialization alone exceeds 500 ms still need separate measurements to choose a production default or routing threshold.
+
+### Reproduce the wider sweep
+
+Use the two committed index leaves and pinned shard 223 described above. Generate 80 eligible queries with the original sampling and split them at 16. The tuning SHA-256 is `32be3c89fac9e93a6a6ad63aee02209ae721f1e84274e51bd590fc4340272792`. The validation SHA-256 is `87f2569ed9c2c758212d77f681cebecf66c15bb11b7a79e6c883d2349a55c3d3`. Run configurations sequentially on an idle host. Each stage CSV includes ordinary filtered kNN under the same candidate and rescoring budgets as the streaming rows.
+
+```sh
+python "$src/prepare.py" "$work/cohorts" "$work/80.i8" --query-count 80 \
+  --queries-from "$cache_dir"/part-00223-9336264f-afa4-46f8-b510-1aedf848eb31-c000.snappy.parquet
+dd if="$work/80.i8" of="$work/tuning.i8" bs=4154 count=16 status=none
+dd if="$work/80.i8" of="$work/validation.i8" bs=4154 skip=16 status=none
+mkdir -p "$work/sweep-classes"
+javac -proc:none -cp "$classpath" -d "$work/sweep-classes" "$src/CatalogPrefilter.java" \
+  "$src/CatalogFilterProfile.java" "$src/RankedStreamBenchmark.java"
+CLASSPATH="$work/sweep-classes:$classpath" "$src/run_ranked_sweep.sh" \
+  "$work/leaf0" "$work/leaf1" "$work/tuning.i8" "$work/validation.i8" "$work/sweep-results"
+```
+
+The runner lists each configuration in width / visit limit / refill interval / refill size order. Stage p95 is nearest rank over three repetitions per query. Recall is the fraction of exact filtered top-48 hits in the final result. Pool recall measures how many of those hits were available before rescoring. Prefix timings use one observation per query and include open. The full set of query-level observations, including stock controls and prefix inversions, is available for reanalysis. [Runner](../../../../../scripts/perf/catalog_prefilter/run_ranked_sweep.sh) · [Stage summary](sweep-stage-summary.csv) · [Prefix summary](sweep-prefix-summary.csv) · [Raw CSV archive](sweep-observations.zip)
