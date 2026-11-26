@@ -43,8 +43,8 @@ import org.apache.lucene.util.quantization.QuantizedVectorsReader;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Performs two-stage rescoring of {@link TopDocs} provided after HNSW graph traversal based on
- * binary quantized vectors.
+ * Performs two-stage binary rescoring, or direct full-pool rescoring on retained vectors for
+ * streaming binary and scalar-quantized queries.
  *
  * <p>Supports both flat and nested (parent-child block join) vector indexes. For nested indexes,
  * provide a {@link BitSetProducer} identifying parent documents; each parent is rescored by taking
@@ -69,8 +69,8 @@ public class BinaryQuantizedVectorRescorer {
   }
 
   /**
-   * Rescores binary-quantized candidates with the requested full-fidelity budget, supporting both
-   * flat and nested (parent-child block join) indexes.
+   * Rescores quantized candidates with the requested full-fidelity budget, supporting both flat and
+   * nested (parent-child block join) indexes.
    *
    * <p>For nested indexes, supply a {@code parentFilter} identifying parent documents. Each parent
    * is scored by the maximum similarity across its child vectors; the vector iterator advances

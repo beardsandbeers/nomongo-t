@@ -17,6 +17,8 @@ import com.xgen.mongot.index.lucene.quantization.BinaryQuantizedVectorRescorer;
 import com.xgen.mongot.index.lucene.query.NestedAvgVectorRescorer;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.counts.Count;
+import com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria;
+import com.xgen.mongot.index.query.operators.StreamingOptions;
 import com.xgen.mongot.index.query.operators.VectorEmbeddedOptions;
 import com.xgen.mongot.index.query.operators.VectorSearchCriteria;
 import com.xgen.mongot.index.query.operators.VectorSearchOperator;
@@ -128,10 +130,21 @@ class LuceneSearchManagerFactory {
       VectorSearchCriteria criteria, VectorQuantization quantization) {
     Vector vector =
         Check.isPresent(criteria.queryVector(), "criteria has to be materialized up to this point");
-    return quantization == VectorQuantization.BINARY
-        && (vector.getVectorType() == Vector.VectorType.FLOAT
-            || vector.getVectorType() == Vector.VectorType.BYTE)
-        && criteria.getVectorSearchType() == VectorSearchCriteria.Type.APPROXIMATE;
+    if (!(criteria instanceof ApproximateVectorSearchCriteria approximate)
+        || criteria.getVectorSearchType() != VectorSearchCriteria.Type.APPROXIMATE) {
+      return false;
+    }
+    return switch (quantization) {
+      case NONE -> false;
+      case BINARY ->
+          vector.getVectorType() == Vector.VectorType.FLOAT
+              || vector.getVectorType() == Vector.VectorType.BYTE;
+      // Float32 scalar indexes retain the original vectors for the explicit full-pool pass.
+      // A byte input on a scalar-mapped path already uses the raw byte field.
+      case SCALAR ->
+          vector.getVectorType() == Vector.VectorType.FLOAT
+              && approximate.streaming().map(StreamingOptions::rescoreAll).orElse(false);
+    };
   }
 
   private static boolean requiresNestedAvgRescoring(VectorSearchCriteria criteria) {

@@ -95,7 +95,7 @@ def prepare(cache, target, int8=False):
                 raise ValueError("Insufficient unique products")
 
 
-def prepare_queries(cohorts, shard, output, count=16):
+def prepare_queries(cohorts, shard, output, count=16, float_queries=False):
     """Select distinct, non-indexed queries from a pinned held-out catalog shard."""
     if count < 1:
         raise ValueError("Query count must be positive")
@@ -112,7 +112,8 @@ def prepare_queries(cohorts, shard, output, count=16):
             vector = batch.column("value")[row]
             if not product or product in indexed:
                 continue
-            codes = np.rint(np.asarray(vector.as_py(), dtype=np.float32) * INT8_SCALE)
+            values = np.asarray(vector.as_py(), dtype="<f4")
+            codes = np.rint(values * INT8_SCALE)
             if (
                 codes.shape != (DIMS,)
                 or not np.isfinite(codes).all()
@@ -120,7 +121,7 @@ def prepare_queries(cohorts, shard, output, count=16):
                 or codes.max() > 127
             ):
                 raise ValueError(f"Invalid query embedding for {product}")
-            vectors.append(codes.astype(np.int8).tobytes())
+            vectors.append((values if float_queries else codes.astype(np.int8)).tobytes())
             indexed.add(product)
             if len(vectors) == count:
                 with output.open("xb") as stream:
@@ -140,13 +141,20 @@ if __name__ == "__main__":
         "--queries-from",
         type=Path,
         metavar="SHARD",
-        help="Export held-out int8 queries. Positional arguments are the existing cohorts directory and the output file.",
+        help="Export held-out queries (int8 by default). Positional arguments are the existing cohorts directory and the output file.",
     )
     parser.add_argument(
         "--query-count", type=int, default=16, help="Number of held-out queries to export"
     )
+    parser.add_argument(
+        "--float-queries", action="store_true", help="Export original float32 query coordinates"
+    )
     args = parser.parse_args()
+    if args.float_queries and not args.queries_from:
+        parser.error("--float-queries requires --queries-from")
     if args.queries_from:
-        prepare_queries(args.cache, args.queries_from, args.target, args.query_count)
+        prepare_queries(
+            args.cache, args.queries_from, args.target, args.query_count, args.float_queries
+        )
     else:
         prepare(args.cache, args.target, args.int8)

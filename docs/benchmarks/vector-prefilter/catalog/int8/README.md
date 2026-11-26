@@ -1,5 +1,7 @@
 # Filter materialization with retained int8 product embeddings
 
+For recall across raw float32, raw int8, scalar and binary graphs on matched product IDs, see the [codec comparison](../codec-comparison/README.md).
+
 **Current recall benchmarks use k = 10, 20, 50 and 100.** The original k = 48 reproduced the result limit in the supplied price-capped search plan. [Finite-stage refinement and full-pool rescoring](#finite-stage-refinement-and-full-pool-rescoring) · [Previous cutoff comparison](#recall-at-10-20-50-and-100)
 
 

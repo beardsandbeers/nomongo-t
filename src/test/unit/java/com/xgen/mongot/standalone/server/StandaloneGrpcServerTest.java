@@ -3430,6 +3430,49 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void vectorSearch_scalarFullPool_ordersTiedCandidatesByRetainedFloats() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("scalar-full")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{fields:[{type:'vector',path:'v',numDimensions:4,"
+                                  + "similarity:'euclidean',quantization:'scalar'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(id, 1);
+      // The anchors set the scalar range. The first two vectors fall in the same bin.
+      f.docs.upsert(
+          UpsertRequest.newBuilder()
+              .setIndexId(id)
+              .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE)
+              .addDocumentsBson(bson("{_id:'first',v:[0.1,0.1,0.1,0.1]}"))
+              .addDocumentsBson(bson("{_id:'target',v:[0.01,0.01,0.01,0.01]}"))
+              .addDocumentsBson(bson("{_id:'low',v:[-100,-100,-100,-100]}"))
+              .addDocumentsBson(bson("{_id:'high',v:[100,100,100,100]}"))
+              .build());
+
+      var request = QueryRequest.newBuilder().setIndexId(id);
+      String fields =
+          "{path:'v',queryVector:[0.01,0.01,0.01,0.01],limit:1,numCandidates:4,streaming:";
+      var normal = f.queries.vectorSearch(request.setQueryBson(bson(fields + "{}}")).build());
+      var full =
+          f.queries.vectorSearch(request.setQueryBson(bson(fields + "{rescoreAll:true}}")).build());
+
+      var before = new RawBsonDocument(normal.getBatchBson().toByteArray()).getArray("results");
+      var after = new RawBsonDocument(full.getBatchBson().toByteArray()).getArray("results");
+      assertThat(before.get(0).asDocument().getString("_id").getValue()).isEqualTo("first");
+      assertThat(after).hasSize(1);
+      assertThat(after.get(0).asDocument().getString("_id").getValue()).isEqualTo("target");
+    }
+  }
+
+  @Test
   public void vectorSearch_streamingBinaryFullPool_returnsExactNeighbor() throws Exception {
     Similarity.load();
     try (var f = new Fixture(data())) {

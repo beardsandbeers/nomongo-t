@@ -1,5 +1,7 @@
 # Catalog pre-filter materialization on 5 GB HNSW segments
 
+For recall across raw float32, raw int8, scalar and binary graphs on matched product IDs, see the [codec comparison](codec-comparison/README.md).
+
 The decision criterion is 500 ms to prepare a pre-filter on one roughly 5 GB segment. Each observation times the first iterator-backed `AcceptDocs.cost()` on a fresh Lucene weight. All qualifying observations count, including isolated slow runs.
 
 **0 of 700 measured materializations reached 500 ms.** The slowest took 18.22 ms after file eviction was requested. The highest per-filter p95 was 11.81 ms. Both occurred on the second leaf for the conjunction of price $5–$100, rating ≥4, at least ten reviews, and category other than Books. Across the seven predicates, actual acceptance ranged from about 11% to 75%. The accepted counts for every timed run matched the source metadata.

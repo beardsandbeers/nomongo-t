@@ -58,6 +58,11 @@ public class RankedStreamBenchmark {
 
   private static ApproximateVectorSearchCriteria criteria(
       int limit, Optional<StreamingOptions> streaming) {
+    return criteria(limit, CANDIDATES, streaming);
+  }
+
+  static ApproximateVectorSearchCriteria criteria(
+      int limit, int candidates, Optional<StreamingOptions> streaming) {
     return new ApproximateVectorSearchCriteria(
         FieldPath.newRoot("vector"),
         Optional.empty(),
@@ -65,17 +70,16 @@ public class RankedStreamBenchmark {
         Optional.empty(),
         Optional.empty(),
         limit,
-        Optional.of(CANDIDATES),
+        Optional.of(candidates),
         Optional.empty(),
         false,
         Optional.empty(),
         streaming);
   }
 
-  private record Case(String name, Query query, BitSet allowed) {}
+  record Case(String name, Query query, BitSet allowed) {}
 
-  private static Case prepare(IndexSearcher searcher, CatalogPrefilter.Case filter)
-      throws IOException {
+  static Case prepare(IndexSearcher searcher, CatalogPrefilter.Case filter) throws IOException {
     var weight =
         searcher.createWeight(searcher.rewrite(filter.query()), ScoreMode.COMPLETE_NO_SCORES, 1);
     var allowed = new BitSet(searcher.getIndexReader().maxDoc());
@@ -92,7 +96,7 @@ public class RankedStreamBenchmark {
     return new Case(filter.name(), filter.query(), allowed);
   }
 
-  private static List<Hit> exact(IndexReader reader, Case filter, byte[] q) throws IOException {
+  static List<Hit> exact(IndexReader reader, Case filter, byte[] q) throws IOException {
     int depth = Math.max(DEEP_PREFIX ? 500 : 100, Collections.max(LIMITS));
     var heap = new PriorityQueue<>(depth, BEST.reversed());
     for (var leaf : reader.leaves()) {
