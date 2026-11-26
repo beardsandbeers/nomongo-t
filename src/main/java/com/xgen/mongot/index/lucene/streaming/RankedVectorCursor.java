@@ -389,18 +389,19 @@ public final class RankedVectorCursor implements Closeable {
                 return scorer.maxOrd();
               }
             };
-        HnswGraphSearcher.search(
-            recording,
+        var graph = new WarmupGraph(this.vectors.graph());
+        var collector =
             new TopKnnCollector(
                 RankedVectorCursor.this.options.warmupWidth(),
-                RankedVectorCursor.this.options.warmupVisits()),
-            this.vectors.graph(),
-            null);
+                RankedVectorCursor.this.options.warmupVisits());
+        HnswGraphSearcher.search(recording, collector, graph, null);
         // A very small visit limit may stop the upper-level descent before a level-zero hit.
         if (this.frontier.isEmpty()) {
           int entry = this.vectors.graph().entryNode();
           remember(entry, scorer.score(entry));
         }
+        var completed = graph.completedNodes(collector.earlyTerminated());
+        this.frontier.removeIf(node -> completed.contains(node.ord));
       }
       admit();
     }

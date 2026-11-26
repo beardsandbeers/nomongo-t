@@ -156,3 +156,56 @@ for experiment in prefix stage; do
     "$experiment" "$work/leaf0" "$work/leaf1" "$work/queries.i8" > "$work/results/$experiment.csv"
 done
 ```
+
+## Continuation, filter cost and rescoring
+
+On the six-category filter (77.45% acceptance), expanding 128 neighborhoods every 32 delivered hits reached **61.85% mean recall@48 at 18.8 ms p95**. Ordinary filtered kNN reached **61.20% at 51.7 ms p95** in the same run. This setting matched ordinary kNN's recall on 13 queries and exceeded it on three. The mean gain was 0.65 percentage points. Its paired 95% bootstrap interval was 0.00 to +1.43 points across 10,000 resamples of the 16 queries (seed 9137).
+
+| Six-category stage | Refill every / expansions | Exact top 48 present in pool, mean | Final recall@48 | Search + rescore wall time, p50 / p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary filtered kNN, depth trial | — | 73.70% | 61.20% | 42.8 / 51.7 ms |
+| Checkpoint streaming, five-filter trial | 8 / 8 | 72.27% | 59.90% | 5.5 / 12.6 ms |
+| Optimized streaming, five-filter trial | 8 / 8 | 72.66% | 59.90% | 6.0 / 12.7 ms |
+| Optimized streaming, five-filter trial | 32 / 32 | 72.40% | 59.90% | 4.8 / 10.3 ms |
+| Optimized streaming, depth trial | 16 / 32 | 74.48% | 61.59% | 8.1 / 16.0 ms |
+| Optimized streaming, depth trial | 32 / 128 | 74.74% | 61.85% | 10.3 / 18.8 ms |
+
+**Where the difficult query lost hits.** Query 0 reached the same first local maximum and best traversal-scored node as ordinary kNN in each leaf. The checkpoint then reopened 64 and 65 already-expanded neighborhoods in its first refill expansions. The optimized walk skips fully read level-zero neighborhoods and leaves the last one eligible if Lucene hit its visit limit, since Lucene may have truncated the final batch of scores. At the original cadence it scored 2,687 distinct nodes by candidate 500, up from 2,377, and still held only 37 of the exact top 48. The stage returned 33. At 16 / 32 it held 46 and returned 41. At 32 / 128 it held all 48 and returned 43, matching ordinary kNN. The two changes have different effects. Using 32 / 128 on the checkpoint also recovered 43. At 16 / 32 the checkpoint returned 39. [Stage observations](streaming-tuning-stage.csv)
+
+**Point-only membership.** A 1 KiB table of candidate ID low bits lets the BKD visitor reject most scanned point IDs before binary-searching the batch. Every possible match still gets an exact ID lookup. In a dedicated point-only trial with the same continuation and 8 / 8 cadence, p95 fell from **594.0 to 67.6 ms**. At 32 / 32 it fell from **243.3 to 46.0 ms**. The pool hit count and final recall agreed on every query at each cadence. Ordinary kNN took **8.1 ms p95** in the optimized trial at **65.10% recall**, versus **64.45%** streaming. Both paths admit the same 49.76% of the catalog. Even this faster visitor scans matching cells repeatedly. At 9.31% acceptance, the price-capped compound filter also favored ordinary kNN at the tail, 108.0 ms versus 160.7 ms streaming at 16 / 32. [Point and compound trials](streaming-tuning-stage.csv)
+
+**Rescoring the same pool.** On each six-category query, freeze the 500 candidates from optimized 16 / 32 streaming. Vary the number read from the retained int8 vectors in the existing binary rescorer and evaluate the top 48 each time. At depth 500 the final recall reached the candidate pool's 74.48% ceiling. This experiment used cached files. At 4,154 bytes per raw vector, 500 raw reads request about 2.0 MiB of vector payload, versus 0.61 MiB at depth 154. Cold reads and concurrent requests could change the cost materially. [Rescoring observations](streaming-tuning-rescore.csv)
+
+| Full-fidelity candidates | Mean recall@48 | Rescorer alone, p50 / p95 |
+| ---: | ---: | ---: |
+| 154 (stage default for 500 / 48) | 61.59% | 0.93 / 1.19 ms |
+| 250 | 65.50% | 1.01 / 1.15 ms |
+| 500 | 74.48% | 1.22 / 1.42 ms |
+
+**Generic cursor prefixes.** Skipping completed neighborhoods at 8 / 8 raised recall@100 from 62.8% to 67.4%, but also raised the share of inverted score pairs from 0.53% to 2.80%. Investing more work before the first delivery improved both measures. It increased the amount of retained state and the time until the first ten hits. The open-ended stream still allows a later hit to outrank an earlier one. [Warm-up and cadence sweep](streaming-tuning-prefix.csv) · [Checkpoint prefixes](streaming-prefix.csv)
+
+| Warm-up width / visits, refill 8 / 8 | Mean recall@10 / @100 | Inverted pairs in first 100 | Mean distinct nodes at 100 | Median time to first 10 |
+| --- | ---: | ---: | ---: | ---: |
+| Checkpoint 64 / 1,024 | 78.8% / 62.8% | 0.53% | 1,641 | 4.1 ms |
+| Optimized 64 / 1,024 | 78.8% / 67.4% | 2.80% | 2,140 | 4.2 ms |
+| Optimized 128 / 2,048 | 81.9% / 71.7% | 1.78% | 2,754 | 4.4 ms |
+| Optimized 256 / 4,096 | 83.8% / 75.9% | 0.37% | 3,874 | 6.2 ms |
+
+### Reproduce the tuning trials
+
+Use the same two leaves, query digest, JVM flags and exact truth procedure as above. Measurements used an i5-12600K and OpenJDK 21.0.13. Each implementation ran in a separate JVM with serial leaf execution and warm files. Within each stage run, the harness shuffled stock and streaming configurations for each query and repetition. Percentiles use the nearest rank over 48 stage observations per configuration. Prefix timings include open and were sampled once per query and configuration in the listed order. The observations cover two dense leaves and 16 independent query vectors. They leave cold latency, concurrent throughput, high segment fan-out and the production routing threshold open.
+
+Compile the **current** benchmark harness once. Put its classes first on the runtime classpath. For a checkpoint run, use the deploy JAR from `c0e870c5`. For optimized runs, use the deploy JAR containing the continuation and point membership changes. To isolate point membership, extract `com/xgen/mongot/index/lucene/streaming/PointRangeMembership*.class` from the checkpoint JAR into a fresh directory (including the visitor inner class) and put that directory before the optimized JAR. An optional JVM property `-Dcatalog.filter=categories_6` or `-Dcatalog.filter=point_only_price` restricts the stage trial to one predicate.
+
+With `run` invoking `RankedStreamBenchmark` as in the streaming reproduction, supply the following arguments after the mode and three input paths.
+
+| Trial | Mode | Refill configurations |
+| --- | --- | --- |
+| Five filter shapes | stage | Checkpoint `8/8` and optimized `8/8 32/32 16/32` |
+| Six-category depth | stage | Both revisions `16/32 32/128` |
+| Standalone points | stage | Optimized, with each point visitor, `8/8 32/32` |
+| Six-category reranking | rescore | Optimized `16/32` |
+| Six-category prefix cadence | prefix | Optimized `8/8 32/32 16/32` |
+| Six-category prefix warm-up | prefix | Optimized `8/8 128/2048/8/8 256/4096/8/8 64/1024/64/64` |
+
+A pair supplies `refillEvery/refillExpansions` with warm-up 64 / 1,024. Four values also override `warmupWidth/warmupVisits`. The reranking experiment calls the production rescorer with limits 48, 125 and 500 so its geometric rule selects 154, 250 and 500 full-fidelity candidates. It times both rescoring passes and evaluates only the first 48 results. This research setting lives in the benchmark harness. [Harness](../../../../../scripts/perf/catalog_prefilter/RankedStreamBenchmark.java)

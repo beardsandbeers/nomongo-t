@@ -11,6 +11,9 @@ import com.xgen.mongot.util.bson.parser.BsonParseException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.codecs.lucene104.Lucene104Codec;
+import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KnnFloatVectorField;
@@ -22,9 +25,11 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
@@ -44,7 +49,15 @@ public class RankedVectorCursorTest {
 
   @Before
   public void setUp() throws IOException {
-    var config = new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE);
+    var codec =
+        new Lucene104Codec() {
+          @Override
+          public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+            // Exercise HNSW continuation even for these deliberately tiny test leaves.
+            return new Lucene99HnswVectorsFormat(16, 100, 0);
+          }
+        };
+    var config = new IndexWriterConfig().setCodec(codec).setMergePolicy(NoMergePolicy.INSTANCE);
     try (var writer = new IndexWriter(this.directory, config)) {
       // Two graphs, vectors missing from some documents and one leaf without the field.
       for (int id = 0; id < 200; id++) {
@@ -127,6 +140,60 @@ public class RankedVectorCursorTest {
       assertThat(first.poll(2, 1).exhausted()).isTrue();
     }
     assertThat(this.reader.getRefCount()).isEqualTo(refs);
+  }
+
+  @Test
+  public void poll_fullyExpandedWarmup_deliversAllHitsWithoutRefillWork() throws IOException {
+    var limits = new StreamingOptions(300, 1000, 1, 1, 500);
+    int liveVectors = 200 - 29 - 1; // multiples of seven have no vector, document 100 is deleted
+    try (var cursor = RankedVectorCursor.open(this.searcher, "v", TARGET, null, limits)) {
+      var batch = cursor.poll(liveVectors, liveVectors);
+
+      assertThat(batch.hits()).hasSize(liveVectors);
+      assertThat(batch.exhausted()).isTrue();
+    }
+  }
+
+  @Test
+  public void completedNodes_finalScoringBatchTruncated_keepsLastNeighborhoodForRefill()
+      throws IOException {
+    var vectors =
+        StreamingVectors.open(
+            this.reader.leaves().getFirst(),
+            "v",
+            (factory, similarity, values) ->
+                factory.getRandomVectorScorer(similarity, values, TARGET),
+            VectorEncoding.FLOAT32,
+            false);
+    var graph = new WarmupGraph(vectors.graph());
+    readNeighborhood(graph, 0);
+    readNeighborhood(graph, 1);
+
+    assertThat(graph.completedNodes(true)).containsExactly(0);
+  }
+
+  private static void readNeighborhood(WarmupGraph graph, int ord) throws IOException {
+    graph.seek(0, ord);
+    while (graph.nextNeighbor() != DocIdSetIterator.NO_MORE_DOCS) {
+      // Lucene can drain this iterator before limiting how many neighbors it scores.
+    }
+  }
+
+  @Test
+  public void poll_visitLimitDuringWarmup_preservesReachableNeighbors() throws IOException {
+    var expected =
+        java.util.stream.IntStream.range(0, 200)
+            .filter(id -> id % 7 != 0 && id != 100)
+            .boxed()
+            .toList();
+    var limits = new StreamingOptions(8, 20, 2, 1, 500);
+    try (var cursor = RankedVectorCursor.open(this.searcher, "v", TARGET, null, limits)) {
+      // A graphless leaf scores every ordinal on open and cannot exercise this handoff.
+      assertThat(cursor.cachedNodes()).isLessThan(expected.size());
+      var docs = drain(cursor, 5, 2).stream().map(RankedVectorCursor.Hit::doc).toList();
+
+      assertThat(docs).containsExactlyElementsIn(expected);
+    }
   }
 
   @Test

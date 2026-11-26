@@ -43,20 +43,23 @@ public class RankedStreamBenchmark {
       List.of(
           new StreamingOptions(32, 256, 8, 8, 250_000),
           new StreamingOptions(64, 1024, 8, 8, 250_000));
-  private static final ApproximateVectorSearchCriteria CRITERIA =
-      new ApproximateVectorSearchCriteria(
-          FieldPath.newRoot("vector"),
-          Optional.empty(),
-          Optional.empty(),
-          Optional.empty(),
-          Optional.empty(),
-          LIMIT,
-          Optional.of(CANDIDATES),
-          Optional.empty(),
-          false,
-          Optional.empty());
+  private static final ApproximateVectorSearchCriteria CRITERIA = criteria(LIMIT);
   private static final BinaryQuantizedVectorRescorer RESCORER =
       new BinaryQuantizedVectorRescorer(Optional.empty());
+
+  private static ApproximateVectorSearchCriteria criteria(int limit) {
+    return new ApproximateVectorSearchCriteria(
+        FieldPath.newRoot("vector"),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        limit,
+        Optional.of(CANDIDATES),
+        Optional.empty(),
+        false,
+        Optional.empty());
+  }
 
   private record Case(String name, Query query, BitSet allowed) {}
 
@@ -136,9 +139,15 @@ public class RankedStreamBenchmark {
     return 2.0 * inversions / (hits.size() * (hits.size() - 1));
   }
 
-  private static void prefix(IndexSearcher searcher, Case filter, byte[] q, int id, List<Hit> truth)
+  private static void prefix(
+      IndexSearcher searcher,
+      Case filter,
+      byte[] q,
+      int id,
+      List<Hit> truth,
+      List<StreamingOptions> budgets)
       throws IOException {
-    for (var options : BUDGETS) {
+    for (var options : budgets) {
       long start = System.nanoTime();
       try (var cursor = RankedVectorCursor.open(searcher, "vector", q, filter.query, options)) {
         var hits = new ArrayList<Hit>();
@@ -164,9 +173,20 @@ public class RankedStreamBenchmark {
     }
   }
 
-  private static void stage(IndexSearcher searcher, Case filter, byte[] q, int id, List<Hit> truth)
+  private static void stage(
+      IndexSearcher searcher,
+      Case filter,
+      byte[] q,
+      int id,
+      List<Hit> truth,
+      List<StreamingOptions> budgets)
       throws IOException {
-    var modes = new ArrayList<>(List.of(0, 1, 2));
+    var modes = new ArrayList<Integer>();
+    for (int mode = 0; mode <= budgets.size(); mode++) {
+      modes.add(mode);
+    }
+    var truthIds = new HashSet<Integer>();
+    truth.subList(0, LIMIT).forEach(hit -> truthIds.add(hit.doc()));
     var order = new Random(9137L + id);
     for (int rep = -1; rep < 3; rep++) {
       Collections.shuffle(modes, order);
@@ -175,7 +195,7 @@ public class RankedStreamBenchmark {
             mode == 0
                 ? new KnnByteVectorQuery("vector", q, CANDIDATES, filter.query)
                 : new StreamingKnnQuery.Bytes(
-                    "vector", q, CANDIDATES, filter.query, BUDGETS.get(mode - 1));
+                    "vector", q, CANDIDATES, filter.query, budgets.get(mode - 1));
         long start = System.nanoTime();
         var candidates = searcher.search(query, CANDIDATES);
         var results =
@@ -188,16 +208,67 @@ public class RankedStreamBenchmark {
         var hits = Arrays.stream(results.scoreDocs).map(sd -> new Hit(sd.doc, sd.score)).toList();
         double recall = recall(hits, truth, LIMIT, filter);
         if (rep >= 0) {
+          long poolHits =
+              Arrays.stream(candidates.scoreDocs).filter(sd -> truthIds.contains(sd.doc)).count();
           System.out.printf(
               Locale.ROOT,
-              "%d,%s,%d,%d,%s,%d,%d,%.3f,%.4f%n",
+              "%d,%s,%d,%d,%s,%d,%d,%.3f,%.4f,%d,%d,%d%n",
               id,
               filter.name,
               filter.allowed.cardinality(),
               rep,
               mode == 0 ? "baseline" : "streaming",
-              mode == 0 ? 0 : BUDGETS.get(mode - 1).warmupWidth(),
-              mode == 0 ? 0 : BUDGETS.get(mode - 1).warmupVisits(),
+              mode == 0 ? 0 : budgets.get(mode - 1).warmupWidth(),
+              mode == 0 ? 0 : budgets.get(mode - 1).warmupVisits(),
+              wall,
+              recall,
+              mode == 0 ? 0 : budgets.get(mode - 1).refillEvery(),
+              mode == 0 ? 0 : budgets.get(mode - 1).refillExpansions(),
+              poolHits);
+        }
+      }
+    }
+  }
+
+  // Hold the candidate IDs fixed and time both production reranking passes together.
+  private static void rescore(
+      IndexSearcher searcher,
+      Case filter,
+      byte[] q,
+      int id,
+      List<Hit> truth,
+      StreamingOptions budget)
+      throws IOException {
+    var query = new StreamingKnnQuery.Bytes("vector", q, CANDIDATES, filter.query, budget);
+    var candidates = searcher.search(query, CANDIDATES);
+    var rescoreQuery = BinaryQuantizedRescoreQuery.from(query);
+    var limits = new ArrayList<>(List.of(LIMIT, 125, CANDIDATES));
+    var order = new Random(9137L + id);
+    for (int rep = -1; rep < 3; rep++) {
+      Collections.shuffle(limits, order);
+      for (int limit : limits) {
+        var criteria = criteria(limit);
+        long start = System.nanoTime();
+        var results = RESCORER.rescore(searcher, candidates, criteria, rescoreQuery);
+        double wall = (System.nanoTime() - start) / 1e6;
+        var hits =
+            Arrays.stream(results.scoreDocs)
+                .limit(LIMIT)
+                .map(sd -> new Hit(sd.doc, sd.score))
+                .toList();
+        double recall = recall(hits, truth, LIMIT, filter);
+        if (rep >= 0) {
+          System.out.printf(
+              Locale.ROOT,
+              "%d,%s,%d,%d,%d,%d,%d,%d,%.3f,%.4f%n",
+              id,
+              filter.name,
+              budget.warmupWidth(),
+              budget.warmupVisits(),
+              budget.refillEvery(),
+              budget.refillExpansions(),
+              rep,
+              (int) Math.sqrt(limit * CANDIDATES),
               wall,
               recall);
         }
@@ -206,10 +277,25 @@ public class RankedStreamBenchmark {
   }
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 4 || !List.of("prefix", "stage").contains(args[0])) {
-      throw new IllegalArgumentException("Expected prefix|stage leaf0 leaf1 queries.i8");
+    if (args.length < 4 || !List.of("prefix", "stage", "rescore").contains(args[0])) {
+      throw new IllegalArgumentException(
+          "Expected prefix|stage|rescore leaf0 leaf1 queries.i8 [refillEvery/refillExpansions"
+              + " ...]");
     }
-    boolean prefixes = args[0].equals("prefix");
+    var budgets = new ArrayList<StreamingOptions>();
+    for (int i = 4; i < args.length; i++) {
+      int[] values = Arrays.stream(args[i].split("/", -1)).mapToInt(Integer::parseInt).toArray();
+      budgets.add(
+          switch (values.length) {
+            case 2 -> new StreamingOptions(64, 1024, values[0], values[1], 250_000);
+            case 4 -> new StreamingOptions(values[0], values[1], values[2], values[3], 250_000);
+            default ->
+                throw new IllegalArgumentException("Expected [width/visits/]every/expansions");
+          });
+    }
+    if (budgets.isEmpty()) {
+      budgets.addAll(BUDGETS);
+    }
     try (var d0 = FSDirectory.open(Path.of(args[1]));
         var d1 = FSDirectory.open(Path.of(args[2]));
         var r0 = DirectoryReader.open(d0);
@@ -220,7 +306,7 @@ public class RankedStreamBenchmark {
       searcher.setQueryCache(null);
       var cases = new ArrayList<Case>();
       cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(6, false)));
-      if (!prefixes) {
+      if (args[0].equals("stage")) {
         cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(3, false)));
         cases.add(prepare(searcher, CatalogFilterProfile.catalogCase(2, true)));
         cases.add(
@@ -238,10 +324,22 @@ public class RankedStreamBenchmark {
                         NumericUtils.doubleToSortableLong(5),
                         NumericUtils.doubleToSortableLong(100)))));
       }
+      String onlyFilter = System.getProperty("catalog.filter");
+      if (onlyFilter != null) {
+        cases.removeIf(c -> !c.name.equals(onlyFilter));
+        if (cases.isEmpty()) {
+          throw new IllegalArgumentException("Unknown filter for this experiment: " + onlyFilter);
+        }
+      }
       System.out.println(
-          prefixes
-              ? "query,width,visits,refillEvery,refillExpansions,recall10,recall100,first10_ms,first100_ms,cached,inverted_pairs100"
-              : "query,filter,accepted,repeat,mode,width,visits,wall_ms,recall48");
+          switch (args[0]) {
+            case "prefix" ->
+                "query,width,visits,refillEvery,refillExpansions,recall10,recall100,first10_ms,first100_ms,cached,inverted_pairs100";
+            case "rescore" ->
+                "query,filter,width,visits,refillEvery,refillExpansions,repeat,full_fidelity_docs,rescore_ms,recall48";
+            default ->
+                "query,filter,accepted,repeat,mode,width,visits,wall_ms,recall48,refillEvery,refillExpansions,pool_hits48";
+          });
       for (int id = 0; ; id++) {
         byte[] q = queries.readNBytes(CatalogPrefilter.DIMS);
         if (q.length == 0) {
@@ -252,10 +350,14 @@ public class RankedStreamBenchmark {
         }
         for (var filter : cases) {
           var truth = exact(reader, filter, q);
-          if (prefixes) {
-            prefix(searcher, filter, q, id, truth);
-          } else {
-            stage(searcher, filter, q, id, truth);
+          switch (args[0]) {
+            case "prefix" -> prefix(searcher, filter, q, id, truth, budgets);
+            case "rescore" -> {
+              for (var budget : budgets) {
+                rescore(searcher, filter, q, id, truth, budget);
+              }
+            }
+            default -> stage(searcher, filter, q, id, truth, budgets);
           }
         }
       }

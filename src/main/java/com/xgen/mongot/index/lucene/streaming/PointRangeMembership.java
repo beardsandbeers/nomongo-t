@@ -9,6 +9,7 @@ import org.apache.lucene.index.PointValues.Relation;
 import org.apache.lucene.index.QueryTimeout;
 import org.apache.lucene.search.CollectionTerminatedException;
 import org.apache.lucene.search.PointRangeQuery;
+import org.apache.lucene.util.FixedBitSet;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -16,6 +17,9 @@ import org.jetbrains.annotations.Nullable;
  * retaining only batch membership. A broad range can be expensive to revisit on each refill.
  */
 final class PointRangeMembership {
+  // One KiB per batch, independent of segment size. Collisions take the exact lookup below.
+  private static final int BUCKETS = 8192;
+
   static CandidateFilter compile(
       LeafReader leaf, PointRangeQuery range, @Nullable QueryTimeout timeout) throws IOException {
     var points = leaf.getPointValues(range.getField());
@@ -42,13 +46,17 @@ final class PointRangeMembership {
       if (docs.length == 0) {
         return;
       }
+      var candidates = new FixedBitSet(BUCKETS);
+      for (int doc : docs) {
+        candidates.set(doc & (BUCKETS - 1));
+      }
       var visitor =
           new PointValues.IntersectVisitor() {
             int remaining = docs.length;
 
             @Override
             public void visit(int doc) {
-              if (doc < docs[0] || doc > docs[docs.length - 1]) {
+              if (!candidates.get(doc & (BUCKETS - 1))) {
                 return;
               }
               int pos = Arrays.binarySearch(docs, doc);
