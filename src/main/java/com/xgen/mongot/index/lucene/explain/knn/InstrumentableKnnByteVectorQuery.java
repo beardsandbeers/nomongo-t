@@ -1,6 +1,7 @@
 package com.xgen.mongot.index.lucene.explain.knn;
 
 import com.xgen.mongot.index.IndexMetricsUpdater;
+import com.xgen.mongot.index.lucene.query.custom.LeafKnnSearch;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnByteQuery;
 import java.io.IOException;
 import org.apache.lucene.index.LeafReaderContext;
@@ -11,6 +12,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.knn.KnnCollectorManager;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * A decorator over MongotKnnByteQuery to intercept calls to 'approximateSearch' and 'exactSearch'
@@ -37,7 +39,18 @@ public class InstrumentableKnnByteVectorQuery extends MongotKnnByteQuery {
       byte[] target,
       int k,
       Query filter) {
-    super(metrics, field, target, k, filter);
+    this(metrics, instrumentationHelper, field, target, k, filter, null);
+  }
+
+  public InstrumentableKnnByteVectorQuery(
+      IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+      KnnInstrumentationHelper instrumentationHelper,
+      String field,
+      byte[] target,
+      int k,
+      @Nullable Query filter,
+      @Nullable LeafKnnSearch leafSearch) {
+    super(metrics, field, target, k, filter, leafSearch);
     this.instrumentationHelper = instrumentationHelper;
   }
 

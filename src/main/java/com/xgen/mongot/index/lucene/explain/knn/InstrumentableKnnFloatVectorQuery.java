@@ -2,6 +2,7 @@ package com.xgen.mongot.index.lucene.explain.knn;
 
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
+import com.xgen.mongot.index.lucene.query.custom.LeafKnnSearch;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnFloatQuery;
 import java.io.IOException;
 import org.apache.lucene.index.LeafReaderContext;
@@ -31,7 +32,19 @@ public class InstrumentableKnnFloatVectorQuery extends MongotKnnFloatQuery {
       float[] target,
       int k,
       @Nullable Query filter) {
-    super(metrics, flags, field, target, k, filter);
+    this(metrics, flags, instrumentationHelper, field, target, k, filter, null);
+  }
+
+  public InstrumentableKnnFloatVectorQuery(
+      IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+      FeatureFlags flags,
+      KnnInstrumentationHelper instrumentationHelper,
+      String field,
+      float[] target,
+      int k,
+      @Nullable Query filter,
+      @Nullable LeafKnnSearch leafSearch) {
+    super(metrics, flags, field, target, k, filter, leafSearch);
     this.instrumentationHelper = instrumentationHelper;
   }
 

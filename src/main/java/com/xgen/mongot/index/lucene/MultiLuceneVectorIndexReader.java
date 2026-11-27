@@ -149,6 +149,33 @@ public class MultiLuceneVectorIndexReader implements VectorIndexReader {
       BatchSizeStrategy batchSizeStrategy,
       QueryOptimizationFlags queryOptimizationFlags)
       throws InvalidQueryException, IOException, InterruptedException, ReaderClosedException {
+    if (materializedVectorSearchQuery.materializedCriteria().isUnboundedStream()) {
+      var producers = new ArrayList<LuceneSearchBatchProducer>();
+      try {
+        for (int i = 0; i < this.readers.size(); i++) {
+          try (var scope = Explain.maybeEnterIndexPartitionQueryContext(i)) {
+            producers.add(
+                this.readers
+                    .get(i)
+                    .openStream(
+                        materializedVectorSearchQuery,
+                        context,
+                        queryCursorOptions,
+                        batchSizeStrategy,
+                        i));
+          }
+        }
+        return new VectorProducerAndMetaResults(
+            new SearchMergingBatchProducer(producers), MetaResults.EMPTY);
+      } catch (IOException
+          | InvalidQueryException
+          | ReaderClosedException
+          | RuntimeException
+          | Error e) {
+        org.apache.lucene.util.IOUtils.closeWhileHandlingException(producers);
+        throw e;
+      }
+    }
     List<Iterator<VectorSearchResult>> vectorSearchResultIterators =
         new ArrayList<>(this.readers.size());
     // Each partition reader sets the timeout on its IndexSearcher internally; this check throws

@@ -6,6 +6,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.flogger.FluentLogger;
 import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria;
+import com.xgen.mongot.index.query.operators.StreamingOptions;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -42,8 +43,8 @@ import org.apache.lucene.util.quantization.QuantizedVectorsReader;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Performs two-stage rescoring of {@link TopDocs} provided after HNSW graph traversal based on
- * binary quantized vectors.
+ * Performs two-stage binary rescoring, or direct full-pool rescoring on retained vectors for
+ * streaming binary and scalar-quantized queries.
  *
  * <p>Supports both flat and nested (parent-child block join) vector indexes. For nested indexes,
  * provide a {@link BitSetProducer} identifying parent documents; each parent is rescored by taking
@@ -68,8 +69,8 @@ public class BinaryQuantizedVectorRescorer {
   }
 
   /**
-   * Rescores vector search candidates using two-stage binary quantization rescoring, supporting
-   * both flat and nested (parent-child block join) indexes.
+   * Rescores quantized candidates with the requested full-fidelity budget, supporting both flat and
+   * nested (parent-child block join) indexes.
    *
    * <p>For nested indexes, supply a {@code parentFilter} identifying parent documents. Each parent
    * is scored by the maximum similarity across its child vectors; the vector iterator advances
@@ -97,25 +98,22 @@ public class BinaryQuantizedVectorRescorer {
       return topDocs;
     }
 
-    // Stage 1 - rescore query against the oversampled dequantized binary vectors
-    ApproximateRescorer approximateRescorer = new ApproximateRescorer(luceneQuery, parentFilter);
-    TopDocs approximatelyRescored =
-        approximateRescorer.rescore(indexSearcher, topDocs, searchCriteria.resolveNumCandidates());
-
-    // Stage 2 - rescore query against full fidelity vectors for the limited subset of docs
-    FullFidelityRescorer fullFidelityRescorer =
-        new FullFidelityRescorer(luceneQuery, this.executor, parentFilter);
-
-    // Use geometric mean between the limit and numCandidates to get a number in between with a bias
-    // towards the lower one (limit). Using a larger number improves recall, but affects latency
-    // as accessing full fidelity vectors could result in page faults
-    int fullFidelityLimit =
-        (int) Math.sqrt(searchCriteria.limit() * searchCriteria.resolveNumCandidates());
-    TopDocs fullFidelityRescoredDocs =
-        fullFidelityRescorer.rescore(indexSearcher, approximatelyRescored, fullFidelityLimit);
+    int candidates = searchCriteria.resolveNumCandidates();
+    var fullFidelityRescorer = new FullFidelityRescorer(luceneQuery, this.executor, parentFilter);
+    TopDocs fullFidelityRescoredDocs;
+    if (searchCriteria.streaming().map(StreamingOptions::rescoreAll).orElse(false)) {
+      // All candidates receive a retained-vector score. An approximate ranking cannot prune any.
+      fullFidelityRescoredDocs = fullFidelityRescorer.rescore(indexSearcher, topDocs, candidates);
+    } else {
+      var approximateRescorer = new ApproximateRescorer(luceneQuery, parentFilter);
+      var approximatelyRescored = approximateRescorer.rescore(indexSearcher, topDocs, candidates);
+      int fullFidelityLimit = (int) Math.sqrt((long) searchCriteria.limit() * candidates);
+      fullFidelityRescoredDocs =
+          fullFidelityRescorer.rescore(indexSearcher, approximatelyRescored, fullFidelityLimit);
+    }
 
     if (fullFidelityRescoredDocs.scoreDocs.length > searchCriteria.limit()) {
-      // Truncate the final result result to limit
+      // Truncate the final result to limit
       fullFidelityRescoredDocs.scoreDocs =
           Arrays.copyOf(fullFidelityRescoredDocs.scoreDocs, searchCriteria.limit());
     }

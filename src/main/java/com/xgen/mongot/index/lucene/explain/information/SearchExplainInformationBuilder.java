@@ -15,6 +15,8 @@ public class SearchExplainInformationBuilder {
   private Optional<ResourceUsageOutput> resourceUsage = Optional.empty();
   private Optional<List<VectorSearchTracingSpec>> vectorTracingInfos = Optional.empty();
   private Optional<List<VectorSearchSegmentStatsSpec>> vectorSearchSegmentStats = Optional.empty();
+  private Optional<BsonDocument> streamStats = Optional.empty();
+
   private Optional<BsonDocument> vectorliteStats = Optional.empty();
   private Optional<BsonDocument> vectorliteTrace = Optional.empty();
   private Optional<VectorSearchNumCandidatesSpec> numCandidates = Optional.empty();
@@ -118,6 +120,11 @@ public class SearchExplainInformationBuilder {
     return this;
   }
 
+  public SearchExplainInformationBuilder streamStats(BsonDocument stats) {
+    this.streamStats = Optional.of(stats);
+    return this;
+  }
+
   public SearchExplainInformationBuilder vectorliteStats(BsonDocument vectorliteStats) {
     this.vectorliteStats = Optional.of(vectorliteStats);
     return this;
@@ -183,6 +190,7 @@ public class SearchExplainInformationBuilder {
           this.resourceUsage,
           this.vectorTracingInfos,
           this.vectorSearchSegmentStats,
+          this.streamStats,
           this.vectorliteStats,
           this.vectorliteTrace,
           this.numCandidates,
@@ -205,6 +213,7 @@ public class SearchExplainInformationBuilder {
         this.aggregationStats,
         this.metadata,
         this.resourceUsage,
+        Optional.empty(),
         Optional.empty(),
         Optional.empty(),
         this.vectorliteStats,

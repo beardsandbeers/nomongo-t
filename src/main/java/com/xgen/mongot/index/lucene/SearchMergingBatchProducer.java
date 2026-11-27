@@ -27,9 +27,15 @@ import org.bson.BsonArray;
  */
 public class SearchMergingBatchProducer implements BatchProducer {
   private final List<LuceneSearchBatchProducer> batchProducers;
+  private long remaining;
   private Optional<MergedSearchResultIter> mergedSearchResultIter;
 
   public SearchMergingBatchProducer(List<LuceneSearchBatchProducer> batchProducers) {
+    this(batchProducers, Long.MAX_VALUE);
+  }
+
+  SearchMergingBatchProducer(List<LuceneSearchBatchProducer> batchProducers, long limit) {
+    this.remaining = limit;
     Check.argNotEmpty(batchProducers, "batchProducers");
     this.batchProducers = batchProducers;
     this.mergedSearchResultIter = Optional.empty();
@@ -72,7 +78,7 @@ public class SearchMergingBatchProducer implements BatchProducer {
     int batchSize = this.batchProducers.get(0).getBatchSizeStrategy().adviseNextBatchSize();
     var builder = BsonArrayBuilder.withLimit(sizeLimit);
     // TODO(CLOUDP-280897): Do we want to add the avgDocSize based capping logic here?
-    for (int i = 0; i < batchSize; i++) {
+    for (int i = 0; i < batchSize && this.remaining > 0; i++) {
       Optional<LuceneSearchBatchProducer.IterValue> iterValue =
           this.mergedSearchResultIter.get().peek(sizeLimit);
       if (iterValue.isEmpty()) {
@@ -84,6 +90,7 @@ public class SearchMergingBatchProducer implements BatchProducer {
         // when the value is successfully consumed (can fit in the BsonArrayBuilder). Only when
         // successfully consumed, the LuceneSearchBatchProducer.lastScoreDoc is updated.
         this.mergedSearchResultIter.get().acceptAndAdvance();
+        this.remaining--;
       } else {
         break;
       }
@@ -190,7 +197,7 @@ public class SearchMergingBatchProducer implements BatchProducer {
     if (this.mergedSearchResultIter.isEmpty()) {
       return false;
     }
-    return this.mergedSearchResultIter.get().isExhausted();
+    return this.remaining == 0 || this.mergedSearchResultIter.get().isExhausted();
   }
 
   @Override

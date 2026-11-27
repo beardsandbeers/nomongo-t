@@ -126,7 +126,8 @@ public record MaterializedVectorSearchQuery(
               approximate.numCandidates(),
               approximate.explainOptions(),
               approximate.returnStoredSource(),
-              approximate.embeddedOptions());
+              approximate.embeddedOptions(),
+              approximate.streaming());
       case ExactVectorSearchCriteria exact ->
           new ExactVectorSearchCriteria(
               internalPath(),

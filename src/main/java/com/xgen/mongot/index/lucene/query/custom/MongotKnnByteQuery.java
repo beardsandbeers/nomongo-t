@@ -8,8 +8,10 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnByteVectorQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.jetbrains.annotations.Nullable;
 
@@ -21,6 +23,7 @@ public class MongotKnnByteQuery extends KnnByteVectorQuery {
 
   protected final IndexMetricsUpdater.QueryingMetricsUpdater metrics;
   protected final boolean hasFilter;
+  private final @Nullable LeafKnnSearch leafSearch;
 
   /** A convenience overload for creating an unfiltered KNN query. */
   public MongotKnnByteQuery(
@@ -46,9 +49,45 @@ public class MongotKnnByteQuery extends KnnByteVectorQuery {
       byte[] target,
       int k,
       @Nullable Query filter) {
+    this(metrics, field, target, k, filter, null);
+  }
+
+  public MongotKnnByteQuery(
+      IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+      String field,
+      byte[] target,
+      int k,
+      @Nullable Query filter,
+      @Nullable LeafKnnSearch leafSearch) {
     super(field, target, k, filter);
+    this.leafSearch = leafSearch;
     this.metrics = metrics;
     this.hasFilter = filter != null;
+  }
+
+  @Override
+  protected TopDocs searchLeaf(
+      LeafReaderContext context,
+      @Nullable Weight filterWeight,
+      TimeLimitingKnnCollectorManager manager)
+      throws IOException {
+    if (this.leafSearch != null) {
+      var hits = this.leafSearch.search(context, manager.getQueryTimeout());
+      if (hits != null) {
+        return hits;
+      }
+    }
+    return super.searchLeaf(context, filterWeight, manager);
+  }
+
+  @Override
+  public boolean equals(Object other) {
+    return super.equals(other) && this.leafSearch == ((MongotKnnByteQuery) other).leafSearch;
+  }
+
+  @Override
+  public int hashCode() {
+    return 31 * super.hashCode() + System.identityHashCode(this.leafSearch);
   }
 
   @Override

@@ -17,6 +17,11 @@ public interface LuceneSearchManager<T> {
     }
   }
 
+  /** A resumed graph exploration can discover a higher-scoring hit after a page was delivered. */
+  default boolean permitsScoreInversions() {
+    return false;
+  }
+
   T initialSearch(LuceneIndexSearcherReference searcherReference, int batchSize)
       throws IOException, InvalidQueryException;
 

@@ -39,7 +39,7 @@ import org.apache.lucene.util.quantization.ScalarQuantizer;
 public class BinaryQuantizedFlatVectorsScorer implements FlatVectorsScorer {
   private final FlatVectorsScorer nonQuantizedDelegate;
 
-  BinaryQuantizedFlatVectorsScorer(FlatVectorsScorer nonQuantizedDelegate) {
+  public BinaryQuantizedFlatVectorsScorer(FlatVectorsScorer nonQuantizedDelegate) {
     this.nonQuantizedDelegate = nonQuantizedDelegate;
   }
 

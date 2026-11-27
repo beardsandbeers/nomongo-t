@@ -41,8 +41,14 @@ public record VectorSearchOperator(Score score, VectorSearchCriteria criteria) i
     if (unwrap.size() != 1) {
       parser.getContext().handleSemanticError("vectorSearch can have only one field path");
     }
-    return new VectorSearchOperator(
-        Operators.parseScore(parser),
-        VectorSearchCriteria.fromBson(parser, unwrap.get(0), VectorSearchFilter.Type.OPERATOR));
+    var score = Operators.parseScore(parser);
+    var criteria =
+        VectorSearchCriteria.fromBson(parser, unwrap.get(0), VectorSearchFilter.Type.OPERATOR);
+    if (criteria.isUnboundedStream() && !score.equals(Score.defaultScore())) {
+      return parser
+          .getContext()
+          .handleSemanticError("Open-ended vector search requires vector similarity scoring");
+    }
+    return new VectorSearchOperator(score, criteria);
   }
 }

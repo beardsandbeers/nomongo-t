@@ -15,15 +15,19 @@ import com.xgen.mongot.index.lucene.explain.knn.KnnInstrumentationHelper;
 import com.xgen.mongot.index.lucene.explain.knn.VectorSearchExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.query.context.QueryFactoryContext;
+import com.xgen.mongot.index.lucene.query.custom.LeafKnnSearch;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnByteQuery;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnFloatQuery;
 import com.xgen.mongot.index.lucene.query.util.MetaIdRetriever;
 import com.xgen.mongot.index.lucene.query.util.WrappedToParentBlockJoinQuery;
+import com.xgen.mongot.index.lucene.streaming.StreamRouting;
+import com.xgen.mongot.index.lucene.streaming.StreamingKnnQuery;
 import com.xgen.mongot.index.lucene.util.LuceneDocumentIdEncoder;
 import com.xgen.mongot.index.query.AutoEmbedQueryVectorReconciler;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria;
 import com.xgen.mongot.index.query.operators.ExactVectorSearchCriteria;
+import com.xgen.mongot.index.query.operators.StreamingOptions;
 import com.xgen.mongot.index.query.operators.VectorEmbeddedOptions;
 import com.xgen.mongot.index.query.operators.VectorSearchCriteria;
 import com.xgen.mongot.util.Check;
@@ -38,6 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
@@ -50,6 +55,7 @@ import org.apache.lucene.search.join.BitSetProducer;
 import org.apache.lucene.search.join.QueryBitSetProducer;
 import org.apache.lucene.search.join.ScoreMode;
 import org.bson.BsonValue;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Translates $vectorSearch into a Lucene query. Until we disallow running $vectorSearch against
@@ -183,13 +189,112 @@ class VectorSearchQueryFactory {
         // otherwise it is the user-supplied value. See ApproximateVectorSearchCriteria.
         int numCandidates = approximateCriteria.resolveNumCandidates();
         int limit = approximateCriteria.limit();
+        @Var var streaming = approximateCriteria.streaming();
+        var encoding =
+            queryVector instanceof FloatVector ? VectorEncoding.FLOAT32 : VectorEncoding.BYTE;
+        boolean eligible =
+            embeddedRoot.isEmpty()
+                && luceneParentFilter.isEmpty()
+                && approximateCriteria.explainOptions().isEmpty();
+        @Var StreamRouting autoPlan = null;
+        @Var LeafKnnSearch leafSearch = null;
+        if (streaming.filter(StreamingOptions::automatic).isPresent()) {
+          var decision =
+              StreamRouting.choose(
+                  queryContext.getIndexReader(),
+                  fieldName,
+                  encoding,
+                  luceneFilter.orElse(null),
+                  numCandidates,
+                  limit,
+                  eligible,
+                  Explain.getQueryInfo()
+                      .map(
+                          info ->
+                              info.getVerbosity().isGreaterThan(Explain.Verbosity.QUERY_PLANNER))
+                      .orElse(false));
+          Explain.getQueryInfo()
+              .ifPresent(
+                  info ->
+                      info.getFeatureExplainer(
+                              VectorSearchExplainer.class, VectorSearchExplainer::new)
+                          .setStreamRouting(decision.describe()));
+          autoPlan = decision;
+          if (!decision.usesStream()) {
+            streaming = Optional.empty();
+          }
+        }
+        if (streaming.isPresent()) {
+          if (!eligible) {
+            throw new InvalidQueryException(
+                "streaming supports root vector fields without parentFilter or tracing options");
+          }
+          var options = streaming.get();
+          if (autoPlan == null) {
+            Explain.getQueryInfo()
+                .ifPresent(
+                    info -> {
+                      var explainer =
+                          info.getFeatureExplainer(
+                              VectorSearchExplainer.class, VectorSearchExplainer::new);
+                      if (isAutoNumCandidates) {
+                        explainer.setNumCandidates(
+                            new VectorSearchNumCandidatesSpec(
+                                VectorSearchNumCandidatesSpec.Mode.AUTO, numCandidates));
+                      }
+                      var plan =
+                          StreamingKnnQuery.explainPlan(
+                              options,
+                              numCandidates,
+                              queryContext.getIndexReader(),
+                              fieldName,
+                              encoding,
+                              approximateCriteria.isUnboundedStream());
+                      if (approximateCriteria.isUnboundedStream()) {
+                        plan.put("openEnded", org.bson.BsonBoolean.TRUE);
+                      }
+                      explainer.setStreamStats(plan);
+                    });
+          }
+          var streamQuery =
+              switch (queryVector) {
+                case FloatVector v ->
+                    new StreamingKnnQuery.Floats(
+                        fieldName,
+                        v.getFloatVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                case ByteVector v ->
+                    new StreamingKnnQuery.Bytes(
+                        fieldName,
+                        v.getByteVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                case BitVector v ->
+                    new StreamingKnnQuery.Bytes(
+                        fieldName,
+                        v.getBitVector(),
+                        numCandidates,
+                        luceneFilter.orElse(null),
+                        options);
+                default -> throw new InvalidQueryException("Unsupported streaming vector encoding");
+              };
+          if (autoPlan == null) {
+            childQuery = streamQuery;
+            break;
+          }
+          leafSearch = StreamingKnnQuery.routed(autoPlan, streamQuery);
+        }
         ApproximateVectorQueryCreator queryCreator =
             ApproximateVectorQueryCreator.get(
                 approximateCriteria,
                 fieldName,
                 effectiveQueryContext.getIndexReader(),
                 this.factoryContext.getFeatureFlags(),
-                this.factoryContext.getMetrics());
+                this.factoryContext.getMetrics(),
+                leafSearch);
         childQuery =
             switch (queryVector) {
               case FloatVector floatVector ->
@@ -318,7 +423,8 @@ class VectorSearchQueryFactory {
         String fieldName,
         IndexReader indexReader,
         FeatureFlags flags,
-        IndexMetricsUpdater.QueryingMetricsUpdater metrics)
+        IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+        @Nullable LeafKnnSearch leafSearch)
         throws IOException {
       if (Explain.getQueryInfo().isPresent()) {
         Optional<ApproximateVectorSearchCriteria.ExplainOptions> explainOptions =
@@ -326,16 +432,16 @@ class VectorSearchQueryFactory {
 
         if (explainOptions.isEmpty()) {
           return new InstrumentableApproximateVectorQueryCreator(
-              Explain.getQueryInfo().get(), List.of(), flags, metrics);
+              Explain.getQueryInfo().get(), List.of(), flags, metrics, leafSearch);
         }
 
         List<VectorSearchExplainer.TracingTarget> targets =
             resolveTraceTargets(explainOptions.get().traceDocuments(), fieldName, indexReader);
         return new InstrumentableApproximateVectorQueryCreator(
-            Explain.getQueryInfo().get(), targets, flags, metrics);
+            Explain.getQueryInfo().get(), targets, flags, metrics, leafSearch);
       }
 
-      return new RegularApproximateVectorQueryCreator(metrics, flags);
+      return new RegularApproximateVectorQueryCreator(metrics, flags, leafSearch);
     }
 
     private static List<VectorSearchExplainer.TracingTarget> resolveTraceTargets(
@@ -377,9 +483,13 @@ class VectorSearchQueryFactory {
 
       private final IndexMetricsUpdater.QueryingMetricsUpdater metrics;
       private final FeatureFlags flags;
+      private final @Nullable LeafKnnSearch leafSearch;
 
       private RegularApproximateVectorQueryCreator(
-          IndexMetricsUpdater.QueryingMetricsUpdater metrics, FeatureFlags flags) {
+          IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+          FeatureFlags flags,
+          @Nullable LeafKnnSearch leafSearch) {
+        this.leafSearch = leafSearch;
         this.metrics = metrics;
         this.flags = flags;
       }
@@ -397,7 +507,7 @@ class VectorSearchQueryFactory {
           boolean isAutoNumCandidates) {
         float[] target = vector.getFloatVector();
         return new MongotKnnFloatQuery(
-            this.metrics, this.flags, field, target, k, filter.orElse(null));
+            this.metrics, this.flags, field, target, k, filter.orElse(null), this.leafSearch);
       }
 
       @Override
@@ -409,7 +519,8 @@ class VectorSearchQueryFactory {
           Optional<Query> filter,
           boolean isAutoNumCandidates) {
         byte[] target = vector.getByteVector();
-        return new MongotKnnByteQuery(this.metrics, field, target, k, filter.orElse(null));
+        return new MongotKnnByteQuery(
+            this.metrics, field, target, k, filter.orElse(null), this.leafSearch);
       }
 
       @Override
@@ -421,7 +532,8 @@ class VectorSearchQueryFactory {
           Optional<Query> filter,
           boolean isAutoNumCandidates) {
         byte[] target = vector.getBitVector();
-        return new MongotKnnByteQuery(this.metrics, field, target, k, filter.orElse(null));
+        return new MongotKnnByteQuery(
+            this.metrics, field, target, k, filter.orElse(null), this.leafSearch);
       }
     }
 
@@ -430,12 +542,15 @@ class VectorSearchQueryFactory {
       private final VectorSearchExplainer tracingExplainer;
       private final IndexMetricsUpdater.QueryingMetricsUpdater metrics;
       private final FeatureFlags flags;
+      private final @Nullable LeafKnnSearch leafSearch;
 
       private InstrumentableApproximateVectorQueryCreator(
           Explain.QueryInfo explainQueryInfo,
           List<VectorSearchExplainer.TracingTarget> tracingTargets,
           FeatureFlags flags,
-          IndexMetricsUpdater.QueryingMetricsUpdater metrics) {
+          IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+          @Nullable LeafKnnSearch leafSearch) {
+        this.leafSearch = leafSearch;
         this.flags = flags;
         this.tracingExplainer =
             explainQueryInfo.getFeatureExplainer(
@@ -466,7 +581,14 @@ class VectorSearchQueryFactory {
             new KnnInstrumentationHelper(this.tracingExplainer, field, limit, filterPresent);
 
         return new InstrumentableKnnFloatVectorQuery(
-            this.metrics, this.flags, instrumentationHelper, field, target, k, filter.orElse(null));
+            this.metrics,
+            this.flags,
+            instrumentationHelper,
+            field,
+            target,
+            k,
+            filter.orElse(null),
+            this.leafSearch);
       }
 
       @Override
@@ -483,11 +605,14 @@ class VectorSearchQueryFactory {
         KnnInstrumentationHelper instrumentationHelper =
             new KnnInstrumentationHelper(this.tracingExplainer, field, limit, filterPresent);
 
-        return filterPresent
-            ? new InstrumentableKnnByteVectorQuery(
-                this.metrics, instrumentationHelper, field, target, k, filter.get())
-            : new InstrumentableKnnByteVectorQuery(
-                this.metrics, instrumentationHelper, field, target, k);
+        return new InstrumentableKnnByteVectorQuery(
+            this.metrics,
+            instrumentationHelper,
+            field,
+            target,
+            k,
+            filter.orElse(null),
+            this.leafSearch);
       }
 
       @Override
@@ -504,11 +629,14 @@ class VectorSearchQueryFactory {
         KnnInstrumentationHelper instrumentationHelper =
             new KnnInstrumentationHelper(this.tracingExplainer, field, limit, filterPresent);
 
-        return filterPresent
-            ? new InstrumentableKnnByteVectorQuery(
-                this.metrics, instrumentationHelper, field, target, k, filter.get())
-            : new InstrumentableKnnByteVectorQuery(
-                this.metrics, instrumentationHelper, field, target, k);
+        return new InstrumentableKnnByteVectorQuery(
+            this.metrics,
+            instrumentationHelper,
+            field,
+            target,
+            k,
+            filter.orElse(null),
+            this.leafSearch);
       }
     }
   }

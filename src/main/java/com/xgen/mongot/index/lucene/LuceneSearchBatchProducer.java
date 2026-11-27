@@ -52,6 +52,7 @@ import org.bson.RawBsonDocument;
  * synchronized and batches should be requested sequentially. Responsible for one index partition.
  */
 class LuceneSearchBatchProducer implements BatchProducer {
+  static final ResultFactory VECTOR_RESULT = com.xgen.mongot.index.VectorSearchResult::create;
 
   private static final FluentLogger FLOGGER = FluentLogger.forEnclosingClass();
 
@@ -327,7 +328,8 @@ class LuceneSearchBatchProducer implements BatchProducer {
 
         // check for duplicated / no progress batches only starting from the second batch
         boolean batchOrderIsWrong =
-            batchOrderIsWrong(iter.topDocs, iter.firstValue, previousBatchLastValue);
+            !this.searchManager.permitsScoreInversions()
+                && batchOrderIsWrong(iter.topDocs, iter.firstValue, previousBatchLastValue);
         boolean batchIsDuplicated =
             batchIsDuplicated(previousBatchLastValue, currentBatchLastValue);
         if (batchOrderIsWrong || batchIsDuplicated) {
@@ -566,6 +568,8 @@ class LuceneSearchBatchProducer implements BatchProducer {
           fetchedMetaId = this.projectStage.getId(docId);
         }
         id = fetchedMetaId;
+      } else if (LuceneSearchBatchProducer.this.resultFactory == VECTOR_RESULT) {
+        id = Optional.of(this.metaIdRetriever.getRootMetaId(docId));
       }
 
       @Var Optional<BsonValue> rootDocumentid = Optional.empty();

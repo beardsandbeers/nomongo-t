@@ -30,7 +30,8 @@ public record ApproximateVectorSearchCriteria(
     Optional<Integer> numCandidates,
     Optional<ExplainOptions> explainOptions,
     boolean returnStoredSource,
-    Optional<VectorEmbeddedOptions> embeddedOptions)
+    Optional<VectorEmbeddedOptions> embeddedOptions,
+    Optional<StreamingOptions> streaming)
     implements VectorSearchCriteria {
 
   /** Maximum value for numCandidates, whether user-supplied or auto-computed. */
@@ -42,12 +43,49 @@ public record ApproximateVectorSearchCriteria(
   /** Auto k/limit ratio: auto numCandidates targets 8x the requested limit before clamping. */
   public static final int AUTO_NUM_CANDIDATES_RATIO = 8;
 
+  private static final int UNBOUNDED = Integer.MAX_VALUE;
+
+  @Override
+  public boolean isUnboundedStream() {
+    return this.limit == UNBOUNDED;
+  }
+
+  public ApproximateVectorSearchCriteria(
+      FieldPath path,
+      Optional<Vector> queryVector,
+      Optional<VectorSearchQueryInput> query,
+      Optional<VectorSearchFilter> filter,
+      Optional<VectorSearchFilter> parentFilter,
+      int limit,
+      Optional<Integer> numCandidates,
+      Optional<ExplainOptions> explainOptions,
+      boolean returnStoredSource,
+      Optional<VectorEmbeddedOptions> embeddedOptions) {
+    this(
+        path,
+        queryVector,
+        query,
+        filter,
+        parentFilter,
+        limit,
+        numCandidates,
+        explainOptions,
+        returnStoredSource,
+        embeddedOptions,
+        Optional.empty());
+  }
+
   public ApproximateVectorSearchCriteria {
-    if (numCandidates.isPresent()) {
-      Check.checkArg(
-          limit <= numCandidates.get(), "limit should be less than or equal to numCandidates");
-    } else {
-      Check.checkArg(limit <= MAX_NUM_CANDIDATES, "limit cannot exceed %s", MAX_NUM_CANDIDATES);
+    boolean openEnded =
+        limit == UNBOUNDED
+            && streaming.filter(s -> s.adaptive().isPresent() && !s.automatic()).isPresent();
+    if (!openEnded) {
+      if (numCandidates.isPresent()) {
+        Check.checkArg(
+            limit <= numCandidates.get(), "limit should be less than or equal to numCandidates");
+      } else {
+        Check.checkArg(limit <= MAX_NUM_CANDIDATES, "limit cannot exceed %s", MAX_NUM_CANDIDATES);
+      }
     }
   }
 
@@ -71,6 +109,9 @@ public record ApproximateVectorSearchCriteria(
    * limit}: parsing and the constructor reject {@code limit > MAX_NUM_CANDIDATES} in auto mode.
    */
   public int resolveNumCandidates() {
+    if (isUnboundedStream()) {
+      return this.numCandidates.orElse(256);
+    }
     return this.numCandidates.orElseGet(
         () ->
             Math.clamp(
@@ -90,9 +131,14 @@ public record ApproximateVectorSearchCriteria(
     // Empty in auto mode: numCandidates will be computed at query time. When
     // enableAutoNumCandidates is disabled, the command layer rejects the omission.
     Optional<Integer> numCandidates = parser.getField(Fields.NUM_CANDIDATES).unwrap();
-    int limit = parser.getField(Fields.LIMIT).unwrap();
+    var streaming = VectorSearchCriteria.parseStreaming(parser);
+    var requestedLimit =
+        streaming.filter(s -> s.adaptive().isPresent() && !s.automatic()).isPresent()
+            ? parser.getField(Fields.OPTIONAL_LIMIT).unwrap()
+            : Optional.of(parser.getField(Fields.LIMIT).unwrap());
+    int limit = requestedLimit.orElse(UNBOUNDED);
 
-    if (numCandidates.isPresent() && limit > numCandidates.get()) {
+    if (requestedLimit.isPresent() && numCandidates.isPresent() && limit > numCandidates.get()) {
       parser
           .getContext()
           .handleSemanticError("limit should be less than or equal to numCandidates");
@@ -100,7 +146,7 @@ public record ApproximateVectorSearchCriteria(
 
     // An explicit numCandidates is already bounded by MAX_NUM_CANDIDATES (and limit <=
     // numCandidates), so only auto mode needs a separate bound on limit.
-    if (numCandidates.isEmpty() && limit > MAX_NUM_CANDIDATES) {
+    if (requestedLimit.isPresent() && numCandidates.isEmpty() && limit > MAX_NUM_CANDIDATES) {
       parser
           .getContext()
           .handleSemanticError(String.format("limit cannot exceed %d", MAX_NUM_CANDIDATES));
@@ -129,7 +175,8 @@ public record ApproximateVectorSearchCriteria(
         numCandidates,
         parser.getField(Fields.EXPLAIN_OPTIONS).unwrap(),
         parser.getField(Fields.STORED_SOURCE).unwrap(),
-        parser.getField(Fields.NESTED_OPTIONS).unwrap());
+        parser.getField(Fields.NESTED_OPTIONS).unwrap(),
+        streaming);
   }
 
   @Override
@@ -149,7 +196,8 @@ public record ApproximateVectorSearchCriteria(
         this.numCandidates,
         this.explainOptions,
         this.returnStoredSource,
-        this.embeddedOptions);
+        this.embeddedOptions,
+        this.streaming);
   }
 
   @Override
@@ -164,7 +212,8 @@ public record ApproximateVectorSearchCriteria(
         this.numCandidates,
         this.explainOptions,
         this.returnStoredSource,
-        this.embeddedOptions);
+        this.embeddedOptions,
+        this.streaming);
   }
 
   @Override
@@ -175,7 +224,9 @@ public record ApproximateVectorSearchCriteria(
         this.query.map(DocumentEncodable::toBson).orElse(new BsonDocument());
     BsonDocumentBuilder builder =
         BsonDocumentBuilder.builder()
-            .field(Fields.LIMIT, this.limit())
+            .field(
+                Fields.OPTIONAL_LIMIT,
+                isUnboundedStream() ? Optional.empty() : Optional.of(this.limit))
             .field(Fields.EXACT, false)
             .field(Fields.NUM_CANDIDATES, this.numCandidates)
             .field(Fields.QUERY_VECTOR, this.queryVector())
@@ -183,6 +234,12 @@ public record ApproximateVectorSearchCriteria(
             .field(Fields.EXPLAIN_OPTIONS, this.explainOptions())
             .field(Fields.STORED_SOURCE, this.returnStoredSource())
             .field(Fields.NESTED_OPTIONS, this.embeddedOptions())
+            .field(Fields.STREAMING, this.streaming.filter(o -> o.adaptive().isEmpty()))
+            .field(
+                Fields.STREAM,
+                this.streaming
+                    .filter(o -> o.adaptive().isPresent())
+                    .map(StreamingOptions::streamBson))
             .join(filterDocument);
 
     if (this.parentFilter.isPresent()) {
