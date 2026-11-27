@@ -2,6 +2,8 @@ package com.xgen.mongot.index.lucene;
 
 import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.analyzer.wrapper.AnalyzerMapping;
+import com.xgen.mongot.index.definition.AutocompleteFieldDefinition;
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
 import com.xgen.mongot.index.definition.EmbeddedDocumentsFieldDefinition;
 import com.xgen.mongot.index.definition.FieldDefinition;
@@ -11,6 +13,8 @@ import com.xgen.mongot.index.definition.HierarchicalFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.definition.SearchIndexVectorFieldDefinition;
+import com.xgen.mongot.index.definition.StringFieldDefinition;
+import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
@@ -42,12 +46,14 @@ import org.apache.lucene.util.Bits;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.BsonValue;
 import org.jetbrains.annotations.Nullable;
 
 /** Builds static public mappings from configured mappings and materialized Lucene field types. */
 public final class LuceneIndexMappingExporter {
   private final SearchFieldDefinitionResolver resolver;
+  private final AnalyzerMapping analyzers;
   private final Map<String, List<List<String>>> vectorSourcePaths = new HashMap<>();
   private final Set<String> legacyPaths;
   private final Map<List<String>, ObservedField> scopes = new HashMap<>();
@@ -60,6 +66,7 @@ public final class LuceneIndexMappingExporter {
 
   private LuceneIndexMappingExporter(
       SearchIndexDefinition definition, IndexFormatVersion formatVersion, Set<String> legacyPaths) {
+    this.analyzers = new AnalyzerMapping(definition);
     this.resolver = definition.createFieldDefinitionResolver(formatVersion);
     this.legacyPaths = legacyPaths;
   }
@@ -106,6 +113,7 @@ public final class LuceneIndexMappingExporter {
         this.resolver.indexDefinition.getMappings(),
         new BsonDocument(),
         this.scopes.getOrDefault(List.of(), new ObservedField()),
+        Optional.empty(),
         Optional.empty());
   }
 
@@ -512,7 +520,8 @@ public final class LuceneIndexMappingExporter {
       HierarchicalFieldDefinition definition,
       BsonDocument result,
       ObservedField observed,
-      Optional<FieldPath> parent) {
+      Optional<FieldPath> parent,
+      Optional<FieldPath> embeddedRoot) {
     var fields = new BsonDocument();
     var names = new TreeSet<>(definition.fields().keySet());
     names.addAll(observed.children.keySet());
@@ -524,7 +533,7 @@ public final class LuceneIndexMappingExporter {
       }
       var path = parent.map(value -> value.newChild(name)).orElseGet(() -> FieldPath.newRoot(name));
       var child = observed.children.getOrDefault(name, new ObservedField());
-      var mapping = exportField(effective.get(), configured.isPresent(), child, path);
+      var mapping = exportField(effective.get(), configured.isPresent(), child, path, embeddedRoot);
       if (!mapping.isEmpty()) {
         fields.put(name, mapping.size() == 1 ? mapping.getFirst() : new BsonArray(mapping));
       }
@@ -535,7 +544,11 @@ public final class LuceneIndexMappingExporter {
   }
 
   private List<BsonValue> exportField(
-      FieldDefinition definition, boolean configured, ObservedField observed, FieldPath path) {
+      FieldDefinition definition,
+      boolean configured,
+      ObservedField observed,
+      FieldPath path,
+      Optional<FieldPath> embeddedRoot) {
     var result = new ArrayList<BsonValue>();
     for (var typeDefinition : definition.getAllDefinitions().flatMap(Optional::stream).toList()) {
       var type = typeDefinition.getType();
@@ -546,6 +559,28 @@ public final class LuceneIndexMappingExporter {
       }
       @Var BsonDocument mapping = typeDefinition.toBson();
       switch (typeDefinition) {
+        case StringFieldDefinition string -> {
+          fixStringAnalysis(
+              mapping, FieldName.TypeField.STRING.getLuceneFieldName(path, embeddedRoot));
+          for (String name : string.multi().keySet()) {
+            fixStringAnalysis(
+                mapping.getDocument("multi").getDocument(name),
+                FieldName.MultiField.getLuceneFieldName(path, name, embeddedRoot));
+          }
+        }
+        case TokenFieldDefinition token ->
+            mapping =
+                this.analyzers
+                    .resolve(FieldName.TypeField.TOKEN.getLuceneFieldName(path, embeddedRoot))
+                    .orElse(token)
+                    .toBson();
+        case AutocompleteFieldDefinition ac ->
+            mapping =
+                this.analyzers
+                    .resolve(
+                        FieldName.TypeField.AUTOCOMPLETE.getLuceneFieldName(path, embeddedRoot))
+                    .orElse(ac)
+                    .toBson();
         case TypeSetVectorFieldDefinition vector -> {
           // The queryable dotted path determines the encoding, including for literal BSON keys.
           var rule =
@@ -556,13 +591,14 @@ public final class LuceneIndexMappingExporter {
           mapping = new SearchIndexVectorFieldDefinition(spec, true).toBson();
         }
         case DocumentFieldDefinition document ->
-            exportDocument(document, mapping, observed, Optional.of(path));
+            exportDocument(document, mapping, observed, Optional.of(path), embeddedRoot);
         case EmbeddedDocumentsFieldDefinition embedded ->
             exportDocument(
                 embedded,
                 mapping,
                 this.scopes.getOrDefault(
                     ImmutableList.copyOf(path.getSegments()), new ObservedField()),
+                Optional.of(path),
                 Optional.of(path));
         default -> {
           // All scalar options, including string multi fields, are already in toBson().
@@ -571,6 +607,18 @@ public final class LuceneIndexMappingExporter {
       result.add(mapping);
     }
     return result;
+  }
+
+  private void fixStringAnalysis(BsonDocument mapping, String physicalName) {
+    var selected = this.analyzers.resolve(physicalName).map(StringFieldDefinition.class::cast);
+    mapping.remove("analyzer");
+    mapping.remove("searchAnalyzer");
+    selected
+        .flatMap(StringFieldDefinition::analyzerName)
+        .ifPresent(name -> mapping.put("analyzer", new BsonString(name)));
+    selected
+        .flatMap(StringFieldDefinition::searchAnalyzerName)
+        .ifPresent(name -> mapping.put("searchAnalyzer", new BsonString(name)));
   }
 
   static Optional<FieldTypeDefinition.Type> publicType(FieldName.TypeField type) {

@@ -209,8 +209,10 @@ public class FieldHierarchyContext {
         .map(FieldHierarchyContext::getRootFields)
         .ifPresent(
             embeddedHierarchyFields ->
-                fieldsByEmbeddedRoot.put(
-                    FieldPath.newRoot(leafPath), prependPaths(embeddedHierarchyFields, leafPath)));
+                mergeEmbeddedFields(
+                    fieldsByEmbeddedRoot,
+                    FieldPath.newRoot(leafPath),
+                    prependPaths(embeddedHierarchyFields, leafPath)));
     field
         .embeddedDocumentsFieldDefinition()
         .ifPresent(
@@ -225,9 +227,9 @@ public class FieldHierarchyContext {
         .map(FieldHierarchyContext::getRootFields)
         .ifPresent(
             documentHierarchyFields ->
-                rootFields.putAll(prependPaths(documentHierarchyFields, leafPath)));
+                mergeFields(rootFields, prependPaths(documentHierarchyFields, leafPath)));
 
-    rootFields.put(FieldPath.newRoot(leafPath), field);
+    rootFields.merge(FieldPath.newRoot(leafPath), field, FieldDefinition::mergeQueryAliases);
   }
 
   private static void populateFieldsByEmbeddedRoot(
@@ -245,7 +247,8 @@ public class FieldHierarchyContext {
         .getFieldsByEmbeddedRoot()
         .forEach(
             (embeddedRootPath, embeddedFieldMap) ->
-                fieldsByEmbeddedRoot.put(
+                mergeEmbeddedFields(
+                    fieldsByEmbeddedRoot,
                     embeddedRootPath.withNewRoot(leafPath),
                     prependPaths(embeddedFieldMap, leafPath)));
 
@@ -257,6 +260,18 @@ public class FieldHierarchyContext {
             (embeddedRootPath, embeddedDocumentsFieldDefinition) ->
                 embeddedRootDocuments.put(
                     embeddedRootPath.withNewRoot(leafPath), embeddedDocumentsFieldDefinition));
+  }
+
+  private static void mergeEmbeddedFields(
+      Map<FieldPath, Map<FieldPath, FieldDefinition>> scopes,
+      FieldPath root,
+      Map<FieldPath, FieldDefinition> children) {
+    mergeFields(scopes.computeIfAbsent(root, unused -> new HashMap<>()), children);
+  }
+
+  private static void mergeFields(
+      Map<FieldPath, FieldDefinition> target, Map<FieldPath, FieldDefinition> fields) {
+    fields.forEach((path, field) -> target.merge(path, field, FieldDefinition::mergeQueryAliases));
   }
 
   private static <T> ImmutableMap<FieldPath, T> prependPaths(

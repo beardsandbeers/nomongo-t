@@ -3,6 +3,7 @@ load("//bazel/java:package.bzl", "java_library")
 java_library(
     name = "wrapper",
     srcs = [
+        "AnalyzerMapping.java",
         "AnalyzerWrapperBuilder.java",
         "DynamicTypeSetPrefixMap.java",
         "IndexAnalyzerBuilder.java",

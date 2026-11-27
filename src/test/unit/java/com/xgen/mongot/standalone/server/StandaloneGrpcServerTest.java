@@ -1,6 +1,7 @@
 package com.xgen.mongot.standalone.server;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
@@ -3393,6 +3394,110 @@ public class StandaloneGrpcServerTest {
       assertSameSingleHit(f, fixed, id, exactVectorQuery("a.b", "[1,0]"));
       assertSameSingleHit(f, fixed, id, "{text:{path:'a.b',query:'snow'}}");
     }
+  }
+
+  @Test
+  public void getIndexMappings_keywordAndVectorAliases_preserveAnalysisInEitherOrder()
+      throws Exception {
+    Similarity.load();
+    String mapping =
+        MIXED_VECTOR_MAPPING.replace("type:'string'", "type:'string',analyzer:'lucene.keyword'");
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "keyword-literal",
+          mapping,
+          List.of("{_id:1,'a.b':'Snow Day'}", "{_id:2,a:{b:" + bsonFloatVector(1, 0) + "}}"),
+          Map.of(
+              "{text:{path:'a.b',query:'snow'}}",
+              0,
+              "{text:{path:'a.b',query:'Snow Day'}}",
+              1,
+              exactVectorQuery("a.b", "[1,0]"),
+              1));
+      assertReplayQueries(
+          f,
+          "keyword-nested",
+          mapping,
+          List.of("{_id:1,'a.b':" + bsonFloatVector(1, 0) + "}", "{_id:2,a:{b:'Snow Day'}}"),
+          Map.of(
+              "{text:{path:'a.b',query:'snow'}}",
+              0,
+              "{text:{path:'a.b',query:'Snow Day'}}",
+              1,
+              exactVectorQuery("a.b", "[1,0]"),
+              1));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_conflictingDynamicAnalyzers_preservesEffectiveAnalyzer()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "analyzer",
+          """
+          {mappings:{dynamic:{typeSet:'root'},fields:{a:{type:'document',dynamic:{typeSet:'nested'}}}},
+           typeSets:[{name:'root',types:[{type:'string',analyzer:'lucene.keyword'},{type:'vector',similarity:'euclidean'}]},
+                     {name:'nested',types:[{type:'string',analyzer:'lucene.standard',searchAnalyzer:'lucene.whitespace'}]}]}
+          """,
+          List.of("{_id:1,'a.b':'Snow Day'}", "{_id:2,a:{b:'Snow Day'}}"),
+          Map.of("{text:{path:'a.b',query:'snow'}}", 2, "{text:{path:'a.b',query:'Snow Day'}}", 0));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_aliasedEmbeddedAutocomplete_preservesBothQueries() throws Exception {
+    var dir = data();
+    String original;
+    String replay;
+    var queries =
+        List.of(
+            "{embeddedDocument:{path:'a.b',operator:{autocomplete:{path:'a.b.left',query:'sno'}}}}",
+            "{embeddedDocument:{path:'a.b',operator:{autocomplete:{path:'a.b.right',query:'rai'}}}}");
+    try (var f = new Fixture(dir)) {
+      original =
+          f.create(
+              "embedded-autocomplete",
+              """
+              {mappings:{dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:{typeSet:'c'}},
+               a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:{typeSet:'c'}}}}}},
+               typeSets:[{name:'c',types:[{type:'autocomplete',minGrams:2,maxGrams:8}]}]}
+              """);
+      var docs = List.of("{_id:1,'a.b':[{left:'snow'}]}", "{_id:2,a:{b:[{right:'rain'}]}}");
+      for (String doc : docs) f.upsert(original, doc);
+      replay = f.create("replayed", exportMappings(f, original).getDefinitionJson());
+      for (String doc : docs) f.upsert(replay, doc);
+    }
+    try (var f = new Fixture(dir)) {
+      f.ready(original, 1);
+      f.ready(replay, 1);
+      for (String query : queries) assertSameSingleHit(f, replay, original, query);
+    }
+  }
+
+  private static void assertReplayQueries(
+      Fixture f,
+      String name,
+      String definition,
+      List<String> documents,
+      Map<String, Integer> expectedHits)
+      throws Exception {
+    String original = f.create(name, definition);
+    for (String doc : documents) {
+      f.upsert(original, doc);
+    }
+    String replay = f.create(name + "-replay", exportMappings(f, original).getDefinitionJson());
+    for (String doc : documents) {
+      f.upsert(replay, doc);
+    }
+    expectedHits.forEach(
+        (query, count) -> {
+          var results = f.query(original, query).getArray("results");
+          assertWithMessage(query).that(results).hasSize(count);
+          assertThat(f.query(replay, query).getArray("results")).isEqualTo(results);
+        });
   }
 
   @Test
