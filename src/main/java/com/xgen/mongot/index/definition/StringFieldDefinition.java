@@ -22,33 +22,9 @@ public record StringFieldDefinition(
     IndexOptions indexOptions,
     boolean storeFlag,
     NormsOptions norms,
-    ImmutableMap<String, StringFieldDefinition> multi,
-    ImmutableMap<String, StringFieldDefinition> declaredMulti)
+    ImmutableMap<String, StringFieldDefinition> multi)
     implements FieldTypeDefinition {
 
-  public StringFieldDefinition(
-      Optional<String> analyzerName,
-      Optional<String> searchAnalyzerName,
-      Optional<SimilarityDefinition> similarity,
-      Optional<Integer> ignoreAbove,
-      IndexOptions indexOptions,
-      boolean storeFlag,
-      NormsOptions norms,
-      ImmutableMap<String, StringFieldDefinition> multi) {
-    this(
-        analyzerName,
-        searchAnalyzerName,
-        similarity,
-        ignoreAbove,
-        indexOptions,
-        storeFlag,
-        norms,
-        multi,
-        multi);
-  }
-
-  // Keep the winning declaration as well as the query view. Older generations used only
-  // the winning string's multis to select physical analyzers and similarity.
   StringFieldDefinition withQueryAliases(StringFieldDefinition other) {
     if (other.multi().isEmpty()) return this;
     var aliases =
@@ -64,8 +40,7 @@ public record StringFieldDefinition(
         this.indexOptions,
         this.storeFlag,
         this.norms,
-        aliases,
-        this.declaredMulti);
+        aliases);
   }
 
   public static class Fields {

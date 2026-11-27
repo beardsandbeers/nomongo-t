@@ -4,6 +4,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
+import com.xgen.mongot.index.definition.SearchIndexDefinition.MappingVersion;
 import com.xgen.mongot.index.definition.TypeSetDefinition;
 import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
@@ -166,7 +167,7 @@ public class LuceneIndexMappingExporterTest {
               .mappings(mappings)
               .typeSets(TypeSetDefinition.fromBson(parser))
               .build();
-      var fresh = old.withTypeSetSimilarity(true);
+      var fresh = old.forNewGeneration();
       var newScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(fresh);
       var fields = infos("$type:string/x", "$type:autocomplete/x");
       assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
@@ -195,14 +196,86 @@ public class LuceneIndexMappingExporterTest {
         assertThat(
                 com.xgen.mongot.index.definition.IndexDefinition.fromBson(prior)
                     .asSearchDefinition()
-                    .usesTypeSetSimilarity())
-            .isFalse();
+                    .getMappingVersion())
+            .isEqualTo(MappingVersion.LEGACY);
         assertThat(
                 com.xgen.mongot.index.definition.IndexDefinition.fromBson(current)
                     .asSearchDefinition()
-                    .usesTypeSetSimilarity())
-            .isTrue();
+                    .getMappingVersion())
+            .isEqualTo(MappingVersion.SCOPED);
       }
+    }
+  }
+
+  @Test
+  public void similarity_legacyDottedAlias_preservesWinningWholeField() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {fields:{a:{type:'document',fields:{b:{type:'string',analyzer:'lucene.keyword',
+                      similarity:{type:'boolean'}}}},'a.b':{type:'number'}}}
+                    """))
+            .build();
+    assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+    var exported = LuceneIndexMappingExporter.export(old, IndexFormatVersion.CURRENT, List.of());
+    var string =
+        exported.getDocument("fields").getDocument("a").getDocument("fields").getDocument("b");
+    assertThat(string.containsKey("analyzer")).isFalse();
+    assertThat(string.containsKey("similarity")).isFalse();
+    var fresh = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
+    assertThat(fresh.get("$type:string/a.b")).isInstanceOf(BooleanSimilarity.class);
+  }
+
+  @Test
+  public void similarity_legacyEmbeddedAlias_preservesWinningEmbeddedScope() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {fields:{a:{type:'document',fields:{b:{type:'embeddedDocuments',fields:{
+                      losing:{type:'string',similarity:{type:'boolean'}}}}}},
+                      'a.b':{type:'embeddedDocuments',fields:{winner:{type:'string'}}}}}
+                    """))
+            .build();
+    assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+    var current = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
+    assertThat(current.get("$embedded:3/a.b/$type:string/a.b.losing"))
+        .isInstanceOf(BooleanSimilarity.class);
+  }
+
+  @Test
+  public void similarity_plainDynamicAndEmptyChild_useTheirOwnScopes() throws Exception {
+    var mapping =
+        mappings(
+            """
+            {dynamic:{typeSet:'outer'},fields:{a:{type:'document',dynamic:true},
+              'a.b':{type:'token'},'':{type:'document',dynamic:{typeSet:'inner'}}}}
+            """);
+    try (var parser =
+            BsonDocumentParser.fromRoot(
+                    BsonDocument.parse(
+                        "{name:'outer',types:[{type:'string',similarity:{type:'boolean'}}]}"))
+                .build();
+        var inner =
+            BsonDocumentParser.fromRoot(
+                    BsonDocument.parse("{name:'inner',types:[{type:'string'}]}"))
+                .build()) {
+      var index =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(mapping)
+              .typeSets(TypeSetDefinition.fromBson(parser), TypeSetDefinition.fromBson(inner))
+              .build()
+              .forNewGeneration();
+      var score = (PerFieldSimilarityWrapper) LuceneSimilarity.from(index);
+      assertThat(score.get("$type:string/a.b")).isInstanceOf(BM25Similarity.class);
+      assertThat(score.get("$type:string/.value")).isInstanceOf(BM25Similarity.class);
+      assertThat(score.get("$type:string/title")).isInstanceOf(BooleanSimilarity.class);
     }
   }
 
@@ -221,8 +294,7 @@ public class LuceneIndexMappingExporterTest {
                     """))
             .build();
     var oldScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old);
-    var freshScore =
-        (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.withTypeSetSimilarity(true));
+    var freshScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
     assertThat(
             List.of(
                 oldScore.get("$multi/a.b.lit").getClass(),

@@ -3531,6 +3531,48 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void getIndexMappings_documentHiddenByDottedAlias_indexesVectorDescendants()
+      throws Exception {
+    Similarity.load();
+    String schema =
+        """
+        {mappings:{dynamic:false,fields:{a:{type:'document',fields:{
+          b:{type:'document',dynamic:{typeSet:'v'}}}},'a.b':%s}},
+          typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}
+        """;
+    try (var f = new Fixture(data())) {
+      for (String alias : List.of("string", "document")) {
+        assertReplayQueries(
+            f,
+            alias,
+            schema.formatted("{type:'" + alias + "'}"),
+            List.of("{_id:1,a:{b:{x:" + bsonFloatVector(1, 0) + "}}}"),
+            Map.of(exactVectorQuery("a.b.x", "[1,0]"), 1));
+      }
+    }
+  }
+
+  @Test
+  public void getIndexMappings_literalStringAndAutocompleteAliases_acceptQueries()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      var docs = List.of("{_id:1,'a.b':'snow day'}", "{_id:2,a:{b:'other'}}");
+      assertReplayQueries(
+          f,
+          "completion",
+          ALIAS_TYPE_SETS.formatted("{type:'autocomplete'}", "{type:'string'}"),
+          docs,
+          Map.of("{autocomplete:{path:'a.b',query:'sno'}}", 1));
+      assertReplayQueries(
+          f,
+          "highlight",
+          ALIAS_TYPE_SETS.formatted("{type:'string'}", "{type:'token'}"),
+          docs,
+          Map.of("{text:{path:'a.b',query:'snow'},highlight:{path:'a.b'}}", 1));
+    }
+  }
+
+  @Test
   public void getIndexMappings_dynamicGeoAlias_acceptsGeoQueryBeforeAndAfterReplay()
       throws Exception {
     try (var f = new Fixture(data())) {

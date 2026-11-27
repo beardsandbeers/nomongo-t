@@ -85,72 +85,62 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
 
   public Optional<AutocompleteFieldDefinition> getAutocompleteDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::autocompleteFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::autocompleteFieldDefinition);
   }
 
   public Optional<BooleanFieldDefinition> getBooleanFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::booleanFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::booleanFieldDefinition);
   }
 
   public Optional<DateFieldDefinition> getDateFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::dateFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::dateFieldDefinition);
   }
 
   public Optional<NumberFieldDefinition> getNumericFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::numberFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::numberFieldDefinition);
   }
 
   public Optional<ObjectIdFieldDefinition> getObjectIdFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::objectIdFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::objectIdFieldDefinition);
   }
 
   public Optional<TokenFieldDefinition> getTokenFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::tokenFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::tokenFieldDefinition);
   }
 
   public Optional<SortableDateBetaV1FieldDefinition> getSortableDateFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableDateBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableDateBetaV1FieldDefinition);
   }
 
   public Optional<SortableNumberBetaV1FieldDefinition> getSortableNumberFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableNumberBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableNumberBetaV1FieldDefinition);
   }
 
   public Optional<SortableStringBetaV1FieldDefinition> getSortableStringFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableStringBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableStringBetaV1FieldDefinition);
   }
 
   public Optional<UuidFieldDefinition> getUuidFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::uuidFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::uuidFieldDefinition);
   }
 
   public Optional<EmbeddedDocumentsFieldDefinition> getEmbeddedDocumentsFieldDefinition(

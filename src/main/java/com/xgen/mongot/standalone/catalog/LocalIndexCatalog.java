@@ -100,8 +100,8 @@ public final class LocalIndexCatalog implements Closeable {
         this.versioned = document.containsKey("catalogVersion");
         if (this.versioned) {
           int version = document.getInt32("catalogVersion").getValue();
-          if (version != 2 && version != 3 && version != 4) {
-            throw new IOException("Unsupported standalone catalog version");
+          if (version < 2 || version > 5) {
+            throw new IOException("Unsupported standalone catalog version " + version);
           }
           if (version >= 3) {
             for (var value : document.getArray("initializations")) {
@@ -111,7 +111,7 @@ public final class LocalIndexCatalog implements Closeable {
               }
             }
           }
-          if (version == 4) {
+          if (version >= 4) {
             for (var value : document.getArray("schemas")) {
               var schema = IndexSchemaUpdate.fromBson(value.asDocument());
               if (this.schemas.put(schema.indexId(), schema) != null) {
@@ -336,7 +336,7 @@ public final class LocalIndexCatalog implements Closeable {
     if (compatibility.kind() == IndexUpdateCompatibility.Kind.PRESERVE_CONTENT
         && candidate instanceof SearchIndexDefinition search) {
       return new UpdatePlan(
-          search.withTypeSetSimilarity(existing.asSearchDefinition().usesTypeSetSimilarity()),
+          search.withMappingVersion(existing.asSearchDefinition().getMappingVersion()),
           compatibility,
           false);
     }
@@ -676,14 +676,42 @@ public final class LocalIndexCatalog implements Closeable {
       LinkedHashMap<String, IndexInitialization> initializations,
       LinkedHashMap<String, IndexSchemaUpdate> schemas) {
     StandaloneDefinitionValidator.validateCatalog(new ArrayList<>(updated.values()));
+    // All durable references must be readable, including the source of an unfinished update.
+    boolean requiresV5 =
+        Stream.of(
+                updated.values().stream(),
+                initializations.values().stream().map(IndexInitialization::definition),
+                changes.values().stream()
+                    .flatMap(
+                        change ->
+                            Stream.of(
+                                change.source().getIndexDefinition(),
+                                change.target().getIndexDefinition())),
+                schemas.values().stream()
+                    .flatMap(
+                        schema ->
+                            Stream.of(
+                                schema.source().getIndexDefinition(),
+                                schema.target().getIndexDefinition())))
+            .flatMap(stream -> stream)
+            .anyMatch(
+                def ->
+                    def instanceof SearchIndexDefinition search
+                        && (search.getMappingVersion()
+                                != SearchIndexDefinition.MappingVersion.LEGACY
+                            || search.declaresVectorTypeSet()));
     boolean useVersioned =
-        this.versioned || !changes.isEmpty() || !initializations.isEmpty() || !schemas.isEmpty();
+        requiresV5
+            || this.versioned
+            || !changes.isEmpty()
+            || !initializations.isEmpty()
+            || !schemas.isEmpty();
     var content =
         new BsonDocument(
             useVersioned ? "entries" : "indexes",
             new BsonArray(updated.values().stream().map(IndexDefinition::toBson).toList()));
     if (useVersioned) {
-      content.append("catalogVersion", new BsonInt32(4));
+      content.append("catalogVersion", new BsonInt32(requiresV5 ? 5 : 4));
       content.append(
           "schemas",
           new BsonArray(schemas.values().stream().map(IndexSchemaUpdate::toBson).toList()));

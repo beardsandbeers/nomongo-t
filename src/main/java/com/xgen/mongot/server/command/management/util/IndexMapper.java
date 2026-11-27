@@ -75,7 +75,7 @@ public class IndexMapper {
                   Optional.empty(),
                   // Preserve prior value on update; stamp v1 on create
                   existingMaterializedViewNameFormatVersion.or(() -> Optional.of(1L)))
-              .withTypeSetSimilarity(true);
+              .forNewGeneration();
       case UserVectorIndexDefinition vectorIndexDefinition ->
           new VectorIndexDefinition(
               newIndexId,

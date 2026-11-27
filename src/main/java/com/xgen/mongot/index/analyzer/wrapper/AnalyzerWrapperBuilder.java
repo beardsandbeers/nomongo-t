@@ -37,7 +37,9 @@ abstract class AnalyzerWrapperBuilder<T> {
             registry,
             defaultAnalyzer,
             defaultNormalizer);
-    return fields.isEmpty() ? Optional.empty() : Optional.of(new DynamicTypeSetPrefixMap<>(fields));
+    return fields.isEmpty()
+        ? Optional.empty()
+        : Optional.of(new DynamicTypeSetPrefixMap<>(fields, index.getMappingVersion()));
   }
 
   private ImmutableMap<String, T> resolve(

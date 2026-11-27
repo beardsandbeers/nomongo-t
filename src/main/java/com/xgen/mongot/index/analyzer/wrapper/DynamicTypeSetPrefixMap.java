@@ -2,6 +2,7 @@ package com.xgen.mongot.index.analyzer.wrapper;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.definition.SearchIndexDefinition.MappingVersion;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.path.string.StringMultiFieldPath;
 import com.xgen.mongot.util.Check;
@@ -11,8 +12,19 @@ import java.util.Optional;
 class DynamicTypeSetPrefixMap<T> {
   private final ImmutableMap<String, T> prefixToAnalyzer;
 
-  DynamicTypeSetPrefixMap(ImmutableMap<String, T> prefixToAnalyzer) {
+  // BSON keys cannot contain NUL. This internal prefix distinguishes the mapping root
+  // from a real document whose BSON key is the empty string.
+  private static final FieldPath SCOPED_ROOT = FieldPath.newRoot("\0");
+  private static final FieldPath LEGACY_ROOT = FieldPath.newRoot("");
+  private final FieldPath root;
+
+  static FieldPath rootPath(MappingVersion version) {
+    return version == MappingVersion.SCOPED ? SCOPED_ROOT : LEGACY_ROOT;
+  }
+
+  DynamicTypeSetPrefixMap(ImmutableMap<String, T> prefixToAnalyzer, MappingVersion version) {
     this.prefixToAnalyzer = prefixToAnalyzer;
+    this.root = rootPath(version);
   }
 
   /**
@@ -46,8 +58,7 @@ class DynamicTypeSetPrefixMap<T> {
 
     while (!FieldName.EmbeddedField.isAtEmbeddedRoot(maybeFieldPath).test(luceneFieldName)
         && maybeFieldPath.isPresent()) {
-      String testLuceneFieldName =
-          fieldNamePrefix + maybeFieldPath.orElse(FieldPath.parse("")) + multiSuffix;
+      String testLuceneFieldName = fieldNamePrefix + maybeFieldPath.orElse(this.root) + multiSuffix;
       Optional<T> result = Optional.ofNullable(this.prefixToAnalyzer.get(testLuceneFieldName));
       if (result.isPresent()) {
         return result;
@@ -56,8 +67,7 @@ class DynamicTypeSetPrefixMap<T> {
     }
 
     // We could still have a match at the embedded root so test that
-    String testLuceneFieldName =
-        fieldNamePrefix + maybeFieldPath.orElse(FieldPath.parse("")) + multiSuffix;
+    String testLuceneFieldName = fieldNamePrefix + maybeFieldPath.orElse(this.root) + multiSuffix;
     T result = this.prefixToAnalyzer.get(testLuceneFieldName);
     return Optional.ofNullable(result);
   }

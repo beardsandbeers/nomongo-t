@@ -5,7 +5,9 @@ import com.xgen.mongot.index.definition.AutocompleteFieldDefinition;
 import com.xgen.mongot.index.definition.DynamicDefinition;
 import com.xgen.mongot.index.definition.FieldDefinition;
 import com.xgen.mongot.index.definition.FieldTypeDefinition;
+import com.xgen.mongot.index.definition.HierarchicalFieldDefinition;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.SearchIndexDefinition.MappingVersion;
 import com.xgen.mongot.index.definition.SimilarityDefinition;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
 import com.xgen.mongot.index.lucene.field.FieldName;
@@ -23,13 +25,15 @@ public final class AnalyzerMapping {
   public AnalyzerMapping(SearchIndexDefinition index) {
     this.fields = staticDefinitions(index);
     var dynamic = dynamicDefinitions(index);
-    this.useDynamicSimilarity = index.usesTypeSetSimilarity();
+    this.useDynamicSimilarity = index.getMappingVersion() != MappingVersion.LEGACY;
     this.hasSimilarity =
         this.fields.values().stream().anyMatch(f -> similarityOf(f).isPresent())
             || (this.useDynamicSimilarity
                 && dynamic.values().stream().anyMatch(f -> similarityOf(f).isPresent()));
     this.prefixes =
-        dynamic.isEmpty() ? Optional.empty() : Optional.of(new DynamicTypeSetPrefixMap<>(dynamic));
+        dynamic.isEmpty()
+            ? Optional.empty()
+            : Optional.of(new DynamicTypeSetPrefixMap<>(dynamic, index.getMappingVersion()));
   }
 
   public Optional<FieldTypeDefinition> resolve(String physicalName) {
@@ -67,7 +71,7 @@ public final class AnalyzerMapping {
   }
 
   private static void visit(SearchIndexDefinition index, Visitor visitor) {
-    var hierarchy = index.getFieldHierarchyContext();
+    var hierarchy = index.getAnalyzerHierarchy();
     hierarchy
         .getRootFields()
         .forEach((path, field) -> visitor.field(path, Optional.empty(), field));
@@ -80,9 +84,7 @@ public final class AnalyzerMapping {
 
   static ImmutableMap<String, FieldTypeDefinition> staticDefinitions(SearchIndexDefinition index) {
     var fields = ImmutableMap.<String, FieldTypeDefinition>builder();
-    visit(
-        index,
-        (path, root, field) -> add(fields, path, root, field, index.usesTypeSetSimilarity()));
+    visit(index, (path, root, field) -> add(fields, path, root, field));
     return fields.buildKeepingLast();
   }
 
@@ -90,18 +92,56 @@ public final class AnalyzerMapping {
     if (index.getTypeSetsMap().isEmpty()) return ImmutableMap.of();
     var fields = ImmutableMap.<String, FieldTypeDefinition>builder();
     addDynamic(
-        fields, index, FieldPath.newRoot(""), Optional.empty(), index.getMappings().dynamic());
-    visit(
+        fields,
         index,
-        (path, root, field) -> {
-          field
-              .documentFieldDefinition()
-              .ifPresent(doc -> addDynamic(fields, index, path, root, doc.dynamic()));
-          field
-              .embeddedDocumentsFieldDefinition()
-              .ifPresent(doc -> addDynamic(fields, index, path, Optional.of(path), doc.dynamic()));
-        });
+        DynamicTypeSetPrefixMap.rootPath(index.getMappingVersion()),
+        Optional.empty(),
+        index.getMappings());
+    if (index.getMappingVersion() == MappingVersion.SCOPED) {
+      visitDynamicScopes(fields, index, index.getMappings(), Optional.empty(), Optional.empty());
+    } else {
+      visit(
+          index,
+          (path, root, field) -> {
+            field
+                .documentFieldDefinition()
+                .ifPresent(doc -> addDynamic(fields, index, path, root, doc));
+            field
+                .embeddedDocumentsFieldDefinition()
+                .ifPresent(doc -> addDynamic(fields, index, path, Optional.of(path), doc));
+          });
+    }
     return fields.buildKeepingLast();
+  }
+
+  /** Visit actual BSON declarations, including document scopes masked in the dotted query view. */
+  private static void visitDynamicScopes(
+      ImmutableMap.Builder<String, FieldTypeDefinition> fields,
+      SearchIndexDefinition index,
+      HierarchicalFieldDefinition mapping,
+      Optional<FieldPath> parent,
+      Optional<FieldPath> root) {
+    mapping
+        .fields()
+        .forEach(
+            (name, field) -> {
+              var path = parent.map(p -> p.newChild(name)).orElseGet(() -> FieldPath.newRoot(name));
+              field
+                  .documentFieldDefinition()
+                  .ifPresent(
+                      doc -> {
+                        addDynamic(fields, index, path, root, doc);
+                        visitDynamicScopes(fields, index, doc, Optional.of(path), root);
+                      });
+              field
+                  .embeddedDocumentsFieldDefinition()
+                  .ifPresent(
+                      doc -> {
+                        addDynamic(fields, index, path, Optional.of(path), doc);
+                        visitDynamicScopes(
+                            fields, index, doc, Optional.of(path), Optional.of(path));
+                      });
+            });
   }
 
   private static void addDynamic(
@@ -109,14 +149,10 @@ public final class AnalyzerMapping {
       SearchIndexDefinition index,
       FieldPath path,
       Optional<FieldPath> root,
-      DynamicDefinition dynamic) {
-    if (dynamic instanceof DynamicDefinition.Document document) {
-      add(
-          fields,
-          path,
-          root,
-          index.getTypeSetsMap().get(document.typeSet()).getFieldDefinition(),
-          true);
+      HierarchicalFieldDefinition scope) {
+    if (index.getMappingVersion() == MappingVersion.SCOPED
+        || scope.dynamic() instanceof DynamicDefinition.Document) {
+      index.getDynamicFieldDefinition(scope).ifPresent(field -> add(fields, path, root, field));
     }
   }
 
@@ -124,8 +160,7 @@ public final class AnalyzerMapping {
       ImmutableMap.Builder<String, FieldTypeDefinition> fields,
       FieldPath path,
       Optional<FieldPath> root,
-      FieldDefinition field,
-      boolean includeQueryAliases) {
+      FieldDefinition field) {
     field
         .tokenFieldDefinition()
         .ifPresent(
@@ -139,7 +174,8 @@ public final class AnalyzerMapping {
         .ifPresent(
             string -> {
               fields.put(FieldName.TypeField.STRING.getLuceneFieldName(path, root), string);
-              (includeQueryAliases ? string.multi() : string.declaredMulti())
+              string
+                  .multi()
                   .forEach(
                       (name, multi) ->
                           fields.put(

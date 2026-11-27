@@ -5,7 +5,6 @@ import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.version.IndexCapabilities;
 import com.xgen.mongot.index.version.IndexFormatVersion;
-import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
 import java.util.function.Function;
@@ -58,26 +57,27 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
 
   public Optional<StringFieldDefinition> getStringFieldDefinition(
       StringPath stringPath, Optional<FieldPath> embeddedRoot) {
-    Optional<StringFieldDefinition> baseStringFieldDefinition =
-        getFieldDefinition(stringPath.getBaseFieldPath(), embeddedRoot)
-            .flatMap(FieldDefinition::stringFieldDefinition);
+    return getQueryFieldDefinition(
+        stringPath.getBaseFieldPath(),
+        embeddedRoot,
+        field ->
+            field
+                .stringFieldDefinition()
+                .flatMap(
+                    string ->
+                        stringPath.isField()
+                            ? Optional.of(string)
+                            : string.getMultiDefinition(stringPath.asMultiField().getMulti())));
+  }
 
-    if (stringPath.isField()) {
-      return baseStringFieldDefinition;
-    }
-
-    String multi = stringPath.asMultiField().getMulti();
-    return baseStringFieldDefinition
-        .flatMap(field -> field.getMultiDefinition(multi))
-        .or(
-            () ->
-                findAlias(
-                    stringPath.getBaseFieldPath(),
-                    embeddedRoot,
-                    field ->
-                        field
-                            .stringFieldDefinition()
-                            .flatMap(string -> string.getMultiDefinition(multi))));
+  /** A query or change event carries a dotted name and can refer to multiple BSON spellings. */
+  public <T> Optional<T> getQueryFieldDefinition(
+      FieldPath path,
+      Optional<FieldPath> embeddedRoot,
+      Function<FieldDefinition, Optional<T>> select) {
+    return getFieldDefinition(path, embeddedRoot)
+        .flatMap(select)
+        .or(() -> findAlias(path, embeddedRoot, select));
   }
 
   /**
@@ -97,14 +97,16 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
 
   @Override
   public boolean isUsed(FieldPath path) {
-    return getFieldDefinition(path, Optional.empty()).isPresent()
+    return getQueryFieldDefinition(path, Optional.empty(), Optional::of).isPresent()
         || this.indexDefinition
             .getMappings()
             .fieldHierarchyContext()
             .getEmbeddedDocumentsRelativeRoots()
             .stream()
             .anyMatch(
-                embeddedRoot -> getFieldDefinition(path, Optional.of(embeddedRoot)).isPresent())
+                embeddedRoot ->
+                    getQueryFieldDefinition(path, Optional.of(embeddedRoot), Optional::of)
+                        .isPresent())
         || this.indexDefinition.getStoredSource().isPathToStored(path);
   }
 
@@ -137,10 +139,7 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
   public boolean hasGeoField(FieldPath path, Optional<FieldPath> embeddedRoot, boolean shapes) {
     Function<FieldDefinition, Optional<GeoFieldDefinition>> select =
         field -> field.geoFieldDefinition().filter(geo -> !shapes || geo.indexShapes());
-    return getFieldDefinition(path, embeddedRoot)
-        .flatMap(select)
-        .or(() -> findAlias(path, embeddedRoot, select))
-        .isPresent();
+    return getQueryFieldDefinition(path, embeddedRoot, select).isPresent();
   }
 
   /** Resolve alternate BSON key boundaries against the configured schema alone. */
@@ -202,18 +201,7 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
    */
   public Optional<FieldDefinition> getDynamicFieldDefinition(
       HierarchicalFieldDefinition hierarchicalFieldDefinition) {
-    return switch (hierarchicalFieldDefinition.dynamic()) {
-      case DynamicDefinition.Boolean bool ->
-          bool.value() ? Optional.of(FieldDefinition.DYNAMIC_FIELD_DEFINITION) : Optional.empty();
-
-      case DynamicDefinition.Document document -> {
-        // If dynamicDefinition is of type document, validation has already occurred during
-        // deserialization that it references a unique valid typeSet defined in the IndexDefinition
-        Optional<TypeSetDefinition> matchingTypeSet =
-            Optional.ofNullable(this.indexDefinition.getTypeSetsMap().get(document.typeSet()));
-        yield Optional.of(Check.isPresent(matchingTypeSet, "matchingTypeSet").getFieldDefinition());
-      }
-    };
+    return this.indexDefinition.getDynamicFieldDefinition(hierarchicalFieldDefinition);
   }
 
   private Optional<FieldDefinition> resolveFieldDefinition(

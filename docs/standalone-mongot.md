@@ -345,6 +345,14 @@ durable commit before the index is ready. After readiness, missing commits fail 
 Legacy indexes without initialization records reopen only when all commits are valid; incomplete
 legacy data requires restoration or an explicit rebuild. Older binaries cannot open a version-4
 catalog. A catalog mutation can upgrade older metadata, so retain a stopped backup before upgrade.
+Catalog version 5 identifies generations using scoped analyzers and type-set scoring, and
+definitions that declare a vector type set. New Search generations use scoped analysis when
+they reference a named type set or multiple BSON paths map to the same dotted field in a scope.
+Reopening a generation or applying a content-preserving update retains its original analyzers
+and scoring. A rebuild selects the current rules. Catalogs containing only ordinary definitions
+and generation records can still be written as version 4 and reopened by a version-4 binary.
+To roll back a version-5 catalog, restore a stopped backup made with the earlier binary.
+
 If `indexes.json` is missing and the journal still contains a live or staged locally owned
 generation, startup stops before altering the journal or deleting index files. Restore the
 matching stopped backup before restarting. A fresh directory and a journal containing only
