@@ -340,6 +340,10 @@ class ConfigManagerChangePlanner {
       reasons.add(IndexChangeReason.INDEX_FEATURE_VERSION.getDescription());
     }
 
+    if (existing.usesTypeSetSimilarity() != desired.usesTypeSetSimilarity()) {
+      reasons.add(IndexChangeReason.TYPE_SET_SIMILARITY.getDescription());
+    }
+
     if (!existing.getAnalyzerName().equals(desired.getAnalyzerName())) {
       reasons.add(IndexChangeReason.ANALYZER.getDescription());
     }

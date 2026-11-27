@@ -3546,6 +3546,35 @@ public class StandaloneGrpcServerTest {
     }
   }
 
+  @Test
+  public void getIndexMappings_distinctStringMultis_preservesEachAlias() throws Exception {
+    String multi = "{type:'string',multi:{%s:{type:'string',analyzer:'lucene.keyword'}}}";
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "multis",
+          ALIAS_TYPE_SETS.formatted(multi.formatted("lit"), multi.formatted("nest")),
+          List.of("{_id:1,'a.b':'red apple'}", "{_id:2,a:{b:'green pear'}}"),
+          Map.of(
+              "{text:{path:{value:'a.b',multi:'lit'},query:'red apple'}}", 1,
+              "{text:{path:{value:'a.b',multi:'nest'},query:'green pear'}}", 1,
+              "{text:{path:{value:'a.b',multi:'lit'},query:'green pear'}}", 0));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_dynamicBooleanSimilarity_preservesScores() throws Exception {
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "ranking",
+          ALIAS_TYPE_SETS.formatted(
+              "{type:'string',similarity:{type:'boolean'}}", "{type:'string'}"),
+          List.of("{_id:1,x:'snow day today'}", "{_id:2,x:'snow snow snow'}"),
+          Map.of("{text:{path:'x',query:'snow'}}", 2));
+    }
+  }
+
   private static void assertReplayQueries(
       Fixture f,
       String name,

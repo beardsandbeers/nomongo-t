@@ -639,13 +639,11 @@ public final class LuceneIndexMappingExporter {
                     .resolve(FieldName.TypeField.TOKEN.getLuceneFieldName(path, embeddedRoot))
                     .orElse(token)
                     .toBson();
-        case AutocompleteFieldDefinition ac ->
-            mapping =
-                this.analyzers
-                    .resolve(
-                        FieldName.TypeField.AUTOCOMPLETE.getLuceneFieldName(path, embeddedRoot))
-                    .orElse(ac)
-                    .toBson();
+        case AutocompleteFieldDefinition ac -> {
+          String physical = FieldName.TypeField.AUTOCOMPLETE.getLuceneFieldName(path, embeddedRoot);
+          mapping = this.analyzers.resolve(physical).orElse(ac).toBson();
+          fixSimilarity(mapping, physical);
+        }
         case TypeSetVectorFieldDefinition vector -> {
           // The queryable dotted path determines the encoding, including for literal BSON keys.
           var rule =
@@ -676,6 +674,7 @@ public final class LuceneIndexMappingExporter {
 
   private void fixStringAnalysis(BsonDocument mapping, String physicalName) {
     var selected = this.analyzers.resolve(physicalName).map(StringFieldDefinition.class::cast);
+    fixSimilarity(mapping, physicalName);
     mapping.remove("analyzer");
     mapping.remove("searchAnalyzer");
     selected
@@ -684,6 +683,13 @@ public final class LuceneIndexMappingExporter {
     selected
         .flatMap(StringFieldDefinition::searchAnalyzerName)
         .ifPresent(name -> mapping.put("searchAnalyzer", new BsonString(name)));
+  }
+
+  private void fixSimilarity(BsonDocument mapping, String physical) {
+    mapping.remove("similarity");
+    this.analyzers
+        .similarity(physical)
+        .ifPresent(model -> mapping.put("similarity", model.toBson()));
   }
 
   private static Optional<FieldTypeDefinition.Type> publicType(FieldName.TypeField type) {

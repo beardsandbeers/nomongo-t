@@ -10,6 +10,7 @@ import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorQuantization;
 import com.xgen.mongot.index.lucene.field.MappingObservations;
+import com.xgen.mongot.index.lucene.similarity.LuceneSimilarity;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
@@ -42,6 +43,9 @@ import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.similarities.BM25Similarity;
+import org.apache.lucene.search.similarities.BooleanSimilarity;
+import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.bson.BsonDocument;
 import org.junit.Test;
@@ -138,6 +142,93 @@ public class LuceneIndexMappingExporterTest {
         }
       }
     }
+  }
+
+  @Test
+  public void export_persistedGenerationSimilarity_matchesScoringForStringMultiAndAutocomplete()
+      throws Exception {
+    var mappings =
+        mappings(
+            "{dynamic:{typeSet:'custom'},fields:{plain:{type:'string'},"
+                + "items:{type:'embeddedDocuments',dynamic:{typeSet:'custom'}}}}");
+    var json =
+        BsonDocument.parse(
+            """
+            {name:'custom',types:[{type:'autocomplete',similarity:{type:'boolean'}},
+             {type:'string',similarity:{type:'boolean'},
+                  multi:{alt:{type:'string',similarity:{type:'boolean'}}}}]}
+            """);
+    try (var parser = BsonDocumentParser.fromRoot(json).build()) {
+      var old =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(mappings)
+              .typeSets(TypeSetDefinition.fromBson(parser))
+              .build();
+      var fresh = old.withTypeSetSimilarity(true);
+      var newScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(fresh);
+      var fields = infos("$type:string/x", "$type:autocomplete/x");
+      assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+      assertThat(newScore.get("$type:string/x")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$multi/x.alt")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$type:autocomplete/x")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$embedded:5/items/$type:string/items.value"))
+          .isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$type:string/plain")).isInstanceOf(BM25Similarity.class);
+      assertThat(
+              LuceneIndexMappingExporter.export(old, IndexFormatVersion.CURRENT, List.of(fields))
+                  .getDocument("fields")
+                  .getArray("x")
+                  .toString())
+          .doesNotContain("similarity");
+      assertThat(
+              LuceneIndexMappingExporter.export(fresh, IndexFormatVersion.CURRENT, List.of(fields))
+                  .getDocument("fields")
+                  .getArray("x")
+                  .toString())
+          .contains("boolean");
+      var oldBson = old.toBson();
+      assertThat(oldBson.containsKey("typeSetSimilarity")).isFalse();
+      try (var prior = BsonDocumentParser.fromRoot(oldBson).build();
+          var current = BsonDocumentParser.fromRoot(fresh.toBson()).build()) {
+        assertThat(
+                com.xgen.mongot.index.definition.IndexDefinition.fromBson(prior)
+                    .asSearchDefinition()
+                    .usesTypeSetSimilarity())
+            .isFalse();
+        assertThat(
+                com.xgen.mongot.index.definition.IndexDefinition.fromBson(current)
+                    .asSearchDefinition()
+                    .usesTypeSetSimilarity())
+            .isTrue();
+      }
+    }
+  }
+
+  @Test
+  public void similarity_olderStaticAliases_preservesOriginalMultiSelection() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'string',
+                      multi:{lit:{type:'string',similarity:{type:'boolean'}}}},
+                      a:{type:'document',fields:{b:{type:'string',
+                      multi:{nest:{type:'string',similarity:{type:'boolean'}}}}}}}}
+                    """))
+            .build();
+    var oldScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old);
+    var freshScore =
+        (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.withTypeSetSimilarity(true));
+    assertThat(
+            List.of(
+                oldScore.get("$multi/a.b.lit").getClass(),
+                oldScore.get("$multi/a.b.nest").getClass()))
+        .containsExactly(BM25Similarity.class, BooleanSimilarity.class);
+    assertThat(freshScore.get("$multi/a.b.lit")).isInstanceOf(BooleanSimilarity.class);
+    assertThat(freshScore.get("$multi/a.b.nest")).isInstanceOf(BooleanSimilarity.class);
   }
 
   private static BsonDocument snapshot(List<DirectoryReader> readers) throws IOException {

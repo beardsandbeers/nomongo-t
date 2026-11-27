@@ -23,6 +23,56 @@ public class LocalIndexCatalogTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
 
   @Test
+  public void planUpdate_olderScoringGeneration_preservedUntilRebuild() throws Exception {
+    var dir = this.folder.getRoot().toPath();
+    var initial =
+        ByteString.copyFrom(
+            StandaloneDefinitionValidator.encode(
+                BsonDocument.parse("{mappings:{dynamic:false,fields:{title:{type:'string'}}}}")));
+    String id;
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      id =
+          catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("older")
+                      .setType(IndexType.INDEX_TYPE_SEARCH)
+                      .setDefinitionBson(initial)
+                      .build())
+              .getIndexId();
+    }
+    var catalogFile = dir.resolve("indexes.json");
+    // Older catalogs predate schema and initialization records and the scoring generation flag.
+    var entries = BsonDocument.parse(Files.readString(catalogFile)).getArray("entries");
+    entries.get(0).asDocument().remove("typeSetSimilarity");
+    Files.writeString(catalogFile, new BsonDocument("indexes", entries).toJson());
+    var update =
+        UpdateIndexRequest.newBuilder()
+            .setIndexId(id)
+            .setExpectedRevision(1)
+            .setDefinitionBson(
+                ByteString.copyFrom(
+                    StandaloneDefinitionValidator.encode(
+                        BsonDocument.parse(
+                            "{mappings:{dynamic:false,fields:{title:{type:'string'},"
+                                + "extra:{type:'number'}}}}"))));
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      var preserve = catalog.planUpdate(update.build());
+      var rebuild =
+          catalog.planUpdate(
+              update
+                  .setUpdateMode(
+                      com.xgen.mongot.standalone.grpc.IndexUpdateMode
+                          .INDEX_UPDATE_MODE_REBUILD_EMPTY)
+                  .build());
+      assertThat(preserve.compatibility().kind())
+          .isEqualTo(IndexUpdateCompatibility.Kind.PRESERVE_CONTENT);
+      assertThat(preserve.candidate().asSearchDefinition().usesTypeSetSimilarity()).isFalse();
+      assertThat(rebuild.candidate().asSearchDefinition().usesTypeSetSimilarity()).isTrue();
+    }
+  }
+
+  @Test
   public void createIndex_moreThan64Indexes_persistsAcrossRestart() throws Exception {
     var directory = this.folder.getRoot().toPath();
     var definition =

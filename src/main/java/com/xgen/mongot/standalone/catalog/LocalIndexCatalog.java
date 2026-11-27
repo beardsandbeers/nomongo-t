@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString;
 import com.xgen.mongot.config.backup.ConfigJournalV1;
 import com.xgen.mongot.config.backup.QuarantinePolicy;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.version.GenerationId;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
 import com.xgen.mongot.standalone.grpc.DropIndexRequest;
@@ -332,6 +333,13 @@ public final class LocalIndexCatalog implements Closeable {
                 request.getExpectedRevision() + 1,
                 request.getDefinitionBson().toByteArray())
             .internal();
+    if (compatibility.kind() == IndexUpdateCompatibility.Kind.PRESERVE_CONTENT
+        && candidate instanceof SearchIndexDefinition search) {
+      return new UpdatePlan(
+          search.withTypeSetSimilarity(existing.asSearchDefinition().usesTypeSetSimilarity()),
+          compatibility,
+          false);
+    }
     return new UpdatePlan(candidate, compatibility, false);
   }
 

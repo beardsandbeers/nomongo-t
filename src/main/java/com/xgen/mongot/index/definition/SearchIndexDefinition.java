@@ -90,6 +90,9 @@ public final class SearchIndexDefinition implements IndexDefinition {
     public static final Field.WithDefault<Integer> INDEX_FEATURE_VERSION =
         Field.builder("indexFeatureVersion").intField().optional().withDefault(0);
 
+    static final Field.WithDefault<Boolean> TYPE_SET_SIMILARITY =
+        Field.builder("typeSetSimilarity").booleanField().optional().withDefault(false);
+
     static final Field.Optional<List<SynonymMappingDefinition>> SYNONYMS =
         Field.builder("synonyms")
             .classField(SynonymMappingDefinition::fromBson)
@@ -131,6 +134,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
   private final AutoEmbedFieldSet autoEmbedFields;
   private final Optional<List<CustomAnalyzerDefinition>> analyzers;
   private final int indexFeatureVersion;
+  private final boolean typeSetSimilarity;
   private final Optional<List<SynonymMappingDefinition>> synonyms;
   private final Optional<StoredSourceDefinition> storedSource;
   private final Optional<List<TypeSetDefinition>> typeSets;
@@ -169,6 +173,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
       Set<String> nonStockAnalyzerNames,
       Optional<List<CustomAnalyzerDefinition>> analyzers,
       int parsedIndexFeatureVersion,
+      boolean typeSetSimilarity,
       Optional<List<SynonymMappingDefinition>> synonyms,
       Optional<StoredSourceDefinition> storedSource,
       Optional<List<TypeSetDefinition>> typeSets,
@@ -194,6 +199,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
     this.nonStockAnalyzerNames = nonStockAnalyzerNames;
     this.analyzers = analyzers;
     this.indexFeatureVersion = parsedIndexFeatureVersion;
+    this.typeSetSimilarity = typeSetSimilarity;
     this.synonyms = synonyms;
     this.storedSource = storedSource;
     this.typeSets = typeSets;
@@ -279,6 +285,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         nonStockAnalyzerNames,
         analyzers,
         indexFeatureVersionNumber,
+        false,
         synonyms,
         storedSource,
         typeSets,
@@ -298,13 +305,26 @@ public final class SearchIndexDefinition implements IndexDefinition {
    * @return a new SearchIndexDefinition instance with the updated view definition
    */
   public SearchIndexDefinition withUpdatedViewDefinition(ViewDefinition updatedViewDefinition) {
+    return copy(Optional.of(updatedViewDefinition), this.typeSetSimilarity);
+  }
+
+  public boolean usesTypeSetSimilarity() {
+    return this.typeSetSimilarity;
+  }
+
+  /** Older generations used static similarity mappings throughout their lifetime. */
+  public SearchIndexDefinition withTypeSetSimilarity(boolean enabled) {
+    return this.typeSetSimilarity == enabled ? this : copy(this.view, enabled);
+  }
+
+  private SearchIndexDefinition copy(Optional<ViewDefinition> view, boolean typeSetSimilarity) {
     return new SearchIndexDefinition(
         this.indexId,
         this.name,
         this.database,
         this.lastObservedCollectionName,
         this.collectionUuid,
-        Optional.of(updatedViewDefinition),
+        view,
         this.numPartitions,
         this.mappings,
         this.autoEmbedFields,
@@ -314,6 +334,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         this.nonStockAnalyzerNames,
         this.analyzers,
         this.indexFeatureVersion,
+        typeSetSimilarity,
         this.synonyms,
         this.storedSource,
         this.typeSets,
@@ -354,30 +375,31 @@ public final class SearchIndexDefinition implements IndexDefinition {
     validateAutoEmbedPathsDoNotOverlapMappings(mappings);
 
     return create(
-        indexId,
-        parser.getField(IndexDefinition.Fields.NAME).unwrap(),
-        parser.getField(IndexDefinition.Fields.DATABASE).unwrap(),
-        parser.getField(IndexDefinition.Fields.LAST_OBSERVED_COLLECTION_NAME).unwrap(),
-        parser.getField(IndexDefinition.Fields.COLLECTION_UUID).unwrap(),
-        parser.getField(IndexDefinition.Fields.VIEW).unwrap(),
-        parser.getField(IndexDefinition.Fields.NUM_PARTITIONS).unwrap(),
-        mappings,
-        parser.getField(Fields.ANALYZER).unwrap(),
-        parser.getField(Fields.SEARCH_ANALYZER).unwrap(),
-        parser.getField(Fields.ANALYZERS).unwrap(),
-        // Initialize with the minimum of the 2 IndexFeatureVersions
-        Integer.min(parsedIndexFeatureVersion, SearchIndexCapabilities.CURRENT_FEATURE_VERSION),
-        parser.getField(Fields.SYNONYMS).unwrap(),
-        parser.getField(IndexDefinition.Fields.STORED_SOURCE).unwrap(),
-        typeSets,
-        sort,
-        parser.getField(IndexDefinition.Fields.DEFINITION_VERSION).unwrap(),
-        DateUtil.parseInstantFromString(
-            parser, DATE_FORMAT, IndexDefinition.Fields.DEFINITION_VERSION_CREATED_AT),
-        parser.getField(IndexDefinition.Fields.DEFINITION_VERSION_ID).unwrap(),
-        parser.getField(IndexDefinition.Fields.INDEX_ID_AT_CREATION_TIME).unwrap(),
-        parser.getField(IndexDefinition.Fields.AUTO_EMBEDDING_DEFINITION_VERSION).unwrap(),
-        parser.getField(IndexDefinition.Fields.MATERIALIZED_VIEW_NAME_FORMAT_VERSION).unwrap());
+            indexId,
+            parser.getField(IndexDefinition.Fields.NAME).unwrap(),
+            parser.getField(IndexDefinition.Fields.DATABASE).unwrap(),
+            parser.getField(IndexDefinition.Fields.LAST_OBSERVED_COLLECTION_NAME).unwrap(),
+            parser.getField(IndexDefinition.Fields.COLLECTION_UUID).unwrap(),
+            parser.getField(IndexDefinition.Fields.VIEW).unwrap(),
+            parser.getField(IndexDefinition.Fields.NUM_PARTITIONS).unwrap(),
+            mappings,
+            parser.getField(Fields.ANALYZER).unwrap(),
+            parser.getField(Fields.SEARCH_ANALYZER).unwrap(),
+            parser.getField(Fields.ANALYZERS).unwrap(),
+            // Initialize with the minimum of the 2 IndexFeatureVersions
+            Integer.min(parsedIndexFeatureVersion, SearchIndexCapabilities.CURRENT_FEATURE_VERSION),
+            parser.getField(Fields.SYNONYMS).unwrap(),
+            parser.getField(IndexDefinition.Fields.STORED_SOURCE).unwrap(),
+            typeSets,
+            sort,
+            parser.getField(IndexDefinition.Fields.DEFINITION_VERSION).unwrap(),
+            DateUtil.parseInstantFromString(
+                parser, DATE_FORMAT, IndexDefinition.Fields.DEFINITION_VERSION_CREATED_AT),
+            parser.getField(IndexDefinition.Fields.DEFINITION_VERSION_ID).unwrap(),
+            parser.getField(IndexDefinition.Fields.INDEX_ID_AT_CREATION_TIME).unwrap(),
+            parser.getField(IndexDefinition.Fields.AUTO_EMBEDDING_DEFINITION_VERSION).unwrap(),
+            parser.getField(IndexDefinition.Fields.MATERIALIZED_VIEW_NAME_FORMAT_VERSION).unwrap())
+        .withTypeSetSimilarity(parser.getField(Fields.TYPE_SET_SIMILARITY).unwrap());
   }
 
   @Override
@@ -397,6 +419,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         .field(Fields.ANALYZERS, this.analyzers)
         .field(Fields.SYNONYMS, this.synonyms)
         .field(Fields.INDEX_FEATURE_VERSION, this.indexFeatureVersion)
+        .fieldOmitDefaultValue(Fields.TYPE_SET_SIMILARITY, this.typeSetSimilarity)
         .field(IndexDefinition.Fields.STORED_SOURCE, this.storedSource)
         .field(Fields.TYPE_SETS, this.typeSets)
         .field(Fields.SORT, this.sort)
@@ -761,6 +784,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
     SearchIndexDefinition that = (SearchIndexDefinition) o;
     return this.numPartitions == that.numPartitions
         && this.indexFeatureVersion == that.indexFeatureVersion
+        && this.typeSetSimilarity == that.typeSetSimilarity
         && Objects.equal(this.indexId, that.indexId)
         && Objects.equal(this.name, that.name)
         && Objects.equal(this.database, that.database)
@@ -808,6 +832,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         this.mappings,
         this.analyzers,
         this.indexFeatureVersion,
+        this.typeSetSimilarity,
         this.synonyms,
         this.storedSource,
         this.typeSets,

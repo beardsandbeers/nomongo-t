@@ -210,7 +210,19 @@ public record FieldDefinition(
                       default -> true;
                     });
     return fromValidatedFieldTypeDefinitions(
-        Stream.concat(otherLeafTypes, current.getAllDefinitions().flatMap(Optional::stream))
+        Stream.concat(
+                otherLeafTypes,
+                current
+                    .getAllDefinitions()
+                    .flatMap(Optional::stream)
+                    .map(
+                        definition ->
+                            definition instanceof StringFieldDefinition string
+                                ? previous
+                                    .stringFieldDefinition()
+                                    .map(string::withQueryAliases)
+                                    .orElse(string)
+                                : definition))
             .toList());
   }
 

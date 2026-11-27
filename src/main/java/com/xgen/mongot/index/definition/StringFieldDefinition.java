@@ -22,8 +22,51 @@ public record StringFieldDefinition(
     IndexOptions indexOptions,
     boolean storeFlag,
     NormsOptions norms,
-    ImmutableMap<String, StringFieldDefinition> multi)
+    ImmutableMap<String, StringFieldDefinition> multi,
+    ImmutableMap<String, StringFieldDefinition> declaredMulti)
     implements FieldTypeDefinition {
+
+  public StringFieldDefinition(
+      Optional<String> analyzerName,
+      Optional<String> searchAnalyzerName,
+      Optional<SimilarityDefinition> similarity,
+      Optional<Integer> ignoreAbove,
+      IndexOptions indexOptions,
+      boolean storeFlag,
+      NormsOptions norms,
+      ImmutableMap<String, StringFieldDefinition> multi) {
+    this(
+        analyzerName,
+        searchAnalyzerName,
+        similarity,
+        ignoreAbove,
+        indexOptions,
+        storeFlag,
+        norms,
+        multi,
+        multi);
+  }
+
+  // Keep the winning declaration as well as the query view. Older generations used only
+  // the winning string's multis to select physical analyzers and similarity.
+  StringFieldDefinition withQueryAliases(StringFieldDefinition other) {
+    if (other.multi().isEmpty()) return this;
+    var aliases =
+        ImmutableMap.<String, StringFieldDefinition>builder()
+            .putAll(other.multi())
+            .putAll(this.multi)
+            .buildKeepingLast();
+    return new StringFieldDefinition(
+        this.analyzerName,
+        this.searchAnalyzerName,
+        this.similarity,
+        this.ignoreAbove,
+        this.indexOptions,
+        this.storeFlag,
+        this.norms,
+        aliases,
+        this.declaredMulti);
+  }
 
   public static class Fields {
 
