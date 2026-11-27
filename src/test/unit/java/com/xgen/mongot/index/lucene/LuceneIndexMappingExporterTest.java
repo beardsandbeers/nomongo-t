@@ -9,25 +9,195 @@ import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorQuantization;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.version.IndexFormatVersion;
+import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.testing.mongot.index.definition.SearchIndexDefinitionBuilder;
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.IntStream;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StoredField;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.store.ByteBuffersDataOutput;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.bson.BsonDocument;
 import org.junit.Test;
 
 public class LuceneIndexMappingExporterTest {
+  @Test
+  public void exportSnapshot_indexedObservations_readsNoStoredDocumentsAcrossDeletesAndReopen()
+      throws Exception {
+    var definition = SearchIndexDefinitionBuilder.VALID_INDEX;
+    String longKey = "猫".repeat(11_000);
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(observedString("literal", FieldPath.newRoot("a.b")));
+      writer.addDocument(observedString("nested", FieldPath.parse("a.b")));
+      writer.addDocument(observedString("long", FieldPath.newRoot(longKey)));
+      writer.commit();
+      try (var before = guardDocumentReads(DirectoryReader.open(directory))) {
+        writer.deleteDocuments(new Term("id", "literal"));
+        writer.commit();
+        try (var after = guardDocumentReads(DirectoryReader.open(directory))) {
+          var current =
+              LuceneIndexMappingExporter.exportSnapshot(
+                      definition, IndexFormatVersion.CURRENT, List.of(after))
+                  .getDocument("fields");
+          assertThat(current.keySet()).containsExactly("a", longKey);
+          assertThat(current.getDocument("a").getDocument("fields").containsKey("b")).isTrue();
+        }
+        var previous =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(before))
+                .getDocument("fields");
+        assertThat(previous.keySet()).containsExactly("a.b", "a", longKey);
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_mixedStoredAndIndexed_buildsLegacyPostingsOnceAcrossDeletes()
+      throws Exception {
+    var definition = SearchIndexDefinitionBuilder.VALID_INDEX;
+    var old = new Document();
+    old.add(new StringField("id", "old", Field.Store.NO));
+    old.add(new StringField("$type:string/a.b", "value", Field.Store.NO));
+    var bytes = new ByteBuffersDataOutput();
+    bytes.writeString("$type:string/a.b");
+    bytes.writeString("a.b");
+    old.add(new StoredField("$meta/mappingObservationsV1", bytes.toArrayCopy()));
+
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(observedString("current", FieldPath.parse("a.b")));
+      writer.commit();
+      var initial = DirectoryReader.open(writer);
+      try (var before = guardDocumentReads(initial)) {
+        writer.deleteDocuments(new Term("id", "old"));
+        writer.commit();
+        try (var after = DirectoryReader.openIfChanged(initial)) {
+          assertThat(after).isNotNull();
+          assertThat(after.leaves()).hasSize(1);
+          // First build the compatibility index on the newer snapshot, after the V1 doc was
+          // deleted.
+          var current =
+              LuceneIndexMappingExporter.exportSnapshot(
+                      definition, IndexFormatVersion.CURRENT, List.of(after))
+                  .getDocument("fields");
+          assertThat(current.keySet()).containsExactly("a");
+        }
+        // The earlier reader shares the segment but must still see the old spelling.
+        var original =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(before))
+                .getDocument("fields");
+        assertThat(original.keySet()).containsExactly("a.b", "a");
+      }
+    }
+  }
+
+  private static Document observedString(String id, FieldPath path) throws IOException {
+    var document = new Document();
+    var observations = new MappingObservations();
+    document.add(observations);
+    document.add(new StringField("id", id, Field.Store.NO));
+    int start = document.getFields().size();
+    document.add(new StringField("$type:string/" + path, "value", Field.Store.NO));
+    observations.recordScalarFields(document, start, path, 0);
+    observations.finish(document);
+    return document;
+  }
+
+  private static DirectoryReader guardDocumentReads(DirectoryReader reader) throws IOException {
+    return new FilterDirectoryReader(
+        reader,
+        new FilterDirectoryReader.SubReaderWrapper() {
+          @Override
+          public LeafReader wrap(LeafReader leaf) {
+            return new FilterLeafReader(leaf) {
+              @Override
+              public StoredFields storedFields() {
+                throw new AssertionError("opening stored documents during mapping export");
+              }
+
+              @Override
+              public Terms terms(String field) throws IOException {
+                var terms = super.terms(field);
+                if (terms == null || !field.equals(MappingObservations.NAME)) {
+                  return terms;
+                }
+                return new FilterTerms(terms) {
+                  @Override
+                  public TermsEnum iterator() throws IOException {
+                    return new FilterTermsEnum(super.iterator()) {
+                      @Override
+                      public PostingsEnum postings(PostingsEnum reuse, int flags)
+                          throws IOException {
+                        if (term().length != 0 && docFreq() > leaf.numDeletedDocs()) {
+                          throw new AssertionError(
+                              "document frequency already proves this spelling is live");
+                        }
+                        return super.postings(reuse, flags);
+                      }
+                    };
+                  }
+                };
+              }
+
+              @Override
+              public CacheHelper getCoreCacheHelper() {
+                return in.getCoreCacheHelper();
+              }
+
+              @Override
+              public CacheHelper getReaderCacheHelper() {
+                return in.getReaderCacheHelper();
+              }
+            };
+          }
+        }) {
+      @Override
+      protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
+        return guardDocumentReads(in);
+      }
+
+      @Override
+      public CacheHelper getReaderCacheHelper() {
+        return in.getReaderCacheHelper();
+      }
+    };
+  }
+
   @Test
   public void export_partitionUnion_collapsesPhysicalTypesAndExcludesInternalFields() {
     var definition = SearchIndexDefinitionBuilder.VALID_INDEX;

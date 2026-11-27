@@ -183,13 +183,22 @@ length at that path are skipped. Independently built indexes can learn different
 if their input mixes dimensions. A vector query on a shard that has yet to observe the path
 returns an empty local result. Numeric arrays require an explicit static vector mapping.
 
-For indexes using vector type sets, mapping export reads the types and BSON key segments
-recorded on live documents. A literal key such as `"a.b"` can hold both a string and a vector.
-Replacing or deleting its last occurrence removes that spelling from the next refreshed export.
+For indexes using vector type sets, Lucene indexes each distinct combination of field type and BSON key
+segments with the IDs of the documents that contain it. Mapping export reads these combinations
+once per segment. On segments with deletions, it checks matching IDs for a surviving document
+when the document frequency alone cannot establish that one survives. The literal key `"a.b"`
+and the nested path in `{"a":{"b":1}}` have separate entries. Each spelling can hold both a string
+and a vector. Replacing or deleting its last occurrence removes that spelling from the next
+refreshed export.
 Exported vector fields use `bsonVectorOnly: true`. Numeric arrays require an ordinary static
-vector mapping. Exporting scans the live documents in the pinned partition readers.
+vector mapping.
 
-Older documents may lack these key segments. The server uses the mapping and earlier checkpoint
+Segments written by the earlier stored-observation format need a one-time read of those records
+on their first export. The server shares the resulting postings across snapshots of the segment,
+including after deletions. A restart or merge drops this in-memory index. Reindexing the source
+documents persists the current format.
+
+Documents predating both formats may lack these key segments. The server uses the mapping and earlier checkpoint
 metadata when they identify a unique spelling. If a live legacy field has multiple possible
 spellings, reindex its source documents before exporting.
 

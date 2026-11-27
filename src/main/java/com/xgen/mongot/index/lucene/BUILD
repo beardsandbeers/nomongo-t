@@ -22,6 +22,7 @@ java_library(
         "InitializedLuceneSearchIndex.java",
         "InitializedLuceneVectorIndex.java",
         "LegacyMappingFields.java",
+        "LegacyMappingObservations.java",
         "LiveSearchSchema.java",
         "LuceneAggregationContextFieldResolver.java",
         "LuceneAggregationPlanResolver.java",

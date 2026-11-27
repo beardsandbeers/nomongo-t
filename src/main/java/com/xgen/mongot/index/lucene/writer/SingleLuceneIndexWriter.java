@@ -722,7 +722,8 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
 
       var fields = this.luceneWriter.getFieldNames();
       return fields.contains(MappingObservations.NAME)
-          ? Sets.difference(fields, Set.of(MappingObservations.NAME))
+              || fields.contains(MappingObservations.STORED_V1)
+          ? Sets.filter(fields, name -> !MappingObservations.isInternalField(name))
           : fields;
     }
   }
@@ -851,7 +852,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         documentBlock.stream()
             .flatMap(d -> d.getFields().stream())
             .map(IndexableField::name)
-            .filter(name -> !name.equals(MappingObservations.NAME))
+            .filter(name -> !MappingObservations.isInternalField(name))
             .distinct()
             .count();
     if (fieldsIndexed > fieldLimit) {

@@ -34,11 +34,15 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.LeafReader;
-import org.apache.lucene.util.FixedBitSet;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.util.Bits;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
 import org.bson.BsonValue;
+import org.jetbrains.annotations.Nullable;
 
 /** Builds static public mappings from configured mappings and materialized Lucene field types. */
 public final class LuceneIndexMappingExporter {
@@ -133,30 +137,37 @@ public final class LuceneIndexMappingExporter {
   }
 
   private void observeLive(LeafReader leaf) throws IOException {
-    var live = leaf.getLiveDocs();
-    var stored = leaf.storedFields();
-    var entries = new HashSet<MappingObservations.Entry>();
-    var legacy = new FixedBitSet(leaf.maxDoc());
-    var selected = Set.of(MappingObservations.NAME);
-    boolean hasObservations = leaf.getFieldInfos().fieldInfo(MappingObservations.NAME) != null;
-    for (int doc = 0; doc < leaf.maxDoc(); ++doc) {
-      if (live != null && !live.get(doc)) {
-        continue;
+    if (leaf.numDocs() == 0) {
+      return;
+    }
+    var terms = leaf.terms(MappingObservations.NAME);
+    if (terms != null) {
+      var iterator = terms.iterator();
+      while (iterator.next() != null) {
+        if (iterator.term().length == 0 || !hasLivePosting(leaf, iterator)) {
+          continue;
+        }
+        String encoded = iterator.term().utf8ToString();
+        if (encoded.equals(MappingObservations.LONG_ENTRY_MARKER)) {
+          observeLongEntries(leaf);
+        } else {
+          observeEntry(leaf, MappingObservations.Entry.decode(encoded));
+        }
       }
-      var value =
-          hasObservations
-              ? stored.document(doc, selected).getBinaryValue(MappingObservations.NAME)
-              : null;
-      if (value == null) {
-        legacy.set(doc);
-      } else {
-        MappingObservations.read(value, entries);
+      // Only writers using this format populate this field, including on empty documents.
+      if (terms.getDocCount() == leaf.maxDoc()) {
+        return;
       }
     }
-    for (var entry : entries) {
-      observe(leaf.getFieldInfos().fieldInfo(entry.field()), Optional.of(entry.keys()), false);
+
+    var older = LegacyMappingObservations.forSegment(leaf);
+    for (var entry : older.stored().entrySet()) {
+      if (hasLiveDoc(entry.getValue().iterator(), leaf.getLiveDocs())) {
+        observeEntry(leaf, entry.getKey());
+      }
     }
-    if (legacy.cardinality() > 0) {
+    var legacy = older.liveUnrecorded(leaf.getLiveDocs());
+    if (!legacy.scanIsEmpty()) {
       for (var field : leaf.getFieldInfos()) {
         if (FieldName.TypeField.getTypeOf(field.name)
                 .flatMap(LuceneIndexMappingExporter::publicType)
@@ -166,6 +177,41 @@ public final class LuceneIndexMappingExporter {
         }
       }
     }
+  }
+
+  private void observeLongEntries(LeafReader leaf) throws IOException {
+    for (var field : leaf.getFieldInfos()) {
+      if (!field.name.startsWith(MappingObservations.LONG_ENTRY_PREFIX)) {
+        continue;
+      }
+      var terms = leaf.terms(field.name);
+      if (terms != null) {
+        var presence = terms.iterator();
+        if (presence.next() != null && hasLivePosting(leaf, presence)) {
+          String encoded = field.name.substring(MappingObservations.LONG_ENTRY_PREFIX.length());
+          observeEntry(leaf, MappingObservations.Entry.decode(encoded));
+        }
+      }
+    }
+  }
+
+  private void observeEntry(LeafReader leaf, MappingObservations.Entry entry) {
+    observe(leaf.getFieldInfos().fieldInfo(entry.field()), Optional.of(entry.keys()), false);
+  }
+
+  private static boolean hasLivePosting(LeafReader leaf, TermsEnum term) throws IOException {
+    // If more documents have the spelling than have been deleted, at least one still has it.
+    return term.docFreq() > leaf.numDeletedDocs()
+        || hasLiveDoc(term.postings(null, PostingsEnum.NONE), leaf.getLiveDocs());
+  }
+
+  private static boolean hasLiveDoc(DocIdSetIterator docs, @Nullable Bits live) throws IOException {
+    for (int doc = docs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docs.nextDoc()) {
+      if (live == null || live.get(doc)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
