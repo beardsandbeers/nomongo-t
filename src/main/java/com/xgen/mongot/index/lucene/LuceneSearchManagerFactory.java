@@ -91,7 +91,7 @@ class LuceneSearchManagerFactory {
   private LuceneSearchManager<QueryInfo> newCachingVectorQueryManager(
       Query luceneQuery, VectorSearchCriteria criteria) {
 
-    VectorQuantization quantization = this.resolveQuantization(criteria.path());
+    VectorQuantization quantization = this.resolveQuantization(luceneQuery, criteria.path());
     boolean requiresRescoring = requiresRescoring(criteria, quantization);
     boolean requiresNestedAvgRescoring = requiresNestedAvgRescoring(criteria);
     LuceneSearchManager<QueryInfo> innerSearchManager =
@@ -109,7 +109,7 @@ class LuceneSearchManagerFactory {
   LuceneSearchManager<QueryInfo> newVectorQueryManager(
       Query luceneQuery, VectorSearchCriteria criteria) {
 
-    VectorQuantization quantization = this.resolveQuantization(criteria.path());
+    VectorQuantization quantization = this.resolveQuantization(luceneQuery, criteria.path());
     boolean requiresRescoring = requiresRescoring(criteria, quantization);
     boolean requiresNestedAvgRescoring = requiresNestedAvgRescoring(criteria);
     LuceneSearchManager<QueryInfo> innerSearchManager =
@@ -142,7 +142,17 @@ class LuceneSearchManagerFactory {
             .orElse(false);
   }
 
-  private VectorQuantization resolveQuantization(FieldPath path) {
+  private VectorQuantization resolveQuantization(Query plan, FieldPath path) {
+    if (plan instanceof org.apache.lucene.search.MatchNoDocsQuery) {
+      return VectorQuantization.NONE;
+    }
+    if (this.fieldDefinitionResolver
+        instanceof com.xgen.mongot.index.definition.SearchFieldDefinitionResolver search) {
+      var rule = search.getTypeSetVectorRule(path, Optional.empty());
+      if (rule.isPresent()) {
+        return rule.get().quantization();
+      }
+    }
     return this.fieldDefinitionResolver
         .getVectorFieldSpecification(path)
         .map(VectorFieldSpecification::quantization)

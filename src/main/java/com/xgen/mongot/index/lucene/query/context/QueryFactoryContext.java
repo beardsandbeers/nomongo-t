@@ -63,14 +63,20 @@ public interface QueryFactoryContext {
   VectorQuantization getIndexedQuantization(FieldPath fieldPath, Optional<FieldPath> embeddedRoot)
       throws InvalidQueryException;
 
-  default boolean hasUnboundVectorRule(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return false;
-  }
+  record VectorField(
+      VectorSimilarity similarity,
+      VectorQuantization quantization,
+      Optional<VectorDimensions.Binding> binding,
+      boolean unbound) {}
 
-  /** Committed dimension and physical naming scheme for a learned vector path. */
-  default Optional<VectorDimensions.Binding> getVectorFieldBinding(
-      FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return Optional.empty();
+  default VectorField resolveVectorField(FieldPath path, Optional<FieldPath> root, int dimensions)
+      throws InvalidQueryException {
+    getQueryTimeMappingChecks().validateVectorField(path, root, dimensions);
+    return new VectorField(
+        getIndexedVectorSimilarityFunction(path, root),
+        getIndexedQuantization(path, root),
+        Optional.empty(),
+        false);
   }
 
   /** Returns the metrics updater tied to the index that this query targets. */

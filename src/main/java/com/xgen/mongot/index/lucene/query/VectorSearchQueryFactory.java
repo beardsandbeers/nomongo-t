@@ -100,10 +100,8 @@ class VectorSearchQueryFactory {
               path, path));
     }
 
-    boolean unbound = this.factoryContext.hasUnboundVectorRule(path, embeddedRoot);
-    this.factoryContext
-        .getQueryTimeMappingChecks()
-        .validateVectorField(path, embeddedRoot, queryVector.numDimensions());
+    var mappedField =
+        this.factoryContext.resolveVectorField(path, embeddedRoot, queryVector.numDimensions());
 
     // Reconcile with the indexed embedding encoding; see AutoEmbedQueryVectorReconciler.
     Optional<VectorAutoEmbedQuantization> autoEmbedQuantization =
@@ -140,8 +138,7 @@ class VectorSearchQueryFactory {
                     SingleQueryContext.createQueryRoot(queryContext.getIndexReader())))
             : Optional.empty();
 
-    VectorSimilarity indexedVectorSimilarity =
-        this.factoryContext.getIndexedVectorSimilarityFunction(path, embeddedRoot);
+    VectorSimilarity indexedVectorSimilarity = mappedField.similarity();
     if (indexedVectorSimilarity == VectorSimilarity.COSINE && queryVector.isZeroVector()) {
       throw new InvalidQueryException(
           "Cosine similarity cannot be calculated against a zero vector.");
@@ -166,12 +163,16 @@ class VectorSearchQueryFactory {
       throw new InvalidQueryException(
           "Query must be run in explain mode, because 'explainOptions' are present.");
     }
-    if (unbound) {
+    if (mappedField.unbound()) {
       return new MatchNoDocsQuery("No vectors observed at " + path);
     }
     String fieldName =
         getLuceneFieldName(
-            path, embeddedRoot, queryVector.getVectorType(), queryContext.getIndexReader());
+            path,
+            embeddedRoot,
+            queryVector.getVectorType(),
+            queryContext.getIndexReader(),
+            mappedField);
 
     Query childQuery;
     switch (criteria) {
@@ -526,13 +527,11 @@ class VectorSearchQueryFactory {
       FieldPath fieldPath,
       Optional<FieldPath> embeddedRoot,
       Vector.VectorType vectorType,
-      IndexReader reader)
-      throws InvalidQueryException {
-    var type =
-        VectorTypeFieldResolver.resolveTypeField(
-            this.factoryContext.getIndexedQuantization(fieldPath, embeddedRoot), vectorType);
+      IndexReader reader,
+      QueryFactoryContext.VectorField mappedField) {
+    var type = VectorTypeFieldResolver.resolveTypeField(mappedField.quantization(), vectorType);
     String ordinary = type.getLuceneFieldName(fieldPath, embeddedRoot);
-    var binding = this.factoryContext.getVectorFieldBinding(fieldPath, embeddedRoot);
+    var binding = mappedField.binding();
     if (binding.isEmpty()) {
       return ordinary;
     }

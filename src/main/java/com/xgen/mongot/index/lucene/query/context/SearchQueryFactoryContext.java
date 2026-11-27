@@ -217,20 +217,27 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
   }
 
   @Override
-  public boolean hasUnboundVectorRule(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-            .getTypeSetVectorRule(path, embeddedRoot)
-            .filter(rule -> rule.numDimensions().isEmpty())
-            .isPresent()
-        && this.fieldDefinitionResolver.vectorDimensions().get(path).isEmpty();
-  }
-
-  @Override
-  public Optional<VectorDimensions.Binding> getVectorFieldBinding(
-      FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return embeddedRoot.isPresent()
-        ? Optional.empty()
-        : this.fieldDefinitionResolver.vectorDimensions().binding(path.toString());
+  public VectorField resolveVectorField(FieldPath path, Optional<FieldPath> root, int dimensions)
+      throws InvalidQueryException {
+    var rule = this.fieldDefinitionResolver.getTypeSetVectorRule(path, root);
+    if (rule.isEmpty()) {
+      return QueryFactoryContext.super.resolveVectorField(path, root, dimensions);
+    }
+    var configured = rule.get();
+    var binding = this.fieldDefinitionResolver.vectorDimensions().binding(path.toString());
+    var expected =
+        configured.numDimensions().or(() -> binding.map(VectorDimensions.Binding::dimensions));
+    if (expected.isPresent() && expected.get() != dimensions) {
+      throw new InvalidQueryException(
+          String.format(
+              "vector field is indexed with %s dimensions but queried with %s",
+              expected.get(), dimensions));
+    }
+    if (configured.resolve(() -> Optional.of(dimensions)).isEmpty()) {
+      throw new InvalidQueryException("Query dimensions are incompatible with the vector mapping.");
+    }
+    return new VectorField(
+        configured.similarity(), configured.quantization(), binding, expected.isEmpty());
   }
 
   @Override
