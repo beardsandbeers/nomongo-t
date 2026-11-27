@@ -7,7 +7,12 @@
       "mappings": {
         "dynamic": false,
         "fields": {
-          "v": { "type": "vector", "numDimensions": 2, "similarity": "cosine", "bsonVectorOnly": true }
+          "v": {
+            "type": "vector",
+            "numDimensions": 2,
+            "similarity": "cosine",
+            "bsonVectorOnly": true
+          }
         }
       }
     }
