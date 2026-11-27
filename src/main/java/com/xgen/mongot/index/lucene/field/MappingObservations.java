@@ -2,16 +2,15 @@ package com.xgen.mongot.index.lucene.field;
 
 import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.util.FieldPath;
-import java.io.IOException;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.util.BytesRef;
 
 /** Exact BSON key segments for the typed fields in one successful Lucene document. */
@@ -20,13 +19,19 @@ public final class MappingObservations extends StoredField {
   public static final String VECTOR_SOURCE_PATH = "mongot.vectorSourcePath";
 
   public static final String STORED_V1 = "$meta/mappingObservationsV1";
-  public static final String NAME = "$meta/mappingObservationsV2";
+  public static final String INDEXED_V2 = "$meta/mappingObservationsV2";
+  public static final String NAME = "$meta/mappingObservationsV3";
+  public static final String PRESENCE_PREFIX = "$presence/";
   public static final String LONG_ENTRY_PREFIX = NAME + "/";
   // Ordinary entry terms start with a decimal length.
   public static final String LONG_ENTRY_MARKER = "long";
 
   public static boolean isInternalField(String field) {
-    return field.equals(STORED_V1) || field.equals(NAME) || field.startsWith(LONG_ENTRY_PREFIX);
+    return field.equals(STORED_V1)
+        || field.equals(INDEXED_V2)
+        || field.startsWith(INDEXED_V2 + "/")
+        || field.equals(NAME)
+        || field.startsWith(LONG_ENTRY_PREFIX);
   }
 
   public record Entry(String field, String segments) {
@@ -47,20 +52,28 @@ public final class MappingObservations extends StoredField {
 
   private final Set<Entry> entries = new HashSet<>();
 
+  private final Set<String> presentPaths = new HashSet<>();
+  private final String presenceField;
+
   public MappingObservations() {
-    super(NAME, new byte[0]);
+    this(Optional.empty());
   }
 
-  public void recordScalarFields(Document document, int start, FieldPath path, int scopeDepth) {
+  public MappingObservations(Optional<FieldPath> root) {
+    super(NAME, new byte[0]);
+    this.presenceField = PRESENCE_PREFIX + root.map(p -> p.getPathHierarchy().size()).orElse(0);
+  }
+
+  public void recordPresence(FieldPath path) {
+    this.presentPaths.add(String.join("\0", path.getSegments()));
+  }
+
+  public void recordScalarFields(Document document, int start, FieldPath path) {
     var fields = document.getFields();
     if (start == fields.size()) {
       return;
     }
-    var parts = path.getPathHierarchy();
-    String segments =
-        String.join(
-            "\0",
-            parts.subList(scopeDepth, parts.size()).stream().map(FieldPath::getLeaf).toList());
+    String segments = String.join("\0", path.getSegments());
     for (int i = start; i < fields.size(); ++i) {
       String name = fields.get(i).name();
       if (FieldName.TypeField.getTypeOf(name).isPresent()) {
@@ -89,6 +102,15 @@ public final class MappingObservations extends StoredField {
       }
       this.entries.add(new Entry(field.name(), segments));
     }
+    // A typed leaf already implies its presence. Each child implies its BSON ancestors.
+    var implied = new HashSet<String>();
+    for (String path : this.presentPaths) {
+      int split = path.lastIndexOf('\0');
+      if (split >= 0) implied.add(path.substring(0, split));
+    }
+    this.presentPaths.removeAll(implied);
+    this.entries.forEach(entry -> this.presentPaths.remove(entry.segments()));
+    this.presentPaths.forEach(path -> this.entries.add(new Entry(this.presenceField, path)));
     // The empty term marks every document written in this format, even if it has no entries.
     document.removeField(NAME);
     document.add(new StringField(NAME, new BytesRef(), Field.Store.NO));
@@ -102,13 +124,6 @@ public final class MappingObservations extends StoredField {
         document.add(new StringField(NAME, LONG_ENTRY_MARKER, Field.Store.NO));
         document.add(new StringField(LONG_ENTRY_PREFIX + encoded, new BytesRef(), Field.Store.NO));
       }
-    }
-  }
-
-  public static void read(BytesRef value, Set<Entry> entries) throws IOException {
-    var data = new ByteArrayDataInput(value.bytes, value.offset, value.length);
-    while (!data.eof()) {
-      entries.add(new Entry(data.readString(), data.readString()));
     }
   }
 }

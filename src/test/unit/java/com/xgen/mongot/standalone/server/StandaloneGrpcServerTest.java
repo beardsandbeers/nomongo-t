@@ -3123,10 +3123,11 @@ public class StandaloneGrpcServerTest {
                   .build());
       assertThat(revision.getActiveRevision()).isEqualTo(2);
       assertThat(f.query(id, query).getArray("results")).hasSize(1);
-      assertThat(fields.containsKey("ignored")).isFalse();
+      assertThat(fields.getDocument("ignored").getString("type").getValue()).isEqualTo("document");
       assertThat(fields.getDocument("fixed").getDocument("fields").containsKey("alias")).isFalse();
-      assertThat(fields.getDocument("inside").getDocument("fields").keySet())
-          .containsExactly("tag");
+      var inside = fields.getDocument("inside").getDocument("fields");
+      assertThat(inside.keySet()).containsExactly("tag", "v");
+      assertThat(inside.getDocument("v").getString("type").getValue()).isEqualTo("document");
       assertThat(
               fields
                   .getDocument("bits")
@@ -3261,7 +3262,7 @@ public class StandaloneGrpcServerTest {
       var literalExport =
           f.catalog.getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build());
       var fields = BsonDocument.parse(literalExport.getMappingsJson()).getDocument("fields");
-      assertThat(fields.keySet()).containsExactly("a.b");
+      assertThat(fields.keySet()).containsExactly("_id", "a.b");
       f.upsert(id, nested);
       f.upsert(id, numeric);
     }
@@ -3474,6 +3475,32 @@ public class StandaloneGrpcServerTest {
       f.ready(original, 1);
       f.ready(replay, 1);
       for (String query : queries) assertSameSingleHit(f, replay, original, query);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_skippedVectorAndNullAlias_preservesFieldPresence() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String v = bsonFloatVector(1, 0);
+      assertReplayQueries(
+          f,
+          "duplicate",
+          MIXED_VECTOR_MAPPING,
+          List.of("{_id:1,'a.b':" + v + ",a:{b:" + v + "}}"),
+          Map.of("{exists:{path:'a'}}", 1, exactVectorQuery("a.b", "[1,0]"), 1));
+      assertReplayQueries(
+          f,
+          "null-alias",
+          MIXED_VECTOR_MAPPING,
+          List.of("{_id:1,'a.b':null}", "{_id:2,a:{b:" + v + "}}"),
+          Map.of(
+              "{exists:{path:'a.b'}}",
+              2,
+              "{equals:{path:'a.b',value:null}}",
+              1,
+              exactVectorQuery("a.b", "[1,0]"),
+              1));
     }
   }
 

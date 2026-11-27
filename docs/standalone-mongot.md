@@ -194,18 +194,19 @@ refreshed export.
 Exported vector fields use `bsonVectorOnly: true`. Numeric arrays require an ordinary static
 vector mapping.
 
-Segments written by the earlier stored-observation format need a one-time read of those records
-on their first export. The server shares the resulting postings across snapshots of the segment,
-including after deletions. A restart or merge drops this in-memory index. Reindexing the source
-documents persists the current format.
+An exact-path export also preserves fields that matched `exists` or contained null even
+when no typed value was indexed. For example, two valid vectors in one document can share a
+dotted name while only one vector is searchable. A path observed solely through its presence
+is exported as an empty static `document` mapping. This lets the reindexed document match
+`exists` and null queries. Embedded-document roots with the same dotted name keep their own children.
 
-For documents that predate path recording, the server caches stored-field evidence per segment
-and applies the current reader’s deletions. Explicit mappings are always included. If the available
-evidence leaves more than one possible exported mapping, reindex the affected source documents.
-
-Indexes with literal and nested embedded-document roots sharing a dotted name also record the
-full BSON paths of their children. Older records that contain only a relative child path can be
-exported when the configured mappings identify its root or already specify every possible match.
+Indexes using a vector type set or aliased embedded-document roots need exact BSON paths for
+export. For segments written before those paths and field presence were recorded together,
+export checks field metadata against explicit mappings and live observations from all partitions.
+If those already cover every possible spelling, export succeeds. Otherwise it returns
+`FAILED_PRECONDITION`. Rebuild the affected index from its source documents before retrying export.
+Queries remain available during this compatibility check. Other Search indexes use the ordinary
+field-metadata export.
 
 The supported quantization settings are `none` (default), `scalar`, and `binary`.
 The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.

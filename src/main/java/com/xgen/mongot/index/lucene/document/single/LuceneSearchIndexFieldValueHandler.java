@@ -417,6 +417,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     // Check the current path to see if it's already indexed, since SortedDocValues does not allow
     // multiple values to be indexed. Note that we don't need to check the embeddedRoot since all
     // fields for the wrapped Lucene document have the same embedded root.
+    this.documentWrapper.observePresence(this.path);
     IndexableFieldFactory.addNullField(this.documentWrapper, this.path);
   }
 
@@ -489,7 +490,9 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void markFieldNameExists() {
-    IndexableFieldFactory.addFieldNamesField(this.documentWrapper, this.path);
+    if (IndexableFieldFactory.addFieldNamesField(this.documentWrapper, this.path)) {
+      this.documentWrapper.observePresence(this.path);
+    }
   }
 
   @Override

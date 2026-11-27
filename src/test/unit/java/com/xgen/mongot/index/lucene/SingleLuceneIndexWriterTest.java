@@ -409,7 +409,7 @@ public class SingleLuceneIndexWriterTest {
                   writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA=='),text:'reject'}")));
 
           try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
-            assertThat(exportFields(reader, resolver).keySet()).containsExactly("text");
+            assertThat(exportFields(reader, resolver).keySet()).containsExactly("_id", "text");
           }
           writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA==')}"));
           writer.commit(EncodedUserData.EMPTY);
@@ -428,7 +428,8 @@ public class SingleLuceneIndexWriterTest {
     }
 
     @Test
-    public void export_mixedFormatMerge_checksOnlySurvivingLegacyDocuments() throws Exception {
+    public void export_mixedFormatMerge_requiresRebuildUntilUncoveredOlderDocumentIsDeleted()
+        throws Exception {
       var definition = definition(Optional.of(2));
       var resolver = definition.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
       var path = FieldPath.parse("a.b");
@@ -458,7 +459,9 @@ public class SingleLuceneIndexWriterTest {
           writer.commit(EncodedUserData.EMPTY);
           try (var reader = DirectoryReader.open(directory)) {
             assertThat(reader.leaves()).hasSize(1);
-            assertThat(exportFields(reader, recovered).keySet()).containsAtLeast("a", "a.b");
+            assertThrows(
+                LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+                () -> exportFields(reader, recovered));
           }
           writer
               .getLuceneWriter()

@@ -727,6 +727,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
 
       var fields = this.luceneWriter.getFieldNames();
       return fields.contains(MappingObservations.NAME)
+              || fields.contains(MappingObservations.INDEXED_V2)
               || fields.contains(MappingObservations.STORED_V1)
           ? Sets.filter(fields, name -> !MappingObservations.isInternalField(name))
           : fields;

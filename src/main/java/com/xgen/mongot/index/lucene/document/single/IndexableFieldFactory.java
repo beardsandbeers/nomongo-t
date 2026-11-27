@@ -192,9 +192,9 @@ public class IndexableFieldFactory {
   }
 
   // Add path to metadata keeping track of the field names we have indexed for this lucene document.
-  static void addFieldNamesField(AbstractDocumentWrapper document, FieldPath path) {
+  static boolean addFieldNamesField(AbstractDocumentWrapper document, FieldPath path) {
     if (!document.getIndexCapabilities().supportsFieldExistsQuery()) {
-      return;
+      return false;
     }
 
     String pathString = path.toString();
@@ -207,7 +207,7 @@ public class IndexableFieldFactory {
           LuceneConfig.MAX_TERM_CHAR_LENGTH,
           pathString.substring(0, 20),
           lazy(() -> getLoggingId(document)));
-      return;
+      return false;
     }
 
     IndexableField indexableField =
@@ -217,6 +217,7 @@ public class IndexableFieldFactory {
             FIELD_NAME_FIELD_TYPE_NOT_STORED);
 
     document.put(indexableField);
+    return true;
   }
 
   static void addStringField(
