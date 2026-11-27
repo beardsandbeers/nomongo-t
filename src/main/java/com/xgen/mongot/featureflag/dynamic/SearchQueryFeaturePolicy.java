@@ -36,6 +36,7 @@ public final class SearchQueryFeaturePolicy {
       VectorSearchCriteria criteria, FeatureFlags featureFlags) throws InvalidQueryException {
     if (criteria instanceof ApproximateVectorSearchCriteria approx
         && approx.isAutoNumCandidates()
+        && !approx.isUnboundedStream()
         && !featureFlags.isEnabled(Feature.AUTO_NUM_CANDIDATES)) {
       throw new InvalidQueryException("numCandidates is required for approximate vector search");
     }

@@ -80,6 +80,18 @@ public class CatalogPrefilter {
       VectorEncoding encoding,
       FormatFactory formats)
       throws Exception {
+    build(inputs, staging, index, docs, encoding, formats, java.util.function.Function.identity());
+  }
+
+  static void build(
+      Path inputs,
+      Path staging,
+      Path index,
+      int docs,
+      VectorEncoding encoding,
+      FormatFactory formats,
+      java.util.function.Function<byte[], byte[]> encodeBytes)
+      throws Exception {
     boolean useBytes = encoding == VectorEncoding.BYTE;
     // Flush bounded batches; build the graph once in the final codec merge.
     var flat = formats.create(Integer.MAX_VALUE, 1, null);
@@ -101,7 +113,9 @@ public class CatalogPrefilter {
         }
         var doc = new Document();
         if (useBytes) {
-          doc.add(new KnnByteVectorField("vector", buffer, VectorSimilarityFunction.EUCLIDEAN));
+          doc.add(
+              new KnnByteVectorField(
+                  "vector", encodeBytes.apply(buffer), VectorSimilarityFunction.EUCLIDEAN));
         } else {
           row.get(0, vector);
           doc.add(new KnnFloatVectorField("vector", vector, VectorSimilarityFunction.EUCLIDEAN));

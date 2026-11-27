@@ -156,6 +156,27 @@ public class LuceneIndexSearcherReferenceTest {
     }
   }
 
+  @Test
+  public void close_attachedCursor_closesBeforeReaderRelease() throws Exception {
+    try (var fixture = new Fixture();
+        var pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+        var ref = fixture.reference(pool, this.phantomCleanup)) {
+      var reader = ref.getIndexSearcher().getIndexReader();
+      int refs = reader.getRefCount();
+      var closed = new AtomicBoolean();
+      ref.attachCursor(
+          () -> {
+            assertThat(reader.getRefCount()).isEqualTo(refs);
+            assertThat(closed.getAndSet(true)).isFalse();
+          });
+
+      ref.close();
+
+      assertThat(closed.get()).isTrue();
+      assertThat(reader.getRefCount()).isEqualTo(refs - 1);
+    }
+  }
+
   private static final class InterruptedSearch implements CollectorManager<SimpleCollector, Void> {
     private final CountDownLatch started = new CountDownLatch(1);
     private final CountDownLatch release = new CountDownLatch(1);

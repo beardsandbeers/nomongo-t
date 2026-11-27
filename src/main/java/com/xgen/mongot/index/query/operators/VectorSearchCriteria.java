@@ -36,6 +36,10 @@ public sealed interface VectorSearchCriteria extends DocumentEncodable
 
   int limit();
 
+  default boolean isUnboundedStream() {
+    return false;
+  }
+
   boolean returnStoredSource();
 
   Optional<VectorEmbeddedOptions> embeddedOptions();
@@ -85,6 +89,9 @@ public sealed interface VectorSearchCriteria extends DocumentEncodable
 
   class Fields {
 
+    static final Field.Optional<Integer> OPTIONAL_LIMIT =
+        Field.builder("limit").intField().mustBePositive().optional().noDefault();
+
     static final Field.Required<Integer> LIMIT =
         Field.builder("limit").intField().mustBePositive().required();
 
@@ -113,6 +120,9 @@ public sealed interface VectorSearchCriteria extends DocumentEncodable
     public static final Field.WithDefault<Boolean> STORED_SOURCE =
         Field.builder("returnStoredSource").booleanField().optional().withDefault(false);
 
+    static final Field.Optional<BsonValue> STREAM =
+        Field.builder("stream").unparsedValueField().optional().noDefault();
+
     static final Field.Optional<StreamingOptions> STREAMING =
         Field.builder("streaming")
             .classField(StreamingOptions::fromBson)
@@ -126,6 +136,19 @@ public sealed interface VectorSearchCriteria extends DocumentEncodable
             .disallowUnknownFields()
             .optional()
             .noDefault();
+  }
+
+  static Optional<StreamingOptions> parseStreaming(DocumentParser parser)
+      throws BsonParseException {
+    var legacy = parser.getField(Fields.STREAMING).unwrap();
+    var stream = parser.getField(Fields.STREAM).unwrap();
+    if (stream.isEmpty()) {
+      return legacy;
+    }
+    if (legacy.isPresent()) {
+      return parser.getContext().handleSemanticError("stream and streaming cannot be combined");
+    }
+    return StreamingOptions.parseStream(parser.getContext().child("stream"), stream.get());
   }
 
   static VectorSearchCriteria fromBson(

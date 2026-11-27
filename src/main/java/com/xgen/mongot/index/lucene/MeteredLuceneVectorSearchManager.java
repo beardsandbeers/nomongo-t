@@ -34,6 +34,11 @@ public class MeteredLuceneVectorSearchManager<T> implements LuceneSearchManager<
   }
 
   @Override
+  public boolean permitsScoreInversions() {
+    return this.searchManager.permitsScoreInversions();
+  }
+
+  @Override
   public T initialSearch(LuceneIndexSearcherReference searcherReference, int batchSize)
       throws IOException, InvalidQueryException {
 
@@ -46,7 +51,9 @@ public class MeteredLuceneVectorSearchManager<T> implements LuceneSearchManager<
           };
       metric.record(approximateCriteria.resolveNumCandidates());
     }
-    this.metricsUpdater.getLimitPerQuery().record(this.criteria.limit());
+    if (!this.criteria.isUnboundedStream()) {
+      this.metricsUpdater.getLimitPerQuery().record(this.criteria.limit());
+    }
 
     return Timed.<T, IOException, InvalidQueryException>supplier2(
         this.metricsUpdater.getVectorSearchInitialTopDocsLatencyTimer(),

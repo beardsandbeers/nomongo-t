@@ -1,0 +1,13 @@
+filter,actual_acceptance,mode,selected,sample_matches,sample_size,median_ms,p95_ms,recall100_pct
+categories_2,0.5458,auto,classic,264,512,14.06,49.41,98.73
+categories_2,0.5458,classic,classic,0,0,13.84,49.47,98.73
+categories_2,0.5458,stream,stream,0,0,15.21,24.58,91.94
+categories_4,0.6970,auto,classic,340,512,15.57,39.17,99.03
+categories_4,0.6970,classic,classic,0,0,15.35,38.44,99.03
+categories_4,0.6970,stream,stream,0,0,15.85,19.03,95.56
+categories_6,0.7741,auto,stream,381,512,16.77,18.56,99.17
+categories_6,0.7741,classic,classic,0,0,17.38,23.87,99.11
+categories_6,0.7741,stream,stream,0,0,16.4,17.89,99.17
+price_capped,0.0937,auto,classic,47,512,68.6,77.9,99.48
+price_capped,0.0937,classic,classic,0,0,68.46,75.87,99.48
+price_capped,0.0937,stream,stream,0,0,33.12,413.86,81.2

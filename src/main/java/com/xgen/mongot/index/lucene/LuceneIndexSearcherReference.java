@@ -21,7 +21,9 @@ import java.lang.ref.WeakReference;
 import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.lucene.search.ReferenceManager;
+import org.apache.lucene.util.IOUtils;
 
 /**
  * LuceneIndexSearcherReference couples together an IndexSearcher with the SearcherManager or other
@@ -77,8 +79,30 @@ public class LuceneIndexSearcherReference implements Closeable {
     }
   }
 
+  private static final Closeable CLOSED = () -> {};
+  private final AtomicReference<Closeable> cursor = new AtomicReference<>();
   private final LuceneIndexSearcher indexSearcher;
   private final Closeable cleaning;
+
+  // The phantom action may hold the cursor, but must never retain its owning reference.
+  private record CloseWithCursor(AtomicReference<Closeable> cursor, Closeable release)
+      implements CloseablePhantomCleaner.NoRefCloseable {
+    @Override
+    public void close() throws IOException {
+      var owned = this.cursor.getAndSet(CLOSED);
+      if (owned != CLOSED) {
+        // Join active read-ahead before releasing the searcher, including on phantom cleanup.
+        IOUtils.close(owned, this.release);
+      }
+    }
+  }
+
+  void attachCursor(Closeable owned) throws IOException {
+    if (!this.cursor.compareAndSet(null, owned)) {
+      owned.close();
+      throw new IllegalStateException("Searcher already closed or owns a cursor");
+    }
+  }
 
   private static void releaseSearcher(
       ReferenceManager<LuceneIndexSearcher> searcherManager, LuceneIndexSearcher indexSearcher)
@@ -101,11 +125,14 @@ public class LuceneIndexSearcherReference implements Closeable {
                 this,
                 new CloseablePhantomCleaner.CleanerThreadAction(
                     metricsUpdater.getPhantomSearcherCleanupCounter(),
-                    new Cleaning(searcherManager, indexSearcher, tasks)))
-            : () -> {
-              tasks.ifPresent(DrainingExecutor::close);
-              releaseSearcher(searcherManager, indexSearcher);
-            };
+                    new CloseWithCursor(
+                        this.cursor, new Cleaning(searcherManager, indexSearcher, tasks))))
+            : new CloseWithCursor(
+                this.cursor,
+                () -> {
+                  tasks.ifPresent(DrainingExecutor::close);
+                  releaseSearcher(searcherManager, indexSearcher);
+                });
   }
 
   public static LuceneIndexSearcherReference create(

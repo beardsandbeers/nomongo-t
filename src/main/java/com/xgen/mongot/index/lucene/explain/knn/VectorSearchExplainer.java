@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.lucene.search.KnnCollector;
+import org.bson.BsonDocument;
 import org.bson.BsonValue;
 
 public class VectorSearchExplainer implements FeatureExplainer {
@@ -25,6 +26,9 @@ public class VectorSearchExplainer implements FeatureExplainer {
   private final Map<Object, SegmentStatistics> segmentStats = new ConcurrentHashMap<>();
 
   private Optional<VectorSearchNumCandidatesSpec> numCandidates = Optional.empty();
+
+  private Optional<BsonDocument> streamRouting = Optional.empty();
+  private Optional<BsonDocument> streamStats = Optional.empty();
 
   private final ImmutableMap<Integer, TracingInformation> tracingInfos;
 
@@ -40,6 +44,14 @@ public class VectorSearchExplainer implements FeatureExplainer {
 
   public SegmentStatistics getSegmentStats(Object contextId) {
     return this.segmentStats.computeIfAbsent(contextId, unused -> new SegmentStatistics());
+  }
+
+  public void setStreamRouting(BsonDocument decision) {
+    this.streamRouting = Optional.of(decision);
+  }
+
+  public void setStreamStats(BsonDocument stats) {
+    this.streamStats = Optional.of(stats);
   }
 
   public void setNumCandidates(VectorSearchNumCandidatesSpec numCandidates) {
@@ -62,6 +74,12 @@ public class VectorSearchExplainer implements FeatureExplainer {
     // VectorSearchQueryFactory#setAutoNumCandidatesExplain), so explicit-numCandidates queries emit
     // nothing here. Segment stats and tracing below are execution-level and stay behind the guard.
     this.numCandidates.ifPresent(builder::numCandidates);
+    if (this.streamRouting.isPresent()) {
+      var stats = this.streamStats.map(BsonDocument::clone).orElseGet(BsonDocument::new);
+      builder.streamStats(stats.append("routing", this.streamRouting.get()));
+    } else {
+      this.streamStats.ifPresent(builder::streamStats);
+    }
 
     if (!verbosity.isGreaterThan(Explain.Verbosity.QUERY_PLANNER)) {
       return;

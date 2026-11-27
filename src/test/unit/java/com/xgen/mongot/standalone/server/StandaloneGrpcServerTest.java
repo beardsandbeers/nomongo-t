@@ -3,6 +3,7 @@ package com.xgen.mongot.standalone.server;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import com.google.errorprone.annotations.Var;
 import com.google.protobuf.ByteString;
 import com.xgen.mongot.catalog.IndexCatalog;
 import com.xgen.mongot.config.backup.JournalEntryIdentity;
@@ -3405,9 +3406,7 @@ public class StandaloneGrpcServerTest {
       var baseline = f.queries.vectorSearch(request.setQueryBson(bson("{" + fields + "}")).build());
       var response =
           f.queries.vectorSearch(
-              request
-                  .setQueryBson(bson("{" + fields + ",streaming:{warmupWidth:2,refillEvery:1}}"))
-                  .build());
+              request.setQueryBson(bson("{" + fields + ",stream:true}")).build());
 
       var hits = new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results");
       assertThat(hits).hasSize(2);
@@ -3416,6 +3415,26 @@ public class StandaloneGrpcServerTest {
       assertThat(hits)
           .isEqualTo(
               new RawBsonDocument(baseline.getBatchBson().toByteArray()).getArray("results"));
+      var auto =
+          f.queries.vectorSearch(
+              request
+                  .clone()
+                  .setQueryBson(bson("{" + fields + ",stream:'auto'}"))
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+      var routing =
+          new RawBsonDocument(auto.getExplainBson().toByteArray())
+              .getDocument("streamStats")
+              .getDocument("routing");
+      assertThat(routing.getString("selected").getValue()).isEqualTo("classic");
+      var segments = routing.getArray("segments");
+      assertThat(segments).isNotEmpty();
+      assertThat(
+              segments.getValues().stream()
+                  .map(v -> v.asDocument().getInt64("vectorCount").longValue())
+                  .mapToLong(Long::longValue)
+                  .sum())
+          .isEqualTo(3);
       var capped =
           assertThrows(
               StatusRuntimeException.class,
@@ -3426,6 +3445,87 @@ public class StandaloneGrpcServerTest {
                           .build()));
       assertThat(capped.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
       assertThat(capped).hasMessageThat().contains("maxCachedNodes=1");
+    }
+  }
+
+  @Test
+  public void vectorStreams_partitionedStages_resumeAndRespectAutoLimit() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var vector =
+          f.catalog
+              .createIndex(
+                  CreateIndexRequest.newBuilder()
+                      .setName("vec")
+                      .setType(IndexType.INDEX_TYPE_VECTOR_SEARCH)
+                      .setDefinitionBson(
+                          bson(
+                              "{numPartitions:2,storedSource:{include:['label']},fields:[{type:'vector',path:'v',numDimensions:8,similarity:'euclidean',quantization:'binary'}]}"))
+                      .build())
+              .getIndexId();
+      f.ready(vector, 1);
+      var search =
+          f.create(
+              "search",
+              "{numPartitions:2,mappings:{dynamic:false,fields:{v:{type:'vector',numDimensions:8,similarity:'euclidean'}}}}");
+      for (String id : java.util.List.of(vector, search)) {
+        var docs =
+            UpsertRequest.newBuilder()
+                .setIndexId(id)
+                .setWriteConcern(DocumentWriteConcern.DOCUMENT_WRITE_CONCERN_VISIBLE);
+        for (int i = 1; i <= 17; i++) {
+          docs.addDocumentsBson(bson("{_id:" + i + ",label:'item',v:[" + i + ",1.0,0,0,0,0,0,0]}"));
+        }
+        f.docs.upsert(docs.build());
+        boolean vectorStage = id.equals(vector);
+        for (boolean auto : java.util.List.of(false, true)) {
+          @Var
+          var stage =
+              "{path:'v',queryVector:[1.0,1.0,0,0,0,0,0,0],numCandidates:3,"
+                  + (vectorStage ? "returnStoredSource:true," : "")
+                  + (auto ? "limit:3,stream:'auto'" : "stream:true")
+                  + "}";
+          if (!vectorStage) {
+            stage = "{vectorSearch:" + stage + "}";
+          }
+          var request =
+              QueryRequest.newBuilder()
+                  .setIndexId(id)
+                  .setBatchSize(2)
+                  .setQueryBson(bson(stage))
+                  .setExplainVerbosityValue(
+                      auto ? ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS.getNumber() : 0)
+                  .build();
+          @Var var page = vectorStage ? f.queries.vectorSearch(request) : f.queries.search(request);
+          var seen = new java.util.HashSet<org.bson.BsonValue>();
+          @Var int pages = 0;
+          while (true) {
+            var results =
+                new RawBsonDocument(page.getBatchBson().toByteArray()).getArray("results");
+            for (var hit : results) {
+              assertThat(seen.add(hit.asDocument().get("_id"))).isTrue();
+              if (vectorStage) {
+                assertThat(
+                        hit.asDocument().getDocument("storedSource").getString("label").getValue())
+                    .isEqualTo("item");
+              }
+            }
+            pages++;
+            assertThat(pages).isAtMost(20);
+            if (page.getCursorId() == 0) {
+              break;
+            }
+            page =
+                f.queries.getMore(
+                    GetMoreRequest.newBuilder()
+                        .setCursorId(page.getCursorId())
+                        .setBatchSize(2)
+                        .build());
+          }
+          assertThat(seen).hasSize(auto ? 3 : 17);
+          assertThat(pages).isGreaterThan(1);
+        }
+      }
     }
   }
 
@@ -3458,8 +3558,7 @@ public class StandaloneGrpcServerTest {
               .build());
 
       var request = QueryRequest.newBuilder().setIndexId(id);
-      String fields =
-          "{path:'v',queryVector:[0.01,0.01,0.01,0.01],limit:1,numCandidates:4,streaming:";
+      String fields = "{path:'v',queryVector:[0.01,0.01,0.01,0.01],limit:1,numCandidates:4,stream:";
       var normal = f.queries.vectorSearch(request.setQueryBson(bson(fields + "{}}")).build());
       var full =
           f.queries.vectorSearch(request.setQueryBson(bson(fields + "{rescoreAll:true}}")).build());
@@ -3506,7 +3605,7 @@ public class StandaloneGrpcServerTest {
               .addDocumentsBson(bson("{_id:'g',v:[-30,-20,-10,0,0,0,0,0]}"));
       f.docs.upsert(docs.build());
 
-      String fields = "{path:'v',queryVector:" + target + ",limit:1,numCandidates:8,streaming:";
+      String fields = "{path:'v',queryVector:" + target + ",limit:1,numCandidates:8,stream:";
       var request = QueryRequest.newBuilder().setIndexId(id);
       var standard = f.queries.vectorSearch(request.setQueryBson(bson(fields + "{}}")).build());
       var full =
@@ -3536,13 +3635,36 @@ public class StandaloneGrpcServerTest {
               .setQueryBson(
                   bson(
                       "{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],"
-                          + "limit:1,numCandidates:2,streaming:{}}}"))
+                          + "limit:1,numCandidates:2,stream:true}}"))
               .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_EXECUTION_STATS);
       var response = f.queries.search(request.build());
 
       assertThat(new RawBsonDocument(response.getBatchBson().toByteArray()).getArray("results"))
           .hasSize(1);
-      assertThat(response.getExplainBson()).isNotEmpty();
+      var detail =
+          new RawBsonDocument(response.getExplainBson().toByteArray()).getDocument("streamStats");
+      assertThat(detail.getArray("segments")).hasSize(1);
+      var qp =
+          f.queries.search(
+              request
+                  .setExplainVerbosity(ExplainVerbosity.EXPLAIN_VERBOSITY_QUERY_PLANNER)
+                  .build());
+      var plan = new RawBsonDocument(qp.getExplainBson().toByteArray()).getDocument("streamStats");
+      assertThat(plan.getString("initialScoreBudgetSource").getValue()).isEqualTo("derived");
+      assertThat(plan.containsKey("segments")).isFalse();
+      assertThat(plan.containsKey("prefetchWorkLimit")).isFalse();
+
+      var open =
+          f.queries.search(
+              request
+                  .setQueryBson(
+                      bson(
+                          "{vectorSearch:{path:'embedding',queryVector:[1.0,0.0,0.0],numCandidates:2,"
+                              + "stream:{lookaheadHits:17}}}"))
+                  .build());
+      var openPlan =
+          new RawBsonDocument(open.getExplainBson().toByteArray()).getDocument("streamStats");
+      assertThat(openPlan.getInt32("prefetchWorkLimit").getValue()).isEqualTo(17);
     }
   }
 

@@ -32,10 +32,20 @@ import org.apache.lucene.store.FSDirectory;
 
 /** Compare ordinary and streaming queries against the same exact neighbors across codecs. */
 public class CatalogCodecBenchmark {
-  private static final StreamingOptions OPTIONS =
-      Boolean.getBoolean("catalog.codecDefaultWalk")
-          ? new StreamingOptions(64, 1024, 8, 8, 250000)
-          : new StreamingOptions(2048, 8192, 128, 256, 250000);
+  private static final StreamingOptions OPTIONS = streamOptions();
+
+  private static StreamingOptions streamOptions() {
+    if (Boolean.getBoolean("catalog.stream")) {
+      var defaults = StreamingOptions.defaults();
+      int visits = Integer.getInteger("catalog.warmupVisits", 0);
+      return new StreamingOptions(
+          0, visits, 0, 0, defaults.maxCachedNodes(), false, defaults.adaptive());
+    }
+    return Boolean.getBoolean("catalog.codecDefaultWalk")
+        ? new StreamingOptions(64, 1024, 8, 8, 250000)
+        : new StreamingOptions(2048, 8192, 128, 256, 250000);
+  }
+
   private static final StreamingOptions FULL =
       new StreamingOptions(2048, 8192, 128, 256, 250000, true);
   private static final BinaryQuantizedVectorRescorer RESCORER =
@@ -62,10 +72,16 @@ public class CatalogCodecBenchmark {
     return truth == null ? "" : Integer.toString(CatalogCodecTruth.overlap(ids, depth, truth, k));
   }
 
+  private static boolean usesBytes(String kind) {
+    return kind.startsWith("i8") || kind.equals("bit");
+  }
+
   static void verify(IndexReader reader, String kind, boolean bytes) throws Exception {
     String expected =
         switch (kind) {
           case "f32", "i8" -> "Lucene99HnswVectorsFormat";
+          case "bit" ->
+              com.xgen.mongot.index.lucene.quantization.Mongot01042HnswBitVectorsFormat.NAME;
           case "scalar" -> "Lucene99HnswScalarQuantizedVectorsFormat";
           case "f32-binary", "i8-binary" ->
               com.xgen.mongot.index.lucene.quantization.Mongot01042HnswBinaryQuantizedVectorsFormat
@@ -93,7 +109,8 @@ public class CatalogCodecBenchmark {
           || values.size() != leaf.maxDoc()
           || graph.size() != values.size()
           || graph.numLevels() < 2
-          || values.dimension() != CatalogPrefilter.DIMS)
+          || values.dimension()
+              != (kind.equals("bit") ? (CatalogPrefilter.DIMS + 7) / 8 : CatalogPrefilter.DIMS))
         throw new IllegalStateException("Wrong index for " + kind);
     }
   }
@@ -108,7 +125,7 @@ public class CatalogCodecBenchmark {
       int repeat,
       PrintWriter out)
       throws Exception {
-    boolean bytes = kind.startsWith("i8"), binary = kind.endsWith("-binary");
+    boolean bytes = usesBytes(kind), binary = kind.endsWith("-binary");
     Query filter = trial.filter.query();
     Query query =
         bytes
@@ -151,6 +168,17 @@ public class CatalogCodecBenchmark {
         || Arrays.stream(poolIds).distinct().count() != poolIds.length
         || Arrays.stream(poolIds).anyMatch(id -> !trial.filter.allowed().get(id)))
       throw new AssertionError("Invalid pool");
+    // Time the primary (k=100) binary policy before the diagnostic full-pool rerank reads the same
+    // vectors.
+    boolean measurePrimaryFirst = binary && OPTIONS.adaptive().isPresent();
+    var primary = RankedStreamBenchmark.criteria(100, trial.candidates, Optional.empty());
+    long primaryStart = System.nanoTime();
+    int[] primaryResult =
+        measurePrimaryFirst
+            ? ids(
+                RESCORER.rescore(searcher, pool, primary, BinaryQuantizedRescoreQuery.from(query)))
+            : poolIds;
+    long primaryNanos = System.nanoTime() - primaryStart;
     // Full-pool rescore is independent of the output limit. Keep its top 100 for all
     // cutoffs.
     long fullStart = System.nanoTime();
@@ -167,12 +195,15 @@ public class CatalogCodecBenchmark {
       var criteria = RankedStreamBenchmark.criteria(k, trial.candidates, Optional.empty());
       long defaultStart = System.nanoTime();
       int[] result =
-          binary
-              ? ids(
-                  RESCORER.rescore(
-                      searcher, pool, criteria, BinaryQuantizedRescoreQuery.from(query)))
-              : poolIds;
-      long defaultNanos = System.nanoTime() - defaultStart;
+          measurePrimaryFirst && k == 100
+              ? primaryResult
+              : binary
+                  ? ids(
+                      RESCORER.rescore(
+                          searcher, pool, criteria, BinaryQuantizedRescoreQuery.from(query)))
+                  : poolIds;
+      long defaultNanos =
+          measurePrimaryFirst && k == 100 ? primaryNanos : System.nanoTime() - defaultStart;
       int after = CatalogCodecTruth.overlap(full, k, nativeTruth, k);
       int available = CatalogCodecTruth.overlap(poolIds, trial.candidates, nativeTruth, k);
       if (after != available)
@@ -216,7 +247,7 @@ public class CatalogCodecBenchmark {
     var out = new PrintWriter(System.out);
     out.println(
         "query,filter,codec,k,native_hits,source_hits,cached_on_open,cached_at_k,prefix_ms,status");
-    boolean bytes = kind.startsWith("i8");
+    boolean bytes = usesBytes(kind);
     for (int index = -Math.min(6, probes.size()); index < probes.size(); index++) {
       int q = Math.floorMod(index, probes.size());
       var probe = probes.get(q);
@@ -283,10 +314,20 @@ public class CatalogCodecBenchmark {
 
   public static void main(String[] args) throws Exception {
     if (args.length != 5)
-      throw new IllegalArgumentException("codec|byte-truth leaf0 leaf1 queries.f32 truth.tsv");
+      throw new IllegalArgumentException(
+          "codec|byte-truth|bit-truth leaf0 leaf1 queries.f32 truth.tsv");
     boolean cursorOnly = args[0].startsWith("cursor-");
     String kind = cursorOnly ? args[0].substring("cursor-".length()) : args[0];
     var probes = CatalogCodecTruth.probes(Path.of(args[3]));
+    if (kind.equals("bit") || kind.equals("bit-truth")) {
+      probes =
+          probes.stream()
+              .map(
+                  q ->
+                      new CatalogCodecTruth.Probe(
+                          q.floats(), CatalogCodecIndex.packSigns(q.bytes())))
+              .toList();
+    }
     try (var d0 = FSDirectory.open(Path.of(args[1]));
         var d1 = FSDirectory.open(Path.of(args[2]));
         var reader = new MultiReader(DirectoryReader.open(d0), DirectoryReader.open(d1))) {
@@ -294,14 +335,16 @@ public class CatalogCodecBenchmark {
       searcher.setQueryCache(null);
       var filters = CatalogCodecTruth.cases(searcher);
       String digest = CatalogCodecTruth.identity(reader, filters);
-      if (kind.equals("byte-truth")) {
+      if (kind.equals("byte-truth") || kind.equals("bit-truth")) {
         try (var out = new PrintWriter(Files.newBufferedWriter(Path.of(args[4])))) {
           out.println(
               String.join("\t", digest, "-", CatalogCodecTruth.coordinates(reader, true, true)));
           for (int i = 0; i < probes.size(); i++)
             for (var f : filters) {
               String ids =
-                  RankedStreamBenchmark.exact(reader, f, probes.get(i).bytes()).stream()
+                  RankedStreamBenchmark.exact(
+                          reader, f, probes.get(i).bytes(), kind.equals("bit-truth"))
+                      .stream()
                       .map(h -> Integer.toString(h.doc()))
                       .collect(Collectors.joining(" "));
               out.printf("%d\t%s\t-\t%s%n", i, f.name(), ids);
@@ -310,10 +353,10 @@ public class CatalogCodecBenchmark {
         }
         return;
       }
-      verify(reader, kind, kind.startsWith("i8"));
+      verify(reader, kind, usesBytes(kind));
       var lines = Files.readAllLines(Path.of(args[4]));
       String[] fingerprints = lines.getFirst().split("\t");
-      boolean byteInput = kind.startsWith("i8");
+      boolean byteInput = usesBytes(kind);
       if (!digest.equals(fingerprints[0])
           || !CatalogCodecTruth.coordinates(reader, byteInput, byteInput)
               .equals(fingerprints[byteInput ? 2 : 1]))

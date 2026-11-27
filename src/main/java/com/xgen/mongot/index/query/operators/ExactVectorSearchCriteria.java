@@ -23,7 +23,7 @@ public record ExactVectorSearchCriteria(
   public static ExactVectorSearchCriteria fromBson(
       DocumentParser parser, FieldPath path, VectorSearchFilter.Type filterType)
       throws BsonParseException {
-    if (parser.getField(Fields.STREAMING).unwrap().isPresent()) {
+    if (VectorSearchCriteria.parseStreaming(parser).isPresent()) {
       parser.getContext().handleSemanticError("streaming requires approximate vector search");
     }
     if (!parser.getField(Fields.EXACT).unwrap()) {

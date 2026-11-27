@@ -97,13 +97,15 @@ class LuceneSearchManagerFactory {
     boolean requiresRescoring = requiresRescoring(criteria, quantization);
     boolean requiresNestedAvgRescoring = requiresNestedAvgRescoring(criteria);
     LuceneSearchManager<QueryInfo> innerSearchManager =
-        new LuceneCachingVectorSearchManager(
-            luceneQuery,
-            criteria,
-            requiresRescoring ? Optional.of(this.rescorer) : Optional.empty(),
-            requiresNestedAvgRescoring
-                ? Optional.of(new NestedAvgVectorRescorer())
-                : Optional.empty());
+        criteria.isUnboundedStream()
+            ? new LuceneStreamingSearchManager(luceneQuery)
+            : new LuceneCachingVectorSearchManager(
+                luceneQuery,
+                criteria,
+                requiresRescoring ? Optional.of(this.rescorer) : Optional.empty(),
+                requiresNestedAvgRescoring
+                    ? Optional.of(new NestedAvgVectorRescorer())
+                    : Optional.empty());
     return new MeteredLuceneVectorSearchManager<>(
         this.metricsUpdater, innerSearchManager, criteria, quantization);
   }
@@ -115,13 +117,15 @@ class LuceneSearchManagerFactory {
     boolean requiresRescoring = requiresRescoring(criteria, quantization);
     boolean requiresNestedAvgRescoring = requiresNestedAvgRescoring(criteria);
     LuceneSearchManager<QueryInfo> innerSearchManager =
-        new LuceneVectorSearchManager(
-            luceneQuery,
-            criteria,
-            requiresRescoring ? Optional.of(this.rescorer) : Optional.empty(),
-            requiresNestedAvgRescoring
-                ? Optional.of(new NestedAvgVectorRescorer())
-                : Optional.empty());
+        criteria.isUnboundedStream()
+            ? new LuceneStreamingSearchManager(luceneQuery)
+            : new LuceneVectorSearchManager(
+                luceneQuery,
+                criteria,
+                requiresRescoring ? Optional.of(this.rescorer) : Optional.empty(),
+                requiresNestedAvgRescoring
+                    ? Optional.of(new NestedAvgVectorRescorer())
+                    : Optional.empty());
     return new MeteredLuceneVectorSearchManager<>(
         this.metricsUpdater, innerSearchManager, criteria, quantization);
   }

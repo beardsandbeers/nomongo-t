@@ -347,6 +347,7 @@ public class VectorSearchCommand implements Command {
     }
 
     if (!vectorSearchQuery.returnStoredSource()
+        && !vectorSearchQuery.criteria().isUnboundedStream()
         && !queryCursorOptions.equals(QueryCursorOptions.empty())) {
       throw new InvalidQueryException(
           "cursor options are only supported for vector search when returnStoredSource is true");
@@ -452,7 +453,8 @@ public class VectorSearchCommand implements Command {
               this.embedder.findEmbedRequestInfo(
                   optionalIndex.get().getDefinition(), vectorSearchQuery));
       var context = buildQueryExecutionContext();
-      if (vectorSearchQuery.returnStoredSource()) {
+      if (vectorSearchQuery.returnStoredSource()
+          || materializedQuery.materializedCriteria().isUnboundedStream()) {
         return getBatch(
             materializedQuery,
             context,

@@ -22,6 +22,7 @@ public record SearchExplainInformation(
     Optional<ResourceUsageOutput> resourceUsage,
     Optional<List<VectorSearchTracingSpec>> vectorSearchTracingInfo,
     Optional<List<VectorSearchSegmentStatsSpec>> vectorSearchSegmentStats,
+    Optional<BsonDocument> streamStats,
     Optional<BsonDocument> vectorliteStats,
     Optional<BsonDocument> vectorliteTrace,
     Optional<VectorSearchNumCandidatesSpec> numCandidates,
@@ -118,6 +119,8 @@ public record SearchExplainInformation(
             .optional()
             .noDefault();
 
+    static final Field.Optional<BsonDocument> STREAM_STATS =
+        Field.builder("streamStats").documentField().optional().noDefault();
     static final Field.Optional<BsonDocument> VECTORLITE_STATS =
         Field.builder("vectorliteStats").documentField().optional().noDefault();
 
@@ -163,6 +166,7 @@ public record SearchExplainInformation(
         parser.getField(Fields.RESOURCE_USAGE).unwrap(),
         parser.getField(Fields.VECTOR_TRACING).unwrap(),
         parser.getField(Fields.VECTOR_SEARCH_LUCENE_SEGMENT_STATS).unwrap(),
+        parser.getField(Fields.STREAM_STATS).unwrap(),
         parser.getField(Fields.VECTORLITE_STATS).unwrap(),
         parser.getField(Fields.VECTORLITE_TRACE).unwrap(),
         parser.getField(Fields.NUM_CANDIDATES).unwrap(),
@@ -192,6 +196,7 @@ public record SearchExplainInformation(
         .field(Fields.RESOURCE_USAGE, this.resourceUsage)
         .field(Fields.VECTOR_TRACING, this.vectorSearchTracingInfo)
         .field(Fields.VECTOR_SEARCH_LUCENE_SEGMENT_STATS, this.vectorSearchSegmentStats)
+        .field(Fields.STREAM_STATS, this.streamStats)
         .field(Fields.VECTORLITE_STATS, this.vectorliteStats)
         .field(Fields.VECTORLITE_TRACE, this.vectorliteTrace)
         .field(Fields.NUM_CANDIDATES, this.numCandidates)

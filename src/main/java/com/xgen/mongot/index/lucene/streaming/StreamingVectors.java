@@ -20,10 +20,34 @@ import org.apache.lucene.util.quantization.QuantizedVectorsReader;
 import org.jetbrains.annotations.Nullable;
 
 record StreamingVectors(
+    String format,
+    Scoring scoring,
     HnswGraph graph,
     KnnVectorValues values,
     RandomVectorScorer traversal,
     RandomVectorScorer output) {
+  enum Scoring {
+    RAW,
+    HAMMING,
+    SCALAR,
+    BINARY;
+
+    String stageRescoring(boolean fullPool) {
+      return switch (this) {
+        case BINARY -> fullPool ? "fullPool" : "twoStage";
+        case SCALAR -> fullPool ? "fullPool" : "none";
+        case RAW, HAMMING -> "none";
+      };
+    }
+  }
+
+  static boolean supported(@Nullable String format) {
+    return "Lucene99HnswVectorsFormat".equals(format)
+        || "Lucene99HnswScalarQuantizedVectorsFormat".equals(format)
+        || Mongot01042HnswBinaryQuantizedVectorsFormat.NAME.equals(format)
+        || Mongot01042HnswBitVectorsFormat.NAME.equals(format);
+  }
+
   interface Target {
     RandomVectorScorer scorer(
         FlatVectorsScorer factory, VectorSimilarityFunction similarity, KnnVectorValues values)
@@ -59,17 +83,21 @@ record StreamingVectors(
     }
     var similarity = info.getVectorSimilarityFunction();
     var standard = FlatVectorScorerUtil.getLucene99FlatVectorsScorer();
+    Scoring scoring;
     RandomVectorScorer traversal;
     RandomVectorScorer output;
     if (Mongot01042HnswBinaryQuantizedVectorsFormat.NAME.equals(format)) {
+      scoring = Scoring.BINARY;
       var binary = ((QuantizedVectorsReader) reader).getQuantizedVectorValues(field);
       traversal = target.scorer(new BinaryQuantizedFlatVectorsScorer(standard), similarity, binary);
       output = finalScores ? target.scorer(standard, similarity, raw) : traversal;
     } else if (Mongot01042HnswBitVectorsFormat.NAME.equals(format)) {
+      scoring = Scoring.HAMMING;
       traversal = target.scorer(new FlatBitVectorsScorer(), similarity, raw);
       output = traversal;
     } else if ("Lucene99HnswScalarQuantizedVectorsFormat".equals(format)
         && encoding == VectorEncoding.FLOAT32) {
+      scoring = Scoring.SCALAR;
       var quantized = ((QuantizedVectorsReader) reader).getQuantizedVectorValues(field);
       traversal =
           target.scorer(
@@ -79,6 +107,7 @@ record StreamingVectors(
       output = finalScores ? target.scorer(standard, similarity, raw) : traversal;
     } else if ("Lucene99HnswVectorsFormat".equals(format)
         || "Lucene99HnswScalarQuantizedVectorsFormat".equals(format)) {
+      scoring = Scoring.RAW;
       traversal = target.scorer(standard, similarity, raw);
       output = traversal;
     } else {
@@ -86,6 +115,6 @@ record StreamingVectors(
     }
     // Some tiny HNSW segments intentionally store no graph.
     var graph = provider.getGraph(field);
-    return new StreamingVectors(graph, raw, traversal, output);
+    return new StreamingVectors(format, scoring, graph, raw, traversal, output);
   }
 }

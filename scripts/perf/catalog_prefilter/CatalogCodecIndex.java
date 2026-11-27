@@ -1,4 +1,5 @@
 import com.xgen.mongot.index.lucene.quantization.Mongot01042HnswBinaryQuantizedVectorsFormat;
+import com.xgen.mongot.index.lucene.quantization.Mongot01042HnswBitVectorsFormat;
 import com.xgen.mongot.index.lucene.vector.HnswWriteParams;
 import com.xgen.mongot.index.lucene.vector.NativeHnswScalarQuantizedVectorsFormat;
 import java.io.IOException;
@@ -22,6 +23,9 @@ public class CatalogCodecIndex {
           case "f32", "i8" ->
               new Lucene99HnswVectorsFormat(
                   16, 100, workers, pool, threshold, Lucene99HnswVectorsFormat.VERSION_START);
+          case "bit" ->
+              new Mongot01042HnswBitVectorsFormat(
+                  16, 100, workers, Optional.ofNullable(pool), params);
           case "scalar" ->
               new NativeHnswScalarQuantizedVectorsFormat(
                   16, 100, workers, Optional.ofNullable(pool), params);
@@ -49,6 +53,14 @@ public class CatalogCodecIndex {
     };
   }
 
+  static byte[] packSigns(byte[] coordinates) {
+    byte[] packed = new byte[(coordinates.length + 7) / 8];
+    for (int i = 0; i < coordinates.length; i++) {
+      if (coordinates[i] > 0) packed[i / 8] |= (byte) (1 << (i % 8));
+    }
+    return packed;
+  }
+
   public static void main(String[] args) throws Exception {
     if (args.length != 4 && args.length != 5)
       throw new IllegalArgumentException("codec inputs staging index [docs-per-leaf]");
@@ -58,7 +70,8 @@ public class CatalogCodecIndex {
         Path.of(args[2]),
         Path.of(args[3]),
         args.length == 5 ? Integer.parseInt(args[4]) : CatalogPrefilter.DOCS,
-        kind.startsWith("i8") ? VectorEncoding.BYTE : VectorEncoding.FLOAT32,
-        (threshold, workers, pool) -> format(kind, threshold, workers, pool));
+        kind.startsWith("i8") || kind.equals("bit") ? VectorEncoding.BYTE : VectorEncoding.FLOAT32,
+        (threshold, workers, pool) -> format(kind, threshold, workers, pool),
+        kind.equals("bit") ? CatalogCodecIndex::packSigns : java.util.function.Function.identity());
   }
 }

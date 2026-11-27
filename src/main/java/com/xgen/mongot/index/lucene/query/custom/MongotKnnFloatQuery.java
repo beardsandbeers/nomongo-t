@@ -11,8 +11,10 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.TimeLimitingKnnCollectorManager;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TotalHits;
+import org.apache.lucene.search.Weight;
 import org.apache.lucene.search.knn.KnnCollectorManager;
 import org.apache.lucene.util.BitSet;
 import org.apache.lucene.util.BitSetIterator;
@@ -26,6 +28,8 @@ public class MongotKnnFloatQuery extends KnnFloatVectorQuery {
 
   protected final IndexMetricsUpdater.QueryingMetricsUpdater metrics;
   protected final boolean hasFilter;
+  private final @Nullable LeafKnnSearch leafSearch;
+
   private final FeatureFlags flags;
 
   /**
@@ -69,7 +73,19 @@ public class MongotKnnFloatQuery extends KnnFloatVectorQuery {
       float[] target,
       int k,
       @Nullable Query filter) {
+    this(metrics, flags, field, target, k, filter, null);
+  }
+
+  public MongotKnnFloatQuery(
+      IndexMetricsUpdater.QueryingMetricsUpdater metrics,
+      FeatureFlags flags,
+      String field,
+      float[] target,
+      int k,
+      @Nullable Query filter,
+      @Nullable LeafKnnSearch leafSearch) {
     super(field, target, k, filter);
+    this.leafSearch = leafSearch;
     this.metrics = metrics;
     this.flags = flags;
     this.hasFilter = filter != null;
@@ -107,6 +123,31 @@ public class MongotKnnFloatQuery extends KnnFloatVectorQuery {
    */
   static double expectedUniqueSamples(int n, double numSamples) {
     return n * (1 - Math.exp(numSamples * Math.log1p(-1.0 / n)));
+  }
+
+  @Override
+  protected TopDocs searchLeaf(
+      LeafReaderContext context,
+      @Nullable Weight filterWeight,
+      TimeLimitingKnnCollectorManager manager)
+      throws IOException {
+    if (this.leafSearch != null) {
+      var hits = this.leafSearch.search(context, manager.getQueryTimeout());
+      if (hits != null) {
+        return hits;
+      }
+    }
+    return super.searchLeaf(context, filterWeight, manager);
+  }
+
+  @Override
+  public boolean equals(Object other) {
+    return super.equals(other) && this.leafSearch == ((MongotKnnFloatQuery) other).leafSearch;
+  }
+
+  @Override
+  public int hashCode() {
+    return 31 * super.hashCode() + System.identityHashCode(this.leafSearch);
   }
 
   @Override

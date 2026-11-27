@@ -202,6 +202,11 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
       throws InvalidQueryException, IOException, InterruptedException, ReaderClosedException {
     try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
       ensureOpen("query");
+      if (query.materializedCriteria().isUnboundedStream()) {
+        return new VectorProducerAndMetaResults(
+            openStream(query, context, queryCursorOptions, batchSizeStrategy, 0),
+            MetaResults.EMPTY);
+      }
       List<VectorSearchResult> allResults;
       try (var searcherReference = createSearcherReference(query.concurrent())) {
         allResults = queryResults(query, context, searcherReference);
@@ -209,6 +214,56 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
       return new VectorProducerAndMetaResults(
           new LuceneVectorSearchBatchProducer(allResults, this.metricsUpdater, batchSizeStrategy),
           MetaResults.EMPTY);
+    }
+  }
+
+  // Ownership of the searcher passes to the batch producer on success.
+  @SuppressWarnings("MustBeClosedChecker")
+  LuceneSearchBatchProducer openStream(
+      MaterializedVectorSearchQuery query,
+      QueryExecutionContext context,
+      QueryCursorOptions options,
+      BatchSizeStrategy batches,
+      int partition)
+      throws InvalidQueryException, ReaderClosedException, IOException {
+    try (var guard = LockGuard.with(this.shutdownSharedLock)) {
+      ensureOpen("openStream");
+      var reference = createSearcherReference(query.concurrent());
+      try {
+        var searcher = reference.getIndexSearcher();
+        DeadlineQueryTimeout.fromDeadline(context.deadlineTimestampMs())
+            .ifPresent(searcher::setTimeout);
+        var luceneQuery =
+            Explain.isEnabled()
+                ? this.queryFactory.createExplainQuery(query, searcher.getIndexReader())
+                : this.queryFactory.createQuery(query, searcher.getIndexReader());
+        var manager =
+            this.luceneSearchManagerFactory.newVectorQueryManager(
+                luceneQuery, query.materializedCriteria());
+        var initial = manager.initialSearch(reference, batches.adviseNextBatchSize());
+        var spec =
+            new ProjectSpec(query.returnStoredSource(), this.indexDefinition.getStoredSource());
+        return new LuceneSearchBatchProducer(
+            reference,
+            manager,
+            initial.topDocs,
+            initial.luceneExhausted,
+            Optional.empty(),
+            Optional.empty(),
+            batches,
+            ProjectFactory.build(spec, searcher.getIndexReader()),
+            this.metricsUpdater,
+            options,
+            false,
+            Optional.empty(),
+            false,
+            LuceneSearchBatchProducer.VECTOR_RESULT,
+            partition,
+            false);
+      } catch (IOException | InvalidQueryException | RuntimeException | Error e) {
+        org.apache.lucene.util.IOUtils.closeWhileHandlingException(reference);
+        throw e;
+      }
     }
   }
 
@@ -230,6 +285,9 @@ public class LuceneVectorIndexReader implements VectorIndexReader {
       QueryExecutionContext context,
       LuceneIndexSearcherReference searcherReference)
       throws IOException, InvalidQueryException {
+    if (materializedVectorQuery.materializedCriteria().isUnboundedStream()) {
+      throw new InvalidQueryException("Open-ended vector search requires a cursor");
+    }
     var indexSearcher = searcherReference.getIndexSearcher();
     DeadlineQueryTimeout.fromDeadline(context.deadlineTimestampMs())
         .ifPresent(indexSearcher::setTimeout);

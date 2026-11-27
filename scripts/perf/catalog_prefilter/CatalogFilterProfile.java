@@ -121,6 +121,22 @@ public class CatalogFilterProfile {
       var cases =
           new ArrayList<>(
               List.of(catalogCase(2, true), catalogCase(3, false), catalogCase(6, false)));
+      if (Boolean.getBoolean("catalog.routingFilters")) {
+        cases.clear();
+        cases.addAll(
+            List.of(
+                catalogCase(2, true),
+                catalogCase(2, false),
+                catalogCase(4, false),
+                catalogCase(6, false)));
+        cases.add(
+            new CatalogPrefilter.Case(
+                "rating_at_least_two",
+                new BooleanQuery.Builder()
+                    .add(CatalogPrefilter.range("rating", 2, Double.MAX_VALUE), Occur.FILTER)
+                    .add(new FieldExistsQuery("vector"), Occur.FILTER)
+                    .build()));
+      }
       var random = new Random(431);
       System.out.println("round,filter,profiled,accepted,materialization_ns");
       for (int round = -5; round < 20; round++) {

@@ -97,6 +97,11 @@ public class RankedStreamBenchmark {
   }
 
   static List<Hit> exact(IndexReader reader, Case filter, byte[] q) throws IOException {
+    return exact(reader, filter, q, false);
+  }
+
+  static List<Hit> exact(IndexReader reader, Case filter, byte[] q, boolean hamming)
+      throws IOException {
     int depth = Math.max(DEEP_PREFIX ? 500 : 100, Collections.max(LIMITS));
     var heap = new PriorityQueue<>(depth, BEST.reversed());
     for (var leaf : reader.leaves()) {
@@ -106,7 +111,11 @@ public class RankedStreamBenchmark {
         if (!filter.allowed.get(doc)) {
           continue;
         }
-        float score = VectorSimilarityFunction.EUCLIDEAN.compare(q, values.vectorValue(ord));
+        var v = values.vectorValue(ord);
+        float score =
+            hamming
+                ? 1f - org.apache.lucene.util.VectorUtil.xorBitCount(q, v) / (float) (q.length * 8)
+                : VectorSimilarityFunction.EUCLIDEAN.compare(q, v);
         if (heap.size() == depth && score < heap.element().score()) {
           continue;
         }

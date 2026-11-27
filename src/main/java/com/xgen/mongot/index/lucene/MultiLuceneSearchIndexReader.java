@@ -190,7 +190,7 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     var searchMergingBatchProducer =
         searchBatchProducers.isEmpty()
             ? new EmptySearchBatchProducer()
-            : new SearchMergingBatchProducer(searchBatchProducers);
+            : new SearchMergingBatchProducer(searchBatchProducers, vectorLimit(query));
     BatchProducer searchBatchProducer =
         (this.shouldCollectMultiPartitionEmptyBatchProducer || snapshots.isPresent())
             ? wrapWithAdditionalClosers(searchMergingBatchProducer, extraBatchProducersToClose)
@@ -198,6 +198,24 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
     // Vector search query or operator query doesn't have facet at all.
     return new SearchProducerAndMetaResults(
         searchBatchProducer, MetaResults.mergeCountResult(metaResultsList));
+  }
+
+  private static long vectorLimit(Query query) {
+    var criteria =
+        query instanceof VectorSearchQuery vector
+            ? vector.criteria()
+            : query instanceof OperatorQuery operator
+                    && operator.operator()
+                        instanceof com.xgen.mongot.index.query.operators.VectorSearchOperator vector
+                ? vector.criteria()
+                : null;
+    return criteria
+                instanceof
+                com.xgen.mongot.index.query.operators.ApproximateVectorSearchCriteria approx
+            && approx.streaming().isPresent()
+            && !approx.isUnboundedStream()
+        ? approx.limit()
+        : Long.MAX_VALUE;
   }
 
   private SearchProducerAndMetaResults collectorQuery(

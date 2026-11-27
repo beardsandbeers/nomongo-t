@@ -5,6 +5,7 @@ java_library(
     srcs = [
         "BitScorer.java",
         "ExactVectorSearchQuery.java",
+        "LeafKnnSearch.java",
         "MongotKnnByteQuery.java",
         "MongotKnnFloatQuery.java",
         "NullnessAwareIndexSortRangeQuery.java",
