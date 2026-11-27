@@ -432,7 +432,8 @@ public final class StandaloneRuntime implements Closeable {
             LuceneIndexMappingExporter.export(
                 definition.asSearchDefinition(),
                 lease.index().getGenerationId().generation.formatVersion.asLucene(),
-                reader.getFieldInfos());
+                reader.getFieldInfos(),
+                reader.getVectorSourcePaths());
         external.put("mappings", mappings);
         response
             .setMappingsJson(mappings.toJson())
@@ -448,6 +449,11 @@ public final class StandaloneRuntime implements Closeable {
             .asRuntimeException();
       }
       return response.setDefinitionJson(external.toJson()).build();
+    } catch (LuceneIndexMappingExporter.AmbiguousVectorPathException error) {
+      throw Status.FAILED_PRECONDITION
+          .withDescription(error.getMessage())
+          .withCause(error)
+          .asRuntimeException();
     } catch (IOException | ReaderClosedException error) {
       throw Status.UNAVAILABLE
           .withDescription("Cannot read index field metadata")

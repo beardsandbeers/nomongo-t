@@ -1,5 +1,6 @@
 package com.xgen.mongot.index.definition;
 
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableMap;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.version.IndexCapabilities;
@@ -7,6 +8,7 @@ import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * FieldDefinitionResolver retrieves the correct FieldDefinition for a combination of path +
@@ -19,6 +21,11 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
   public final SearchIndexCapabilities indexCapabilities;
 
   private final VectorDimensions vectorDimensions;
+  private final Supplier<Boolean> hasTypeSetVectorFields;
+
+  public boolean hasTypeSetVectorFields() {
+    return this.hasTypeSetVectorFields.get();
+  }
 
   public VectorDimensions vectorDimensions() {
     return this.vectorDimensions;
@@ -31,6 +38,8 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
     this.indexDefinition = indexDefinition;
     this.indexCapabilities = indexDefinition.getIndexCapabilities(indexFormatVersion);
     this.vectorDimensions = vectorDimensions;
+    this.hasTypeSetVectorFields =
+        Suppliers.memoize(() -> indexDefinition.dynamicVectorFields().findAny().isPresent());
   }
 
   SearchFieldDefinitionResolver(
@@ -105,6 +114,14 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
       return rule.get().resolve(() -> this.vectorDimensions.get(path));
     }
     return field.flatMap(FieldDefinition::vectorFieldSpecification);
+  }
+
+  public Optional<TypeSetVectorFieldDefinition> getTypeSetVectorRule(
+      FieldPath path, Optional<FieldPath> embeddedRoot) {
+    return embeddedRoot.isPresent()
+        ? Optional.empty()
+        : getFieldDefinition(path, embeddedRoot)
+            .flatMap(FieldDefinition::typeSetVectorFieldDefinition);
   }
 
   public IndexCapabilities getIndexCapabilities() {

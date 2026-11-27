@@ -3084,9 +3084,7 @@ public class StandaloneGrpcServerTest {
               + ",inside:[{tag:'keep',v:"
               + three
               + "}]}");
-      assertThat(assertThrows(StatusRuntimeException.class, () -> f.query(id, query)))
-          .hasMessageThat()
-          .contains("must be indexed");
+      assertThat(f.query(id, query).getArray("results")).isEmpty();
       f.upsert(
           id,
           "{_id:3,nested:{v:"
@@ -3139,7 +3137,7 @@ public class StandaloneGrpcServerTest {
       assertThat(fields.getDocument("nested").getDocument("fields").getDocument("v"))
           .isEqualTo(
               BsonDocument.parse(
-                  "{type:'vector',similarity:'cosine',quantization:'scalar',numDimensions:3}"));
+                  "{type:'vector',similarity:'cosine',quantization:'scalar',numDimensions:3,bsonVectorOnly:true}"));
     }
 
     try (var f = new Fixture(directory)) {
@@ -3208,14 +3206,14 @@ public class StandaloneGrpcServerTest {
       f.upsert(fixed, document);
 
       String queryVector = "[1,0,0,0,0,0,0,0]";
-      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("v", queryVector));
-      assertSameVectorResults(
+      assertSameSingleHit(f, fixed, dynamic, exactVectorQuery("v", queryVector));
+      assertSameSingleHit(
           f,
           fixed,
           dynamic,
           "{vectorSearch:{path:'v',queryVector:" + queryVector + ",numCandidates:16,limit:1}}");
-      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("scalar.v", queryVector));
-      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("plain.v", packedBits));
+      assertSameSingleHit(f, fixed, dynamic, exactVectorQuery("scalar.v", queryVector));
+      assertSameSingleHit(f, fixed, dynamic, exactVectorQuery("plain.v", packedBits));
     }
   }
 
@@ -3239,12 +3237,118 @@ public class StandaloneGrpcServerTest {
       var fixed = f.create("static-dotted-parent", exported.getDefinitionJson());
       f.upsert(fixed, document);
 
-      assertSameVectorResults(f, fixed, dynamic, exactVectorQuery("a.b.v", "[1,0]"));
+      assertSameSingleHit(f, fixed, dynamic, exactVectorQuery("a.b.v", "[1,0]"));
     }
   }
 
-  private static void assertSameVectorResults(
-      Fixture f, String fixed, String dynamic, String query) {
+  @Test
+  public void getIndexMappings_literalAndNestedVectors_preservesBothBsonPathsAfterRestart()
+      throws Exception {
+    Similarity.load();
+    var directory = data();
+    String definition =
+        "{mappings:{dynamic:{typeSet:'v'}},typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}";
+    String vector = bsonFloatVector(1, 0);
+    String literal = "{_id:1,'a.b':" + vector + "}";
+    String nested = "{_id:2,a:{b:" + vector + "}}";
+    String numeric = "{_id:3,'a.b':[1,0]}";
+    String id;
+    try (var f = new Fixture(directory)) {
+      id = f.create("shapes", definition);
+      f.upsert(id, literal);
+      var literalExport =
+          f.catalog.getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build());
+      var fields = BsonDocument.parse(literalExport.getMappingsJson()).getDocument("fields");
+      assertThat(fields.keySet()).containsExactly("a.b");
+      f.upsert(id, nested);
+      f.upsert(id, numeric);
+    }
+    try (var f = new Fixture(directory)) {
+      f.ready(id, 1);
+      var exported =
+          f.catalog.getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build());
+      var fixed = f.create("static-shapes", exported.getDefinitionJson());
+      f.upsert(fixed, literal);
+      f.upsert(fixed, nested);
+      f.upsert(fixed, numeric);
+      String query = exactVectorQuery("a.b", "[1,0]");
+      var hits = f.query(id, query).getArray("results");
+      assertThat(hits).hasSize(2);
+      assertThat(f.query(fixed, query).getArray("results")).containsExactlyElementsIn(hits);
+      var ordinary =
+          f.create(
+              "ordinary",
+              "{mappings:{dynamic:false,fields:{'a.b':{type:'vector',numDimensions:2,similarity:'euclidean'}}}}");
+      f.upsert(ordinary, numeric);
+      assertThat(f.query(ordinary, query).getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
+  public void upsert_firstVectorWithAnalyzedText_preservesAllTokensAndStoredValues()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "with-text",
+              "{mappings:{dynamic:{typeSet:'v'}},typeSets:[{name:'v',types:[{type:'string',store:true},{type:'vector',similarity:'euclidean'}]}]}");
+      f.upsert(
+          id,
+          "{_id:1,v:"
+              + bsonFloatVector(1, 0)
+              + ",text:['winter snow','blue jay'],other:'sugar maple'}");
+      assertThat(f.query(id, "{phrase:{path:'text',query:'blue jay'}}").getArray("results"))
+          .hasSize(1);
+      assertThat(f.query(id, "{phrase:{path:'other',query:'sugar maple'}}").getArray("results"))
+          .hasSize(1);
+      assertThat(f.query(id, exactVectorQuery("v", "[1,0]")).getArray("results")).hasSize(1);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_literalTokenAndNestedText_preservesBothSearches() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "alias",
+              "{mappings:{dynamic:false,fields:{a:{type:'document',dynamic:true},'a.b':{type:'token'}}}}");
+      String document = "{_id:1,a:{b:'snow'},'a.b':'other'}";
+      f.upsert(id, document);
+      var exported =
+          f.catalog.getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build());
+      var fixed = f.create("static-alias", exported.getDefinitionJson());
+      f.upsert(fixed, document);
+      assertSameSingleHit(f, fixed, id, "{text:{path:'a.b',query:'snow'}}");
+      assertSameSingleHit(f, fixed, id, "{equals:{path:'a.b',value:'other'}}");
+    }
+  }
+
+  @Test
+  public void query_unboundVectorOnSparseShard_returnsEmptyUntilFirstWrite() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      String definition =
+          "{mappings:{dynamic:{typeSet:'v'}},typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}";
+      String full = f.create("full", definition);
+      String sparse = f.create("sparse", definition);
+      f.upsert(full, "{_id:1,v:" + bsonFloatVector(1, 0) + "}");
+      f.upsert(sparse, "{_id:2,other:" + bsonFloatVector(1, 0) + "}");
+      String exact = exactVectorQuery("v", "[1,0]");
+      String ann = "{vectorSearch:{path:'v',queryVector:[1,0],numCandidates:8,limit:2}}";
+      assertThat(f.query(full, exact).getArray("results")).hasSize(1);
+      assertThat(f.query(sparse, exact).getArray("results")).isEmpty();
+      assertThat(f.query(full, ann).getArray("results")).hasSize(1);
+      assertThat(f.query(sparse, ann).getArray("results")).isEmpty();
+      f.upsert(sparse, "{_id:3,v:" + bsonFloatVector(1, 0, 0) + "}");
+      assertThat(f.query(sparse, exactVectorQuery("v", "[1,0,0]")).getArray("results")).hasSize(1);
+      assertThat(assertThrows(StatusRuntimeException.class, () -> f.query(sparse, exact)))
+          .hasMessageThat()
+          .contains("3 dimensions");
+    }
+  }
+
+  private static void assertSameSingleHit(Fixture f, String fixed, String dynamic, String query) {
     var results = f.query(dynamic, query).getArray("results");
     assertThat(results).hasSize(1);
     assertThat(f.query(fixed, query).getArray("results")).isEqualTo(results);

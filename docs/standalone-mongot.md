@@ -180,7 +180,14 @@ Set `numDimensions` on the vector entry to require that length at every matching
 When omitted, the first successfully indexed vector at each path sets its length for the
 local index generation, across partitions and restarts. Subsequent vectors of a different
 length at that path are skipped. Independently built indexes can learn different lengths
-if their input mixes dimensions. Numeric arrays require an explicit static vector mapping.
+if their input mixes dimensions. A vector query on a shard that has yet to observe the path
+returns an empty local result. Numeric arrays require an explicit static vector mapping.
+
+Mapping exports preserve literal dots in discovered BSON keys. Exported vector fields use
+`bsonVectorOnly: true` so reingesting the same numeric arrays continues to skip them. Ordinary
+static vector fields accept both numeric arrays and BSON vectors by default. Older index
+generations may lack BSON path metadata. If the configured mapping allows multiple spellings
+for a legacy vector path, rebuild the index from its source documents before exporting.
 
 The supported quantization settings are `none` (default), `scalar`, and `binary`.
 The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.

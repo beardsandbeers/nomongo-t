@@ -1,5 +1,18 @@
 [
   {
+    "name": "static Search vector with BSON-only input",
+    "indexType": "search",
+    "valid": true,
+    "definition": {
+      "mappings": {
+        "dynamic": false,
+        "fields": {
+          "v": { "type": "vector", "numDimensions": 2, "similarity": "cosine", "bsonVectorOnly": true }
+        }
+      }
+    }
+  },
+  {
     "name": "inferred vector type set",
     "indexType": "search",
     "valid": true,

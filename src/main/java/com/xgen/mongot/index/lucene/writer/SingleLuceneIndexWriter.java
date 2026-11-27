@@ -780,6 +780,11 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         this.typeSetVectors
             .get()
             .write(documentBlock, () -> updateDocuments(encodedDocumentId, event, documentBlock));
+        if (documentBlock.stream()
+            .flatMap(doc -> doc.getFields().stream())
+            .anyMatch(field -> field.fieldType().vectorDimension() > 0)) {
+          this.indexingMetricsUpdater.getVectorFieldsIndexed().increment();
+        }
       } else {
         updateDocuments(encodedDocumentId, event, documentBlock);
       }

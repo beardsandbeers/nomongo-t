@@ -1,14 +1,21 @@
 package com.xgen.mongot.index.lucene;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
 import com.xgen.mongot.index.definition.TypeSetDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
+import com.xgen.mongot.index.definition.VectorSimilarity;
+import com.xgen.mongot.index.definition.quantization.VectorQuantization;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.testing.mongot.index.definition.SearchIndexDefinitionBuilder;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.IntStream;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
@@ -126,6 +133,76 @@ public class LuceneIndexMappingExporterTest {
     assertThat(
             result.getDocument("fields").getDocument("explicit").getString("analyzer").getValue())
         .isEqualTo("lucene.keyword");
+  }
+
+  @Test
+  public void export_legacyVectorWithMultipleBsonSpellings_reportsAmbiguousPath() throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(mappings("{dynamic:{typeSet:'v'}}"))
+            .typeSets(vectorTypeSet())
+            .build();
+
+    // Newer writes established one spelling. The legacy segment could contain the other.
+    var paths = new SourcePaths(Set.of("a\0b"), Set.of("a.b"));
+    assertThrows(
+        LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+        () ->
+            LuceneIndexMappingExporter.export(
+                definition, IndexFormatVersion.CURRENT, List.of(vectorInfo("a.b")), paths));
+  }
+
+  @Test
+  public void export_legacyVectorUnderExplicitDottedParent_recoversBsonSpelling() throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings("{dynamic:false,fields:{'a.b':{type:'document',dynamic:{typeSet:'v'}}}}"))
+            .typeSets(vectorTypeSet())
+            .build();
+
+    var result =
+        LuceneIndexMappingExporter.export(
+            definition, IndexFormatVersion.CURRENT, List.of(vectorInfo("a.b.v")));
+
+    var vector =
+        result.getDocument("fields").getDocument("a.b").getDocument("fields").getDocument("v");
+    assertThat(vector.getInt32("numDimensions").getValue()).isEqualTo(2);
+    assertThat(vector.getBoolean("bsonVectorOnly").getValue()).isTrue();
+  }
+
+  private static TypeSetDefinition vectorTypeSet() {
+    return new TypeSetDefinition(
+        "v",
+        List.of(
+            new TypeSetVectorFieldDefinition(
+                Optional.empty(), VectorSimilarity.COSINE, VectorQuantization.NONE)));
+  }
+
+  private static FieldInfos vectorInfo(String path) {
+    var field =
+        new FieldInfo(
+            "$type:knnByte/" + path,
+            0,
+            false,
+            false,
+            false,
+            IndexOptions.NONE,
+            DocValuesType.NONE,
+            DocValuesSkipIndexType.NONE,
+            -1L,
+            Map.of(),
+            0,
+            0,
+            0,
+            2,
+            VectorEncoding.BYTE,
+            VectorSimilarityFunction.COSINE,
+            false,
+            false);
+    return new FieldInfos(new FieldInfo[] {field});
   }
 
   private static DocumentFieldDefinition mappings(String json) throws Exception {

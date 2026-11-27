@@ -10,7 +10,6 @@ import com.xgen.mongot.index.definition.NumberFieldDefinition;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
 import com.xgen.mongot.index.definition.SortableNumberBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
-import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.ingestion.handlers.DocumentHandler;
 import com.xgen.mongot.index.ingestion.handlers.FieldValueHandler;
@@ -317,7 +316,11 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
   @Override
   public void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {
     var configured = this.fieldDefinition.typeSetVectorFieldDefinition();
-    if (configured.isEmpty()
+    var bsonOnly =
+        this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(field -> field.bsonVectorOnly());
+    if ((configured.isEmpty() && bsonOnly.isEmpty())
         || this.isMultiValued
         || this.documentWrapper.getEmbeddedRoot().isPresent()
         || this.path.toString().isEmpty()
@@ -325,6 +328,15 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         || binarySize
             > BsonVectorParser.BSON_VECTOR_HEADER_SIZE
                 + Float.BYTES * VectorFieldSpecification.MAX_DIMENSIONS) {
+      return;
+    }
+    if (bsonOnly.isPresent()) {
+      supplier
+          .get()
+          .ifPresent(
+              vector ->
+                  IndexableFieldFactory.addKnnVectorField(
+                      this.documentWrapper, this.path, vector, bsonOnly.get().specification()));
       return;
     }
     // Lucene and queries address a field by its dotted name, even for literal dots in BSON keys.
@@ -347,20 +359,13 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     var vector = parsed.get();
     // The partition writer checks inferred lengths so its commit can also record a binding
     // when this partition's first occurrence of the path has a different length.
-    boolean dimensionInFieldName =
-        rule.get().numDimensions().isEmpty()
-            && this.documentWrapper
-                .resolver
-                .vectorDimensions()
-                .binding(canonicalPath.toString())
-                .map(VectorDimensions.Binding::dimensionInFieldName)
-                .orElse(true);
+    boolean dimensionInFieldName = rule.get().numDimensions().isEmpty();
     rule.get()
         .resolve(() -> Optional.of(vector.numDimensions()))
         .ifPresent(
             spec ->
                 IndexableFieldFactory.addKnnVectorField(
-                    this.documentWrapper, canonicalPath, vector, spec, dimensionInFieldName));
+                    this.documentWrapper, this.path, vector, spec, dimensionInFieldName));
   }
 
   @Override
@@ -368,7 +373,12 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     Optional<VectorFieldSpecification> maybeFieldSpec =
         this.fieldDefinition.vectorFieldSpecification();
 
-    if (maybeFieldSpec.isEmpty() || this.isMultiValued) {
+    if (maybeFieldSpec.isEmpty()
+        || this.isMultiValued
+        || this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(field -> field.bsonVectorOnly())
+            .isPresent()) {
       return;
     }
 

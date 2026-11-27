@@ -165,7 +165,8 @@ public abstract class AbstractDocumentWrapper {
    * @param checkFieldName - the field name of the corresponding vector field
    */
   void addIndexedVectorField(String checkFieldName) {
-    if (this.vectorFieldsIndexed.isEmpty()) {
+    if (this.vectorFieldsIndexed.isEmpty()
+        && !(this instanceof DocumentWrapper search && search.resolver.hasTypeSetVectorFields())) {
       // Only increment for the first vector field discovered in a document.
       this.indexingMetricsUpdater.getVectorFieldsIndexed().increment();
     }

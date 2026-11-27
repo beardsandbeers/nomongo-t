@@ -506,7 +506,7 @@ public class IndexableFieldFactory {
       FieldPath field,
       Vector vector,
       VectorFieldSpecification specification) {
-    addKnnVectorField(document, field, vector, specification, false);
+    addKnnVectorField(document, field, vector, specification, false, Optional.empty());
   }
 
   static void addKnnVectorField(
@@ -515,6 +515,20 @@ public class IndexableFieldFactory {
       Vector vector,
       VectorFieldSpecification specification,
       boolean dimensionInFieldName) {
+    Optional<String> sourcePath =
+        field.toString().contains(".")
+            ? Optional.of(String.join("\0", field.getSegments()))
+            : Optional.empty();
+    addKnnVectorField(document, field, vector, specification, dimensionInFieldName, sourcePath);
+  }
+
+  private static void addKnnVectorField(
+      AbstractDocumentWrapper document,
+      FieldPath field,
+      Vector vector,
+      VectorFieldSpecification specification,
+      boolean dimensionInFieldName,
+      Optional<String> sourcePath) {
     // This is the field name we use to check for duplicate vectors and invalid vectors. The
     // embeddedRoot is set to be empty when we are retrieving the field name for this purpose.
     String checkFieldName =
@@ -572,7 +586,10 @@ public class IndexableFieldFactory {
         case FLOAT -> {
           document.addVectorField(
               new KnnFloatVectorField(
-                  vectorFieldName, vector.asFloatVector().getFloatVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asFloatVector().getFloatVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
         // float16 is guarded out above (vectorlite-only); unreachable here.
@@ -597,7 +614,10 @@ public class IndexableFieldFactory {
           }
           document.addVectorField(
               new KnnByteVectorField(
-                  vectorFieldName, vector.asByteVector().getByteVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asByteVector().getByteVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
         case BIT -> {
@@ -616,7 +636,10 @@ public class IndexableFieldFactory {
           }
           document.addVectorField(
               new KnnByteVectorField(
-                  vectorFieldName, vector.asBitVector().getBitVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asBitVector().getBitVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
       }

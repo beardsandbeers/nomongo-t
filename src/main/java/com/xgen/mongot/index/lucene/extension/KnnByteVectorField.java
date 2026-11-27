@@ -1,6 +1,8 @@
 package com.xgen.mongot.index.lucene.extension;
 
 import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions;
+import java.util.Optional;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
@@ -15,12 +17,24 @@ public class KnnByteVectorField extends org.apache.lucene.document.KnnByteVector
 
   public KnnByteVectorField(
       String name, byte[] vector, VectorSimilarityFunction similarityFunction) {
-    super(name, vector, createType(vector, similarityFunction));
+    this(name, vector, similarityFunction, Optional.empty());
   }
 
-  private static FieldType createType(byte[] vector, VectorSimilarityFunction similarityFunction) {
+  public KnnByteVectorField(
+      String name,
+      byte[] vector,
+      VectorSimilarityFunction similarityFunction,
+      Optional<String> sourcePath) {
+    super(name, vector, createType(vector, similarityFunction, sourcePath));
+  }
+
+  private static FieldType createType(
+      byte[] vector, VectorSimilarityFunction similarityFunction, Optional<String> sourcePath) {
     var type =
         new FieldType(new KnnFieldType(vector.length, VectorEncoding.BYTE, similarityFunction));
+    if (sourcePath.isPresent()) {
+      type.putAttribute(VectorDimensions.SOURCE_PATH, sourcePath.get());
+    }
     type.freeze();
     return type;
   }

@@ -5,6 +5,7 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.definition.FieldDefinitionResolver;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorAutoEmbedQuantization;
 import com.xgen.mongot.index.definition.quantization.VectorQuantization;
@@ -62,8 +63,12 @@ public interface QueryFactoryContext {
   VectorQuantization getIndexedQuantization(FieldPath fieldPath, Optional<FieldPath> embeddedRoot)
       throws InvalidQueryException;
 
-  /** Dimension included in the Lucene field name for a learned vector path. */
-  default Optional<Integer> getVectorFieldNameDimensions(
+  default boolean hasUnboundVectorRule(FieldPath path, Optional<FieldPath> embeddedRoot) {
+    return false;
+  }
+
+  /** Committed dimension and physical naming scheme for a learned vector path. */
+  default Optional<VectorDimensions.Binding> getVectorFieldBinding(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
     return Optional.empty();
   }

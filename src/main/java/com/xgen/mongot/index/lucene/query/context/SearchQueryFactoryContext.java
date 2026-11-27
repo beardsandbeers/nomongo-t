@@ -187,7 +187,12 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
     Optional<VectorSimilarity> vectorSimilarity =
         this.fieldDefinitionResolver
             .getVectorFieldSpecification(fieldPath, embeddedRoot)
-            .map(VectorFieldSpecification::similarity);
+            .map(VectorFieldSpecification::similarity)
+            .or(
+                () ->
+                    this.fieldDefinitionResolver
+                        .getTypeSetVectorRule(fieldPath, embeddedRoot)
+                        .map(rule -> rule.similarity()));
 
     if (vectorSimilarity.isEmpty()) {
       throw new InvalidQueryException(
@@ -203,19 +208,29 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
     return this.fieldDefinitionResolver
         .getVectorFieldSpecification(fieldPath, embeddedRoot)
         .map(VectorFieldSpecification::quantization)
+        .or(
+            () ->
+                this.fieldDefinitionResolver
+                    .getTypeSetVectorRule(fieldPath, embeddedRoot)
+                    .map(rule -> rule.quantization()))
         .orElse(VectorQuantization.NONE);
   }
 
   @Override
-  public Optional<Integer> getVectorFieldNameDimensions(
+  public boolean hasUnboundVectorRule(FieldPath path, Optional<FieldPath> embeddedRoot) {
+    return this.fieldDefinitionResolver
+            .getTypeSetVectorRule(path, embeddedRoot)
+            .filter(rule -> rule.numDimensions().isEmpty())
+            .isPresent()
+        && this.fieldDefinitionResolver.vectorDimensions().get(path).isEmpty();
+  }
+
+  @Override
+  public Optional<VectorDimensions.Binding> getVectorFieldBinding(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
     return embeddedRoot.isPresent()
         ? Optional.empty()
-        : this.fieldDefinitionResolver
-            .vectorDimensions()
-            .binding(path.toString())
-            .filter(VectorDimensions.Binding::dimensionInFieldName)
-            .map(VectorDimensions.Binding::dimensions);
+        : this.fieldDefinitionResolver.vectorDimensions().binding(path.toString());
   }
 
   @Override

@@ -113,6 +113,14 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
         this.fieldDefinitionResolver.getVectorFieldSpecification(fieldPath, embeddedRoot);
 
     if (definition.isEmpty()) {
+      var rule = this.fieldDefinitionResolver.getTypeSetVectorRule(fieldPath, embeddedRoot);
+      if (rule.isPresent()) {
+        if (rule.get().resolve(() -> Optional.of(dimensions)).isEmpty()) {
+          throw new InvalidQueryException(
+              "Query dimensions are incompatible with the vector mapping.");
+        }
+        return;
+      }
       throw new InvalidQueryException(
           String.format("%s must be indexed as \"vector\".", fieldPath));
     }

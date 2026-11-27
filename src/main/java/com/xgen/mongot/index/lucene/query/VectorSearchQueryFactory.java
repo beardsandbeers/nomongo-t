@@ -43,6 +43,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
@@ -99,6 +100,7 @@ class VectorSearchQueryFactory {
               path, path));
     }
 
+    boolean unbound = this.factoryContext.hasUnboundVectorRule(path, embeddedRoot);
     this.factoryContext
         .getQueryTimeMappingChecks()
         .validateVectorField(path, embeddedRoot, queryVector.numDimensions());
@@ -158,15 +160,22 @@ class VectorSearchQueryFactory {
           "float16 query vectors are not supported by the Lucene engine");
     }
 
-    String fieldName = getLuceneFieldName(path, embeddedRoot, queryVector.getVectorType());
+    if (criteria instanceof ApproximateVectorSearchCriteria approximateCriteria
+        && !Explain.isEnabled()
+        && approximateCriteria.explainOptions().isPresent()) {
+      throw new InvalidQueryException(
+          "Query must be run in explain mode, because 'explainOptions' are present.");
+    }
+    if (unbound) {
+      return new MatchNoDocsQuery("No vectors observed at " + path);
+    }
+    String fieldName =
+        getLuceneFieldName(
+            path, embeddedRoot, queryVector.getVectorType(), queryContext.getIndexReader());
 
     Query childQuery;
     switch (criteria) {
       case ApproximateVectorSearchCriteria approximateCriteria:
-        if (!Explain.isEnabled() && approximateCriteria.explainOptions().isPresent()) {
-          throw new InvalidQueryException(
-              "Query must be run in explain mode, because 'explainOptions' are present.");
-        }
 
         // Whether the user omitted numCandidates. The explain path reports the resolved value as
         // AUTO; the regular query path ignores this flag.
@@ -514,15 +523,38 @@ class VectorSearchQueryFactory {
   }
 
   private String getLuceneFieldName(
-      FieldPath fieldPath, Optional<FieldPath> embeddedRoot, Vector.VectorType vectorType)
+      FieldPath fieldPath,
+      Optional<FieldPath> embeddedRoot,
+      Vector.VectorType vectorType,
+      IndexReader reader)
       throws InvalidQueryException {
     var type =
         VectorTypeFieldResolver.resolveTypeField(
             this.factoryContext.getIndexedQuantization(fieldPath, embeddedRoot), vectorType);
-    return this.factoryContext
-        .getVectorFieldNameDimensions(fieldPath, embeddedRoot)
-        .map(dimensions -> type.getInferredVectorFieldName(fieldPath, dimensions))
-        .orElseGet(() -> type.getLuceneFieldName(fieldPath, embeddedRoot));
+    String ordinary = type.getLuceneFieldName(fieldPath, embeddedRoot);
+    var binding = this.factoryContext.getVectorFieldBinding(fieldPath, embeddedRoot);
+    if (binding.isEmpty()) {
+      return ordinary;
+    }
+    int dimensions = binding.get().dimensions();
+    String qualified = type.getInferredVectorFieldName(fieldPath, dimensions);
+    if (binding.get().dimensionInFieldName()) {
+      return qualified;
+    }
+    // Physical names are local to a partition. Old checkpoints may use the ordinary name.
+    for (var leaf : reader.leaves()) {
+      if (leaf.reader().getFieldInfos().fieldInfo(qualified) != null) {
+        return qualified;
+      }
+    }
+    for (var leaf : reader.leaves()) {
+      var legacy = leaf.reader().getFieldInfos().fieldInfo(ordinary);
+      if (legacy != null
+          && type.logicalVectorDimensions(legacy.getVectorDimension()) == dimensions) {
+        return ordinary;
+      }
+    }
+    return qualified;
   }
 
   /**

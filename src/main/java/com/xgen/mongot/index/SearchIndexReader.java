@@ -2,6 +2,7 @@ package com.xgen.mongot.index;
 
 import com.xgen.mongot.cursor.batch.BatchSizeStrategy;
 import com.xgen.mongot.cursor.batch.QueryCursorOptions;
+import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
 import com.xgen.mongot.index.lucene.facet.TokenFacetsStateCache;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.Query;
@@ -131,6 +132,11 @@ public interface SearchIndexReader extends IndexReader {
       throws IOException, InvalidQueryException, InterruptedException;
 
   long getNumEmbeddedRootDocuments() throws IOException, ReaderClosedException;
+
+  /** Original BSON spellings learned by this generation, including literal dots. */
+  default SourcePaths getVectorSourcePaths() {
+    return SourcePaths.EMPTY;
+  }
 
   List<FieldInfos> getFieldInfos() throws IOException, ReaderClosedException;
 

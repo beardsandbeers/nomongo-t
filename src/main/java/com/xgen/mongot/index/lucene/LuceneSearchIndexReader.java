@@ -24,6 +24,7 @@ import com.xgen.mongot.index.VectorSearchResult;
 import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
 import com.xgen.mongot.index.lucene.LuceneAggregationSearchManager.AggregationQueryInfo;
 import com.xgen.mongot.index.lucene.LuceneFacetCollectorSearchManager.FacetCollectorQueryInfo;
 import com.xgen.mongot.index.lucene.LuceneSearchManager.QueryInfo;
@@ -910,6 +911,11 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
             .orElse(0L);
       }
     }
+  }
+
+  @Override
+  public SourcePaths getVectorSourcePaths() {
+    return this.facetContext.getFieldDefinitionResolver().vectorDimensions().sourcePaths();
   }
 
   @Override
