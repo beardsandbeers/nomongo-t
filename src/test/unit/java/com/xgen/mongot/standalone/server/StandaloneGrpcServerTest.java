@@ -34,6 +34,7 @@ import com.xgen.mongot.standalone.grpc.DropIndexRequest;
 import com.xgen.mongot.standalone.grpc.ExplainVerbosity;
 import com.xgen.mongot.standalone.grpc.GetIndexFieldStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexMappingsRequest;
+import com.xgen.mongot.standalone.grpc.GetIndexMappingsResponse;
 import com.xgen.mongot.standalone.grpc.GetIndexRequest;
 import com.xgen.mongot.standalone.grpc.GetIndexStatsRequest;
 import com.xgen.mongot.standalone.grpc.GetMoreRequest;
@@ -3346,6 +3347,103 @@ public class StandaloneGrpcServerTest {
           .hasMessageThat()
           .contains("3 dimensions");
     }
+  }
+
+  private static final String MIXED_VECTOR_MAPPING =
+      "{numPartitions:2,mappings:{dynamic:{typeSet:'v'}},typeSets:[{name:'v',types:["
+          + "{type:'string'},{type:'vector',similarity:'euclidean'}]}]}";
+
+  private static GetIndexMappingsResponse exportMappings(Fixture f, String id) {
+    return f.catalog.getIndexMappings(GetIndexMappingsRequest.newBuilder().setIndexId(id).build());
+  }
+
+  @Test
+  public void getIndexMappings_mixedLiteralKey_preservesTextAndVectorHits() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id = f.create("mixed-literal", MIXED_VECTOR_MAPPING);
+      var vector = "{_id:1,'a.b':" + bsonFloatVector(1, 0) + "}";
+      var text = "{_id:2,'a.b':'snow'}";
+      f.upsert(id, vector);
+      f.upsert(id, text);
+      var fixed = f.create("fixed-mixed", exportMappings(f, id).getDefinitionJson());
+      f.upsert(fixed, vector);
+      f.upsert(fixed, text);
+
+      assertSameSingleHit(f, fixed, id, "{text:{path:'a.b',query:'snow'}}");
+      assertSameSingleHit(f, fixed, id, exactVectorQuery("a.b", "[1,0]"));
+    }
+  }
+
+  @Test
+  public void upsert_binaryAliases_preservesCandidateOrderOnReplay() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id =
+          f.create(
+              "binary-aliases",
+              MIXED_VECTOR_MAPPING.replace(
+                  "similarity:'euclidean'", "similarity:'euclidean',quantization:'binary'"));
+      String valid = bsonFloatVector(1, 0, 0, 0, 0, 0, 0, 0);
+      String invalid = bsonFloatVector(1, 0, 0);
+      var docs =
+          List.of(
+              "{_id:1,'a.b':" + valid + "}",
+              "{_id:2,a:{b:" + valid + "}}",
+              "{_id:3,'a.b':" + invalid + ",a:{b:" + valid + "}}",
+              "{_id:4,a:{b:" + valid + "},'a.b':" + invalid + "}",
+              "{_id:5,'a.b':" + valid + ",a:{b:" + valid + "}}",
+              "{_id:6,'a.b':" + bsonFloatVector(new float[16]) + ",a:{b:" + valid + "}}");
+      for (var doc : docs) {
+        f.upsert(id, doc);
+      }
+      var fixed = f.create("replayed-aliases", exportMappings(f, id).getDefinitionJson());
+      for (var doc : docs) {
+        f.upsert(fixed, doc);
+      }
+
+      var query = "{vectorSearch:{path:'a.b',exact:true,queryVector:[1,0,0,0,0,0,0,0],limit:10}}";
+      var original = f.query(id, query).getArray("results");
+      assertThat(original).hasSize(5);
+      assertThat(f.query(fixed, query).getArray("results")).containsExactlyElementsIn(original);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_replacedLiteralVector_disappearsAcrossMergeAndRestart()
+      throws Exception {
+    Similarity.load();
+    var directory = data();
+    String id;
+    try (var f = new Fixture(directory)) {
+      id = f.create("retired-spelling", MIXED_VECTOR_MAPPING);
+      var v = bsonFloatVector(1, 0);
+      f.upsert(id, "{_id:1,'a.b':" + v + "}");
+      f.upsert(id, "{_id:2,a:{b:" + v + "}}");
+      f.upsert(id, "{_id:1}");
+      assertOnlyNestedSpelling(f, id);
+      try (var lease = f.runtime.reads().acquire(id, "")) {
+        lease.index().getWriter().forceMerge(1);
+      }
+      assertOnlyNestedSpelling(f, id);
+    }
+    try (var f = new Fixture(directory)) {
+      f.ready(id, 1);
+      assertOnlyNestedSpelling(f, id);
+    }
+  }
+
+  private static void assertOnlyNestedSpelling(Fixture f, String id) {
+    var fields = BsonDocument.parse(exportMappings(f, id).getMappingsJson()).getDocument("fields");
+    assertThat(fields.containsKey("a.b")).isFalse();
+    assertThat(
+            fields
+                .getDocument("a")
+                .getDocument("fields")
+                .getDocument("b")
+                .getString("type")
+                .getValue())
+        .isEqualTo("vector");
   }
 
   private static void assertSameSingleHit(Fixture f, String fixed, String dynamic, String query) {

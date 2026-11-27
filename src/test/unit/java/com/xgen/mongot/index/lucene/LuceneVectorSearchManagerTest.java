@@ -65,6 +65,68 @@ public class LuceneVectorSearchManagerTest {
   }
 
   @Test
+  public void initialSearch_firstBindingAfterPlanning_preservesEmptyVectorPlan() throws Exception {
+    var path = FieldPath.newRoot("v");
+    var criteria =
+        ApproximateVectorQueryCriteriaBuilder.builder()
+            .queryVector(Vector.fromFloats(new float[] {1, 0, 0, 0, 0, 0, 0, 0}, NATIVE))
+            .path(path)
+            .numCandidates(8)
+            .limit(2)
+            .build();
+    var emptyPlan = new org.apache.lucene.search.MatchNoDocsQuery("No vectors observed at v");
+    var resolver =
+        org.mockito.Mockito.mock(com.xgen.mongot.index.definition.FieldDefinitionResolver.class);
+    var bound =
+        org.mockito.Mockito.mock(com.xgen.mongot.index.definition.VectorFieldSpecification.class);
+    org.mockito.Mockito.when(bound.quantization())
+        .thenReturn(com.xgen.mongot.index.definition.quantization.VectorQuantization.BINARY);
+    org.mockito.Mockito.when(resolver.getVectorFieldSpecification(path))
+        .thenReturn(Optional.of(bound));
+    var factory =
+        new LuceneSearchManagerFactory(
+            resolver,
+            org.mockito.Mockito.mock(
+                com.xgen.mongot.index.lucene.quantization.BinaryQuantizedVectorRescorer.class),
+            metrics);
+    var operator =
+        com.xgen.testing.mongot.index.query.OperatorQueryBuilder.builder()
+            .returnStoredSource(false)
+            .operator(
+                new com.xgen.mongot.index.query.operators.VectorSearchOperator(
+                    com.xgen.mongot.index.query.scores.Score.defaultScore(), criteria))
+            .build();
+    try (var manager =
+            LuceneSearcherManager.create(
+                this.indexWriter,
+                new LuceneSearcherFactory(
+                    VectorIndex.MOCK_VECTOR_DEFINITION,
+                    false,
+                    new QueryCacheProvider.DefaultQueryCacheProvider(),
+                    Optional.empty(),
+                    VectorIndex.mockQueryMetricsUpdater()),
+                VectorIndex.mockMetricsFactory(),
+                () -> false);
+        var ref =
+            LuceneIndexSearcherReference.create(manager, metrics, FeatureFlags.getDefault())) {
+      assertThat(
+              factory
+                  .newVectorQueryManager(emptyPlan, criteria)
+                  .initialSearch(ref, 2)
+                  .topDocs
+                  .scoreDocs)
+          .isEmpty();
+      assertThat(
+              factory
+                  .newOperatorManager(operator, emptyPlan, Optional.empty(), Optional.empty())
+                  .initialSearch(ref, 2)
+                  .topDocs
+                  .scoreDocs)
+          .isEmpty();
+    }
+  }
+
+  @Test
   public void shouldCapResultsWithLimitWhenNumCandidatesIsHigherThanLimit_float()
       throws IOException {
 

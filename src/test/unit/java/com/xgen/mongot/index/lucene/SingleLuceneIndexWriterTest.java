@@ -301,27 +301,28 @@ public class SingleLuceneIndexWriterTest {
 
   public static class DynamicVectorTests {
     private static final FieldPath PATH = FieldPath.parse("embedding");
-    private static final SearchIndexDefinition DEFINITION =
-        SearchIndexDefinitionBuilder.builder()
-            .defaultMetadata()
-            .mappings(
-                DocumentFieldDefinitionBuilder.builder()
-                    .dynamic("vectors")
-                    .field(
-                        "text",
-                        FieldDefinitionBuilder.builder()
-                            .string(StringFieldDefinitionBuilder.builder().build())
-                            .build())
-                    .build())
-            .typeSets(
-                new TypeSetDefinition(
-                    "vectors",
-                    List.of(
-                        new TypeSetVectorFieldDefinition(
-                            Optional.empty(),
-                            VectorSimilarity.EUCLIDEAN,
-                            VectorQuantization.NONE))))
-            .build();
+    private static final SearchIndexDefinition DEFINITION = definition(Optional.empty());
+
+    private static SearchIndexDefinition definition(Optional<Integer> dimensions) {
+      return SearchIndexDefinitionBuilder.builder()
+          .defaultMetadata()
+          .mappings(
+              DocumentFieldDefinitionBuilder.builder()
+                  .dynamic("vectors")
+                  .field(
+                      "text",
+                      FieldDefinitionBuilder.builder()
+                          .string(StringFieldDefinitionBuilder.builder().build())
+                          .build())
+                  .build())
+          .typeSets(
+              new TypeSetDefinition(
+                  "vectors",
+                  List.of(
+                      new TypeSetVectorFieldDefinition(
+                          dimensions, VectorSimilarity.EUCLIDEAN, VectorQuantization.NONE))))
+          .build();
+    }
 
     private static SingleLuceneIndexWriter open(
         Directory directory, SearchFieldDefinitionResolver resolver, Optional<Integer> limit)
@@ -380,6 +381,69 @@ public class SingleLuceneIndexWriterTest {
                       BsonVectorParser.encode(Vector.fromBytes(new byte[dimensions]))));
       return DocumentEvent.createInsert(
           DocumentMetadata.fromOriginalDocument(Optional.of(doc)), doc);
+    }
+
+    @Test
+    public void export_rejectedFixedVector_requiresLiveEvidence() throws Exception {
+      var definition = definition(Optional.of(2));
+      var resolver = definition.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      var registry = spy(AnalyzerRegistryBuilder.empty());
+      try (var analyzer =
+              CustomAnalyzer.builder(KeywordTokenizer::new)
+                  .tokenFilter(
+                      input ->
+                          new TokenFilter(input) {
+                            @Override
+                            public boolean incrementToken() {
+                              throw new RegexLimitExceededException();
+                            }
+                          })
+                  .build();
+          var directory = new ByteBuffersDirectory()) {
+        doReturn(analyzer).when(registry).getAnalyzer(anyString());
+        try (var writer = open(directory, resolver, Optional.empty(), registry)) {
+          writer.updateIndex(insert("{_id:2}"));
+          assertThrows(
+              RegexLimitExceededException.class,
+              () ->
+                  writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA=='),text:'reject'}")));
+
+          try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+            assertThat(exportFields(reader, resolver).containsKey("a.b")).isFalse();
+          }
+          writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA==')}"));
+          writer.commit(EncodedUserData.EMPTY);
+        }
+        var recovered = definition.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var writer = open(directory, recovered, Optional.empty());
+            var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+          assertThat(
+                  exportFields(reader, recovered)
+                      .getDocument("a.b")
+                      .getInt32("numDimensions")
+                      .getValue())
+              .isEqualTo(2);
+        }
+      }
+    }
+
+    private static DocumentEvent insert(String json) {
+      var raw = BsonUtils.documentToRaw(BsonDocument.parse(json));
+      return DocumentEvent.createInsert(
+          DocumentMetadata.fromOriginalDocument(Optional.of(raw)), raw);
+    }
+
+    private static BsonDocument exportFields(
+        DirectoryReader reader, SearchFieldDefinitionResolver resolver) throws IOException {
+      var fields =
+          LuceneIndexMappingExporter.publishedFields(
+              org.apache.lucene.index.FieldInfos.getMergedFieldInfos(reader), resolver);
+      return LuceneIndexMappingExporter.export(
+              resolver.indexDefinition,
+              IndexFormatVersion.CURRENT,
+              List.of(fields),
+              resolver.vectorDimensions().sourcePaths())
+          .getDocument("fields");
     }
 
     @Test
