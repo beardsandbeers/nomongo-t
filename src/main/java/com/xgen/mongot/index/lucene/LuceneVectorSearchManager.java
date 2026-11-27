@@ -94,7 +94,7 @@ public class LuceneVectorSearchManager implements LuceneSearchManager<QueryInfo>
     // Surface a timeout to the user if the deadline is exceeded
     DeadlineQueryTimeout.throwIfExceeded(Optional.ofNullable(indexSearcher.getTimeout()));
 
-    if (this.rescorer.isEmpty()) {
+    if (topCandidates.scoreDocs.length == 0 || this.rescorer.isEmpty()) {
       return topCandidates;
     }
 

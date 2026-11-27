@@ -6,11 +6,15 @@ import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
 
 import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
+import com.xgen.mongot.index.definition.FieldDefinitionResolver;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.VectorFieldSpecification;
+import com.xgen.mongot.index.definition.quantization.VectorQuantization;
 import com.xgen.mongot.index.lucene.codec.LuceneCodec;
 import com.xgen.mongot.index.lucene.extension.KnnByteVectorField;
 import com.xgen.mongot.index.lucene.extension.KnnFloatVectorField;
 import com.xgen.mongot.index.lucene.field.FieldName;
+import com.xgen.mongot.index.lucene.quantization.BinaryQuantizedVectorRescorer;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnByteQuery;
 import com.xgen.mongot.index.lucene.query.custom.MongotKnnFloatQuery;
 import com.xgen.mongot.index.lucene.query.custom.WrappedKnnQuery;
@@ -18,10 +22,13 @@ import com.xgen.mongot.index.lucene.query.util.WrappedToParentBlockJoinQuery;
 import com.xgen.mongot.index.lucene.searcher.LuceneSearcherFactory;
 import com.xgen.mongot.index.lucene.searcher.LuceneSearcherManager;
 import com.xgen.mongot.index.lucene.searcher.QueryCacheProvider;
+import com.xgen.mongot.index.query.operators.VectorSearchOperator;
+import com.xgen.mongot.index.query.scores.Score;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.FloatVector;
 import com.xgen.mongot.util.bson.Vector;
 import com.xgen.testing.mongot.index.query.ApproximateVectorQueryCriteriaBuilder;
+import com.xgen.testing.mongot.index.query.OperatorQueryBuilder;
 import com.xgen.testing.mongot.index.query.VectorQueryBuilder;
 import com.xgen.testing.mongot.mock.index.SearchIndex;
 import com.xgen.testing.mongot.mock.index.VectorIndex;
@@ -33,8 +40,10 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.KnnByteVectorQuery;
 import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.join.QueryBitSetProducer;
 import org.apache.lucene.search.join.ScoreMode;
@@ -42,6 +51,7 @@ import org.apache.lucene.store.ByteBuffersDirectory;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+import org.mockito.Mockito;
 
 /** Runs under every {@link LuceneCodec.WriteFormat}: results must be write-format-invariant. */
 @RunWith(Parameterized.class)
@@ -74,27 +84,18 @@ public class LuceneVectorSearchManagerTest {
             .numCandidates(8)
             .limit(2)
             .build();
-    var emptyPlan = new org.apache.lucene.search.MatchNoDocsQuery("No vectors observed at v");
-    var resolver =
-        org.mockito.Mockito.mock(com.xgen.mongot.index.definition.FieldDefinitionResolver.class);
-    var bound =
-        org.mockito.Mockito.mock(com.xgen.mongot.index.definition.VectorFieldSpecification.class);
-    org.mockito.Mockito.when(bound.quantization())
-        .thenReturn(com.xgen.mongot.index.definition.quantization.VectorQuantization.BINARY);
-    org.mockito.Mockito.when(resolver.getVectorFieldSpecification(path))
-        .thenReturn(Optional.of(bound));
+    var emptyPlan = new MatchNoDocsQuery("No vectors observed at v");
+    var resolver = Mockito.mock(FieldDefinitionResolver.class);
+    var bound = Mockito.mock(VectorFieldSpecification.class);
+    Mockito.when(bound.quantization()).thenReturn(VectorQuantization.BINARY);
+    Mockito.when(resolver.getVectorFieldSpecification(path)).thenReturn(Optional.of(bound));
     var factory =
         new LuceneSearchManagerFactory(
-            resolver,
-            org.mockito.Mockito.mock(
-                com.xgen.mongot.index.lucene.quantization.BinaryQuantizedVectorRescorer.class),
-            metrics);
+            resolver, Mockito.mock(BinaryQuantizedVectorRescorer.class), metrics);
     var operator =
-        com.xgen.testing.mongot.index.query.OperatorQueryBuilder.builder()
+        OperatorQueryBuilder.builder()
             .returnStoredSource(false)
-            .operator(
-                new com.xgen.mongot.index.query.operators.VectorSearchOperator(
-                    com.xgen.mongot.index.query.scores.Score.defaultScore(), criteria))
+            .operator(new VectorSearchOperator(Score.defaultScore(), criteria))
             .build();
     try (var manager =
             LuceneSearcherManager.create(
@@ -119,6 +120,22 @@ public class LuceneVectorSearchManagerTest {
       assertThat(
               factory
                   .newOperatorManager(operator, emptyPlan, Optional.empty(), Optional.empty())
+                  .initialSearch(ref, 2)
+                  .topDocs
+                  .scoreDocs)
+          .isEmpty();
+      var explain = new WrappedKnnQuery(emptyPlan);
+      assertThat(
+              factory
+                  .newVectorQueryManager(explain, criteria)
+                  .initialSearch(ref, 2)
+                  .topDocs
+                  .scoreDocs)
+          .isEmpty();
+      var countOnly = new ConstantScoreQuery(explain);
+      assertThat(
+              factory
+                  .newOperatorManager(operator, countOnly, Optional.empty(), Optional.empty())
                   .initialSearch(ref, 2)
                   .topDocs
                   .scoreDocs)

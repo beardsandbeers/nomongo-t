@@ -7,6 +7,7 @@ import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlagRegistry;
 import com.xgen.mongot.featureflag.dynamic.DynamicFeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.definition.FieldDefinitionResolver;
+import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.definition.quantization.VectorQuantization;
 import com.xgen.mongot.index.lucene.LuceneAggregationPlanResolver.AggregationPlan;
@@ -15,6 +16,7 @@ import com.xgen.mongot.index.lucene.LuceneFacetCollectorSearchManager.FacetColle
 import com.xgen.mongot.index.lucene.LuceneFacetGenericDrillSidewaysSearchManager.GenericDrillSidewaysResultFacetCollectorQueryInfo;
 import com.xgen.mongot.index.lucene.quantization.BinaryQuantizedVectorRescorer;
 import com.xgen.mongot.index.lucene.query.NestedAvgVectorRescorer;
+import com.xgen.mongot.index.lucene.query.custom.WrappedKnnQuery;
 import com.xgen.mongot.index.query.OperatorQuery;
 import com.xgen.mongot.index.query.counts.Count;
 import com.xgen.mongot.index.query.operators.VectorEmbeddedOptions;
@@ -27,6 +29,8 @@ import com.xgen.mongot.util.bson.Vector;
 import com.xgen.mongot.util.concurrent.NamedExecutorService;
 import java.util.Map;
 import java.util.Optional;
+import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Sort;
 
@@ -143,11 +147,17 @@ class LuceneSearchManagerFactory {
   }
 
   private VectorQuantization resolveQuantization(Query plan, FieldPath path) {
-    if (plan instanceof org.apache.lucene.search.MatchNoDocsQuery) {
+    // Explain and count-only plans wrap the same empty decision.
+    if (plan instanceof WrappedKnnQuery wrapped) {
+      return resolveQuantization(wrapped.getQuery(), path);
+    }
+    if (plan instanceof ConstantScoreQuery constant) {
+      return resolveQuantization(constant.getQuery(), path);
+    }
+    if (plan instanceof MatchNoDocsQuery) {
       return VectorQuantization.NONE;
     }
-    if (this.fieldDefinitionResolver
-        instanceof com.xgen.mongot.index.definition.SearchFieldDefinitionResolver search) {
+    if (this.fieldDefinitionResolver instanceof SearchFieldDefinitionResolver search) {
       var rule = search.getTypeSetVectorRule(path, Optional.empty());
       if (rule.isPresent()) {
         return rule.get().quantization();
