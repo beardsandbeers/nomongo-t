@@ -409,7 +409,7 @@ public class SingleLuceneIndexWriterTest {
                   writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA=='),text:'reject'}")));
 
           try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
-            assertThat(exportFields(reader, resolver).containsKey("a.b")).isFalse();
+            assertThat(exportFields(reader, resolver).keySet()).containsExactly("text");
           }
           writer.updateIndex(insert("{_id:1,'a.b':BinData(9,'AwAAAA==')}"));
           writer.commit(EncodedUserData.EMPTY);
@@ -427,6 +427,51 @@ public class SingleLuceneIndexWriterTest {
       }
     }
 
+    @Test
+    public void export_mixedFormatMerge_checksOnlySurvivingLegacyDocuments() throws Exception {
+      var definition = definition(Optional.of(2));
+      var resolver = definition.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+      var path = FieldPath.parse("a.b");
+      try (var directory = new ByteBuffersDirectory()) {
+        try (var writer = open(directory, resolver, Optional.empty())) {
+          var legacy = new Document();
+          legacy.add(
+              new org.apache.lucene.document.KnnByteVectorField(
+                  FieldName.TypeField.KNN_BYTE.getLuceneFieldName(path, Optional.empty()),
+                  new byte[] {1, 0},
+                  VectorSimilarityFunction.EUCLIDEAN));
+          legacy.add(
+              new org.apache.lucene.document.StringField(
+                  "legacyId", "one", org.apache.lucene.document.Field.Store.NO));
+          var lucene = writer.getLuceneWriter();
+          lucene.addDocument(legacy);
+          lucene.setLiveCommitData(
+              java.util.Map.of(
+                      "typeSetVectorSourcePathVersion", "1", "typeSetVectorSourcePath/a.b", "1")
+                  .entrySet());
+          lucene.commit();
+        }
+        var recovered = definition.createFieldDefinitionResolver(IndexFormatVersion.CURRENT);
+        try (var writer = open(directory, recovered, Optional.empty())) {
+          writer.updateIndex(insert("{_id:2,a:{b:BinData(9,'AwAAAA==')}}"));
+          writer.forceMerge(1);
+          writer.commit(EncodedUserData.EMPTY);
+          try (var reader = DirectoryReader.open(directory)) {
+            assertThat(reader.leaves()).hasSize(1);
+            assertThat(exportFields(reader, recovered).keySet()).containsAtLeast("a", "a.b");
+          }
+          writer
+              .getLuceneWriter()
+              .deleteDocuments(new org.apache.lucene.index.Term("legacyId", "one"));
+          try (var reader = DirectoryReader.open(writer.getLuceneWriter())) {
+            var fields = exportFields(reader, recovered);
+            assertThat(fields.containsKey("a.b")).isFalse();
+            assertThat(fields.getDocument("a").getDocument("fields").keySet()).containsExactly("b");
+          }
+        }
+      }
+    }
+
     private static DocumentEvent insert(String json) {
       var raw = BsonUtils.documentToRaw(BsonDocument.parse(json));
       return DocumentEvent.createInsert(
@@ -435,14 +480,8 @@ public class SingleLuceneIndexWriterTest {
 
     private static BsonDocument exportFields(
         DirectoryReader reader, SearchFieldDefinitionResolver resolver) throws IOException {
-      var fields =
-          LuceneIndexMappingExporter.publishedFields(
-              org.apache.lucene.index.FieldInfos.getMergedFieldInfos(reader), resolver);
-      return LuceneIndexMappingExporter.export(
-              resolver.indexDefinition,
-              IndexFormatVersion.CURRENT,
-              List.of(fields),
-              resolver.vectorDimensions().sourcePaths())
+      return LuceneIndexMappingExporter.exportSnapshot(
+              resolver.indexDefinition, IndexFormatVersion.CURRENT, List.of(reader))
           .getDocument("fields");
     }
 

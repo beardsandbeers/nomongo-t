@@ -58,10 +58,12 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleBoolean(Supplier<Boolean> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.booleanFieldDefinition().isPresent()) {
       boolean value = supplier.get();
       IndexableFieldFactory.addBooleanField(this.documentWrapper, this.path, value);
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
@@ -72,9 +74,11 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleDateTime(Supplier<Long> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     handleDateField(supplier);
     handleDateFacetField(supplier);
     handleSortableDateField(supplier);
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleDateField(Supplier<Long> supplier) {
@@ -124,6 +128,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleDouble(Supplier<Double> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<NumberFieldDefinition> numberFieldDefinition =
         this.fieldDefinition.numberFieldDefinition();
     Optional<NumberFacetFieldDefinition> numberFacetFieldDefinition =
@@ -139,6 +144,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     numberFacetFieldDefinition.ifPresent(
         definition -> handleDoubleFacetField(supplier, numberFieldDefinition, definition));
     sortableNumberFieldDefinition.ifPresent(definition -> handleSortBetaDoubleField(supplier));
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleDoubleField(
@@ -202,6 +208,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleGeometry(Supplier<Optional<Geometry>> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<GeoFieldDefinition> geoFieldDefinition = this.fieldDefinition.geoFieldDefinition();
     if (geoFieldDefinition.isEmpty()) {
       return;
@@ -228,6 +235,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
                 this.path, this.documentWrapper.getEmbeddedRoot()),
             this.documentWrapper.indexingMetricsUpdater)
         .forEach(this.documentWrapper.luceneDocument::add);
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
@@ -237,6 +245,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleInt64(Supplier<Long> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<NumberFieldDefinition> numberFieldDefinition =
         this.fieldDefinition.numberFieldDefinition();
     Optional<NumberFacetFieldDefinition> numberFacetFieldDefinition =
@@ -252,6 +261,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     numberFacetFieldDefinition.ifPresent(
         definition -> handleInt64FacetField(supplier, numberFieldDefinition, definition));
     sortBetaNumberFieldDefinition.ifPresent(definition -> handleSortBetaLongField(supplier));
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleInt64Field(
@@ -412,14 +422,17 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleObjectId(Supplier<ObjectId> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.objectIdFieldDefinition().isPresent()) {
       ObjectId objectId = supplier.get();
       IndexableFieldFactory.addObjectIdField(this.documentWrapper, this.path, objectId);
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
   public void handleString(Supplier<String> supplier) throws IOException {
+    int start = this.documentWrapper.firstFieldToObserve();
     handleSortableString(supplier);
 
     this.fieldDefinition
@@ -436,6 +449,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     if (this.fieldDefinition.autocompleteFieldDefinition().isPresent()) {
       IndexableFieldFactory.addAutocompleteField(this.documentWrapper, this.path, supplier.get());
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private static void doHandleString(
@@ -453,6 +467,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleUuid(Supplier<Optional<UUID>> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.uuidFieldDefinition().isEmpty()) {
       return;
     }
@@ -464,6 +479,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     }
 
     IndexableFieldFactory.addUuidField(this.documentWrapper, this.path, uuid.get());
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override

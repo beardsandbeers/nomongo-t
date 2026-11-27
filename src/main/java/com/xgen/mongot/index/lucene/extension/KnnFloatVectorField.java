@@ -1,7 +1,7 @@
 package com.xgen.mongot.index.lucene.extension;
 
 import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
-import com.xgen.mongot.index.definition.VectorDimensions;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import java.util.Optional;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.index.VectorEncoding;
@@ -33,7 +33,7 @@ public class KnnFloatVectorField extends org.apache.lucene.document.KnnFloatVect
     var type =
         new FieldType(new KnnFieldType(vector.length, VectorEncoding.FLOAT32, similarityFunction));
     if (sourcePath.isPresent()) {
-      type.putAttribute(VectorDimensions.SOURCE_PATH, sourcePath.get());
+      type.putAttribute(MappingObservations.VECTOR_SOURCE_PATH, sourcePath.get());
     }
     type.freeze();
     return type;

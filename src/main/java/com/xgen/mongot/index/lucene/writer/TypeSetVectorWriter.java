@@ -41,10 +41,9 @@ final class TypeSetVectorWriter {
   // A bare integer denotes a checkpoint written with the original physical field names.
   private static final String DIMENSIONED = "v2:";
   private static final String PATH_FORMAT = "typeSetVectorSourcePathVersion";
-  private static final String LEGACY_PATH_PREFIX = "typeSetVectorUnknownSourcePath/";
-  private static final String PATH_PREFIX = "typeSetVectorSourcePath/";
   private final Set<String> legacyPaths = new HashSet<>();
-  private final Set<String> sourcePaths = ConcurrentHashMap.newKeySet();
+  // Retain old checkpoint hints for documents that predate per-document observations.
+  private final Set<String> legacySpellings = new HashSet<>();
   private final VectorDimensions shared;
   private final ConcurrentHashMap<String, Binding> local = new ConcurrentHashMap<>();
 
@@ -70,12 +69,12 @@ final class TypeSetVectorWriter {
       for (var entry : commitData) {
         if (entry.getKey().equals(PATH_FORMAT)) {
           hasPathMetadata = true;
-        } else if (entry.getKey().startsWith(LEGACY_PATH_PREFIX)) {
-          partition.recordLegacyPath(entry.getKey().substring(LEGACY_PATH_PREFIX.length()));
-        } else if (entry.getKey().startsWith(PATH_PREFIX)) {
-          String shape = entry.getKey().substring(PATH_PREFIX.length());
-          partition.sourcePaths.add(shape);
-          partition.shared.recordSourcePath(shape);
+        } else if (entry.getKey().startsWith(VectorDimensions.LEGACY_PATH_PREFIX)) {
+          partition.recordLegacyPath(
+              entry.getKey().substring(VectorDimensions.LEGACY_PATH_PREFIX.length()));
+        } else if (entry.getKey().startsWith(VectorDimensions.PATH_PREFIX)) {
+          String shape = entry.getKey().substring(VectorDimensions.PATH_PREFIX.length());
+          partition.legacySpellings.add(shape);
         } else if (entry.getKey().startsWith(COMMIT_PREFIX)) {
           String path = entry.getKey().substring(COMMIT_PREFIX.length());
           try {
@@ -110,7 +109,6 @@ final class TypeSetVectorWriter {
 
   private void recordLegacyPath(String path) {
     this.legacyPaths.add(path);
-    this.shared.recordLegacyPath(path);
   }
 
   private void restorePhysicalFields(
@@ -155,7 +153,6 @@ final class TypeSetVectorWriter {
 
   void write(List<Document> block, Write write) throws IOException, FieldExceededLimitsException {
     List<Candidate> candidates = new ArrayList<>();
-    Set<String> newPaths = new HashSet<>();
     for (var doc : block) {
       var legacy = new ArrayList<IndexableField>();
       var fields = doc.iterator();
@@ -186,18 +183,15 @@ final class TypeSetVectorWriter {
             }
           }
         }
-        collectSourcePath(field, newPaths);
       }
       legacy.forEach(doc::add);
     }
-    if (candidates.isEmpty() && newPaths.isEmpty()) {
+    if (candidates.isEmpty()) {
       write.run();
       return;
     }
-    if (!candidates.isEmpty()) {
-      prepareAnalysis(block);
-    }
-    writeCandidates(candidates, newPaths, write);
+    prepareAnalysis(block);
+    writeCandidates(candidates, write);
   }
 
   private static Field withName(IndexableField field, String name) {
@@ -210,18 +204,7 @@ final class TypeSetVectorWriter {
     };
   }
 
-  private void collectSourcePath(IndexableField field, Set<String> paths) {
-    var attributes = field.fieldType().getAttributes();
-    if (attributes != null) {
-      String shape = attributes.get(VectorDimensions.SOURCE_PATH);
-      if (shape != null && !this.sourcePaths.contains(shape)) {
-        paths.add(shape);
-      }
-    }
-  }
-
-  private synchronized void writeCandidates(
-      List<Candidate> candidates, Set<String> newPaths, Write write)
+  private synchronized void writeCandidates(List<Candidate> candidates, Write write)
       throws IOException, FieldExceededLimitsException {
     // First writes also take the generation lock to choose one winner across partitions.
     synchronized (this.shared) {
@@ -240,15 +223,11 @@ final class TypeSetVectorWriter {
         if (decision.dimensions() != candidate.dimensions()) {
           candidate.doc().removeField(candidate.field().name());
           logMismatch(candidate.path(), decision.dimensions(), candidate.dimensions());
-        } else {
-          collectSourcePath(candidate.field(), newPaths);
         }
       }
       write.run();
       decisions.forEach(this.shared::record);
       this.local.putAll(decisions);
-      this.sourcePaths.addAll(newPaths);
-      newPaths.forEach(this.shared::recordSourcePath);
     }
   }
 
@@ -304,9 +283,9 @@ final class TypeSetVectorWriter {
             combined.put(
                 COMMIT_PREFIX + path,
                 (binding.dimensionInFieldName() ? DIMENSIONED : "") + binding.dimensions()));
-    combined.put(PATH_FORMAT, "1");
-    this.legacyPaths.forEach(path -> combined.put(LEGACY_PATH_PREFIX + path, "1"));
-    this.sourcePaths.forEach(shape -> combined.put(PATH_PREFIX + shape, "1"));
+    combined.put(PATH_FORMAT, "2");
+    this.legacyPaths.forEach(path -> combined.put(VectorDimensions.LEGACY_PATH_PREFIX + path, "1"));
+    this.legacySpellings.forEach(shape -> combined.put(VectorDimensions.PATH_PREFIX + shape, "1"));
     writer.setLiveCommitData(combined.entrySet());
     writer.commit();
   }

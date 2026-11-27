@@ -428,12 +428,17 @@ public final class StandaloneRuntime implements Closeable {
               .setActiveVersion(this.reads.version(definition));
       if (lease.reader() instanceof SearchIndexReader reader) {
         reader.refresh();
-        var mappings =
-            LuceneIndexMappingExporter.export(
-                definition.asSearchDefinition(),
-                lease.index().getGenerationId().generation.formatVersion.asLucene(),
-                reader.getFieldInfos(),
-                reader.getVectorSourcePaths());
+        var search = definition.asSearchDefinition();
+        var version = lease.index().getGenerationId().generation.formatVersion.asLucene();
+        org.bson.BsonDocument mappings;
+        if (search.dynamicVectorFields().findAny().isPresent()) {
+          try (var snapshot = reader.acquireStatisticsSnapshot()) {
+            mappings =
+                LuceneIndexMappingExporter.exportSnapshot(search, version, snapshot.readers());
+          }
+        } else {
+          mappings = LuceneIndexMappingExporter.export(search, version, reader.getFieldInfos());
+        }
         external.put("mappings", mappings);
         response
             .setMappingsJson(mappings.toJson())

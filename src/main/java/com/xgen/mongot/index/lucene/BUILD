@@ -21,6 +21,7 @@ java_library(
         "IndexBackingStrategyFactory.java",
         "InitializedLuceneSearchIndex.java",
         "InitializedLuceneVectorIndex.java",
+        "LegacyMappingFields.java",
         "LiveSearchSchema.java",
         "LuceneAggregationContextFieldResolver.java",
         "LuceneAggregationPlanResolver.java",

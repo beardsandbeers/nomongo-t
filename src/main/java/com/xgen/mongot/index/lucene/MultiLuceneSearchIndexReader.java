@@ -14,7 +14,6 @@ import com.xgen.mongot.index.MetaResults;
 import com.xgen.mongot.index.MeteredBatchProducer;
 import com.xgen.mongot.index.ReaderClosedException;
 import com.xgen.mongot.index.SearchIndexReader;
-import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
 import com.xgen.mongot.index.lucene.facet.TokenFacetsStateCache;
 import com.xgen.mongot.index.query.CollectorQuery;
@@ -424,12 +423,6 @@ public class MultiLuceneSearchIndexReader implements SearchIndexReader {
       sum += reader.getNumEmbeddedRootDocuments();
     }
     return sum;
-  }
-
-  @Override
-  public SourcePaths getVectorSourcePaths() {
-    // Readers for all partitions of a generation share their vector dimensions and source paths.
-    return this.readers.getFirst().getVectorSourcePaths();
   }
 
   @Override

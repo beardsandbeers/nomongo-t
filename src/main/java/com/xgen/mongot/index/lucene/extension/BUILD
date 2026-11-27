@@ -11,6 +11,7 @@ java_library(
     exports = ["@maven//:org_apache_lucene_lucene_core"],
     deps = [
         "//src/main/java/com/xgen/mongot/index/definition",
+        "//src/main/java/com/xgen/mongot/index/lucene/field",
         "@maven//:org_apache_lucene_lucene_core",
     ],
 )

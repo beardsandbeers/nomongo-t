@@ -251,7 +251,9 @@ The request accepts an optional `generation_id` fence. The response identifies t
 active revision, and the server refreshes its readers before collecting metadata from all partitions.
 This is a snapshot of materialized types: deleted fields can remain until segment merges, while
 null-only fields, empty objects/arrays, and unindexed values cannot supply an inferred type.
-Concurrent writes can add fields after the snapshot. Vector-search indexes return
+For Search indexes using vector type sets, new documents record exact BSON path spellings and
+deleted documents stop contributing those spellings after refresh. Concurrent writes can add fields
+after the snapshot. Vector-search indexes return
 `FAILED_PRECONDITION`; unavailable or transitioning search indexes return `UNAVAILABLE`.
 
 ## Index and field statistics

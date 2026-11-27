@@ -1,6 +1,7 @@
 package com.xgen.mongot.index.lucene.writer;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.RateLimiter;
 import com.google.errorprone.annotations.Var;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
@@ -26,6 +27,7 @@ import com.xgen.mongot.index.lucene.document.LuceneIndexingPolicy;
 import com.xgen.mongot.index.lucene.document.builder.DocumentBlockBuilder;
 import com.xgen.mongot.index.lucene.document.context.IndexingPolicyBuilderContext;
 import com.xgen.mongot.index.lucene.field.FieldName;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.lucene.merge.InstrumentedConcurrentMergeScheduler;
 import com.xgen.mongot.index.lucene.similarity.LuceneSimilarity;
 import com.xgen.mongot.index.lucene.sort.LuceneIndexSortCompatibilityValidator;
@@ -718,7 +720,10 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         throw WriterClosedException.create("getFieldNames");
       }
 
-      return this.luceneWriter.getFieldNames();
+      var fields = this.luceneWriter.getFieldNames();
+      return fields.contains(MappingObservations.NAME)
+          ? Sets.difference(fields, Set.of(MappingObservations.NAME))
+          : fields;
     }
   }
 
@@ -806,6 +811,14 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
   private void updateDocuments(
       byte[] encodedDocumentId, DocumentEvent event, List<Document> documentBlock)
       throws IOException, FieldExceededLimitsException {
+    if (this.typeSetVectors.isPresent()) {
+      for (var document : documentBlock) {
+        if (document.getField(MappingObservations.NAME)
+            instanceof MappingObservations observations) {
+          observations.finish(document);
+        }
+      }
+    }
     if (this.fieldLimit.isPresent()) {
       // Try to fail early so we don't exceed field limits.
       // This condition is sufficient but not necessary to exceed field limits (imagine a document
@@ -838,6 +851,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         documentBlock.stream()
             .flatMap(d -> d.getFields().stream())
             .map(IndexableField::name)
+            .filter(name -> !name.equals(MappingObservations.NAME))
             .distinct()
             .count();
     if (fieldsIndexed > fieldLimit) {
