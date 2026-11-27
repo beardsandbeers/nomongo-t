@@ -146,6 +146,7 @@ public final class LuceneIndexMappingExporter {
     }
     var terms = leaf.terms(MappingObservations.NAME);
     if (terms != null) {
+      @Var boolean recoverEmptyKey = false;
       var iterator = terms.iterator();
       while (iterator.next() != null) {
         if (iterator.term().length == 0 || !hasLivePosting(leaf, iterator)) {
@@ -153,11 +154,12 @@ public final class LuceneIndexMappingExporter {
         }
         String encoded = iterator.term().utf8ToString();
         if (encoded.equals(MappingObservations.LONG_ENTRY_MARKER)) {
-          observeLongEntries(leaf);
+          recoverEmptyKey |= observeLongEntries(leaf);
         } else {
-          observeEntry(leaf, MappingObservations.Entry.decode(encoded));
+          recoverEmptyKey |= observeEntry(leaf, encoded);
         }
       }
+      if (recoverEmptyKey) recoverEmptyKeyTypes(leaf);
       if (terms.getDocCount() == leaf.maxDoc()) return false;
       if (terms.getDocCount() < leaf.numDocs()) return true;
       return hasLiveOlderPosting(leaf, null);
@@ -366,7 +368,8 @@ public final class LuceneIndexMappingExporter {
     return true;
   }
 
-  private void observeLongEntries(LeafReader leaf) throws IOException {
+  private boolean observeLongEntries(LeafReader leaf) throws IOException {
+    @Var boolean recoverEmptyKey = false;
     for (var field : leaf.getFieldInfos()) {
       if (!field.name.startsWith(MappingObservations.LONG_ENTRY_PREFIX)) {
         continue;
@@ -376,13 +379,15 @@ public final class LuceneIndexMappingExporter {
         var presence = terms.iterator();
         if (presence.next() != null && hasLivePosting(leaf, presence)) {
           String encoded = field.name.substring(MappingObservations.LONG_ENTRY_PREFIX.length());
-          observeEntry(leaf, MappingObservations.Entry.decode(encoded));
+          recoverEmptyKey |= observeEntry(leaf, encoded);
         }
       }
     }
+    return recoverEmptyKey;
   }
 
-  private void observeEntry(LeafReader leaf, MappingObservations.Entry entry) {
+  private boolean observeEntry(LeafReader leaf, String encoded) {
+    var entry = MappingObservations.Entry.decode(encoded);
     if (entry.field().startsWith(MappingObservations.PRESENCE_PREFIX)) {
       var keys = entry.keys();
       int depth =
@@ -390,9 +395,41 @@ public final class LuceneIndexMappingExporter {
       var scope =
           this.scopes.computeIfAbsent(keys.subList(0, depth), unused -> new ObservedField());
       descend(scope, keys.subList(depth, keys.size())).present = true;
-      return;
+    } else {
+      observe(leaf.getFieldInfos().fieldInfo(entry.field()), Optional.of(entry.keys()));
     }
-    observe(leaf.getFieldInfos().fieldInfo(entry.field()), Optional.of(entry.keys()));
+    // A child can imply the empty root's presence, including in an array containing both a
+    // scalar and a document. Either form in an older live entry warrants checking its type.
+    return encoded.charAt(0) != '0' && entry.hasEmptyRoot();
+  }
+
+  /**
+   * V3 originally recorded a scalar at the empty root key as presence alone. Its physical name is
+   * unambiguous. Consult Lucene field metadata only for leaves carrying that old entry.
+   */
+  private void recoverEmptyKeyTypes(LeafReader leaf) throws IOException {
+    for (var field : leaf.getFieldInfos()) {
+      var type = FieldName.TypeField.getTypeOf(field.name);
+      if (type.isEmpty()
+          || !type.get().stripPrefix(field.name).isEmpty()
+          || publicType(type.get()).isEmpty()) continue;
+      if (leaf.hasDeletions()) {
+        var docs = fieldDocuments(leaf, field);
+        if (docs != null) {
+          if (!intersectsLive(leaf, docs, null)) continue;
+        } else {
+          var points = leaf.getPointValues(field.name);
+          var terms = leaf.terms(field.name);
+          if ((points == null || points.getDocCount() <= leaf.numDeletedDocs())
+              && (terms == null || terms.getDocCount() <= leaf.numDeletedDocs())) {
+            throw new AmbiguousVectorPathException(
+                "Reindex before exporting the empty BSON key: older index data does not identify"
+                    + " its live type.");
+          }
+        }
+      }
+      observe(field, Optional.of(List.of("")));
+    }
   }
 
   private static boolean hasLivePosting(LeafReader leaf, TermsEnum term) throws IOException {

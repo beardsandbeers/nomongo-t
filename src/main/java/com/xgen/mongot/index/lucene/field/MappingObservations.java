@@ -36,13 +36,19 @@ public final class MappingObservations extends StoredField {
 
   public record Entry(String field, String segments) {
     private String encode() {
-      return this.field.length() + ":" + this.field + this.segments;
+      // Original V3 writers omitted types for the empty root key. A leading zero in its
+      // decimal length distinguishes complete entries and is accepted by existing decoders.
+      return (hasEmptyRoot() ? "0" : "") + this.field.length() + ":" + this.field + this.segments;
     }
 
     public static Entry decode(String encoded) {
       int separator = encoded.indexOf(':');
       int end = separator + 1 + Integer.parseInt(encoded, 0, separator, 10);
       return new Entry(encoded.substring(separator + 1, end), encoded.substring(end));
+    }
+
+    public boolean hasEmptyRoot() {
+      return this.segments.isEmpty() || this.segments.startsWith("\0");
     }
 
     public List<String> keys() {
@@ -65,7 +71,8 @@ public final class MappingObservations extends StoredField {
   }
 
   public void recordPresence(FieldPath path) {
-    this.presentPaths.add(String.join("\0", path.getSegments()));
+    String segments = String.join("\0", path.getSegments());
+    this.presentPaths.add(segments);
   }
 
   public void recordScalarFields(Document document, int start, FieldPath path) {

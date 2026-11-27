@@ -250,8 +250,7 @@ public class FieldName {
 
       // Extract up to the first occurrence of DELIMITER for lookup
       int index = strippedField.indexOf(DELIMITER);
-      if (index == -1 || index + DELIMITER.length() >= strippedField.length()) {
-        // Return empty if no delimiter or if there's no content after the delimiter
+      if (index == -1) {
         return Optional.empty();
       }
 

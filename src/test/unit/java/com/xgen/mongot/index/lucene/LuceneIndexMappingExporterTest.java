@@ -24,6 +24,7 @@ import java.util.stream.IntStream;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
@@ -294,6 +295,69 @@ public class LuceneIndexMappingExporterTest {
         try (var after = DirectoryReader.openIfChanged(before)) {
           assertThat(snapshot(List.of(after)).getDocument("fields").isEmpty()).isTrue();
         }
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderEmptyKeyPresence_recoversLiveTypeAndDropsDeletedType()
+      throws Exception {
+    var old = new Document();
+    old.add(new StringField("id", "text", Field.Store.NO));
+    old.add(new TextField("$type:string/", "snow", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "11:$presence/0", Field.Store.NO));
+    var empty = new Document();
+    empty.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    empty.add(new StringField(MappingObservations.NAME, "11:$presence/0", Field.Store.NO));
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(empty);
+      try (var before = guardDocumentReads(DirectoryReader.open(writer))) {
+        assertThat(
+                snapshot(List.of(before))
+                    .getDocument("fields")
+                    .getDocument("")
+                    .getString("type")
+                    .getValue())
+            .isEqualTo("string");
+        writer.deleteDocuments(new Term("id", "text"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(
+                  snapshot(List.of(after))
+                      .getDocument("fields")
+                      .getDocument("")
+                      .getString("type")
+                      .getValue())
+              .isEqualTo("document");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderEmptyRootArrayChild_recoversScalarSibling() throws Exception {
+    var old = new Document();
+    old.add(new TextField("$type:string/", "snow", Field.Store.NO));
+    String child = "$type:string/.kid";
+    old.add(new TextField(child, "blue", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    old.add(
+        new StringField(
+            MappingObservations.NAME, child.length() + ":" + child + "\0kid", Field.Store.NO));
+    try (var dir = new ByteBuffersDirectory();
+        var writer = new IndexWriter(dir, new IndexWriterConfig())) {
+      writer.addDocument(old);
+      try (var reader = guardDocumentReads(DirectoryReader.open(writer))) {
+        var mappings = snapshot(List.of(reader)).getDocument("fields").getArray("");
+        assertThat(
+                mappings.stream()
+                    .map(value -> value.asDocument().getString("type").getValue())
+                    .toList())
+            .containsExactly("string", "document");
       }
     }
   }

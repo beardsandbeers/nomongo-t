@@ -3575,6 +3575,18 @@ public class StandaloneGrpcServerTest {
     }
   }
 
+  @Test
+  public void getIndexMappings_emptyKeyText_preservesTextAndExistence() throws Exception {
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "empty-key",
+          MIXED_VECTOR_MAPPING,
+          List.of("{_id:1,'':'snow'}", "{_id:2,'':null}"),
+          Map.of("{text:{path:'',query:'snow'}}", 1, "{exists:{path:''}}", 2));
+    }
+  }
+
   private static void assertReplayQueries(
       Fixture f,
       String name,
