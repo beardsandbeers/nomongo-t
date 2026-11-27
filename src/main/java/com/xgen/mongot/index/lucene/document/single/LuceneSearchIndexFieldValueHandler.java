@@ -335,8 +335,12 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
           .get()
           .ifPresent(
               vector ->
-                  IndexableFieldFactory.addKnnVectorField(
-                      this.documentWrapper, this.path, vector, bsonOnly.get().specification()));
+                  IndexableFieldFactory.addBsonVectorField(
+                      this.documentWrapper,
+                      this.path,
+                      vector,
+                      bsonOnly.get().specification(),
+                      false));
       return;
     }
     // Lucene and queries address a field by its dotted name, even for literal dots in BSON keys.
@@ -364,7 +368,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         .resolve(() -> Optional.of(vector.numDimensions()))
         .ifPresent(
             spec ->
-                IndexableFieldFactory.addKnnVectorField(
+                IndexableFieldFactory.addBsonVectorField(
                     this.documentWrapper, this.path, vector, spec, dimensionInFieldName));
   }
 

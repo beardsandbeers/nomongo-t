@@ -509,12 +509,20 @@ public class IndexableFieldFactory {
     addKnnVectorField(document, field, vector, specification, false, Optional.empty());
   }
 
-  static void addKnnVectorField(
+  static void addBsonVectorField(
       AbstractDocumentWrapper document,
       FieldPath field,
       Vector vector,
       VectorFieldSpecification specification,
       boolean dimensionInFieldName) {
+    // Intrinsically invalid input cannot reserve a dotted path shared with another BSON key.
+    int dimensions = vector.numDimensions();
+    if (dimensions < 1
+        || dimensions > VectorFieldSpecification.MAX_DIMENSIONS
+        || !VectorFieldSpecification.validQuantizationDimensions(
+            dimensions, specification.quantization())) {
+      return;
+    }
     Optional<String> sourcePath =
         field.toString().contains(".")
             ? Optional.of(String.join("\0", field.getSegments()))

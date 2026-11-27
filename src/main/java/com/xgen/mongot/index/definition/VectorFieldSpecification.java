@@ -238,7 +238,8 @@ public class VectorFieldSpecification implements DocumentEncodable {
     };
   }
 
-  static boolean validQuantizationDimensions(int dimensions, VectorQuantization quantization) {
+  public static boolean validQuantizationDimensions(
+      int dimensions, VectorQuantization quantization) {
     return quantization != VectorQuantization.BINARY || dimensions % 8 == 0;
   }
 
