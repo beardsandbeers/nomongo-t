@@ -1,7 +1,6 @@
 package com.xgen.mongot.index.lucene.writer;
 
 import com.google.common.flogger.FluentLogger;
-import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.FieldExceededLimitsException;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.VectorDimensions;
@@ -40,10 +39,6 @@ final class TypeSetVectorWriter {
   private static final String COMMIT_PREFIX = "typeSetVectorDimensions/";
   // A bare integer denotes a checkpoint written with the original physical field names.
   private static final String DIMENSIONED = "v2:";
-  private static final String PATH_FORMAT = "typeSetVectorSourcePathVersion";
-  private final Set<String> legacyPaths = new HashSet<>();
-  // Retain old checkpoint hints for documents that predate per-document observations.
-  private final Set<String> legacySpellings = new HashSet<>();
   private final VectorDimensions shared;
   private final ConcurrentHashMap<String, Binding> local = new ConcurrentHashMap<>();
 
@@ -64,18 +59,9 @@ final class TypeSetVectorWriter {
     var partition =
         new TypeSetVectorWriter(resolver.vectorDimensions(), writer.getConfig().getAnalyzer());
     var commitData = writer.getLiveCommitData();
-    @Var boolean hasPathMetadata = false;
     if (commitData != null) {
       for (var entry : commitData) {
-        if (entry.getKey().equals(PATH_FORMAT)) {
-          hasPathMetadata = true;
-        } else if (entry.getKey().startsWith(VectorDimensions.LEGACY_PATH_PREFIX)) {
-          partition.recordLegacyPath(
-              entry.getKey().substring(VectorDimensions.LEGACY_PATH_PREFIX.length()));
-        } else if (entry.getKey().startsWith(VectorDimensions.PATH_PREFIX)) {
-          String shape = entry.getKey().substring(VectorDimensions.PATH_PREFIX.length());
-          partition.legacySpellings.add(shape);
-        } else if (entry.getKey().startsWith(COMMIT_PREFIX)) {
+        if (entry.getKey().startsWith(COMMIT_PREFIX)) {
           String path = entry.getKey().substring(COMMIT_PREFIX.length());
           try {
             String value = entry.getValue();
@@ -95,24 +81,16 @@ final class TypeSetVectorWriter {
         }
       }
     }
-    if (DirectoryReader.indexExists(writer.getDirectory())
-        && (!hasPathMetadata
-            || partition.local.values().stream()
-                .anyMatch(binding -> !binding.dimensionInFieldName()))) {
+    if (partition.local.values().stream().anyMatch(binding -> !binding.dimensionInFieldName())
+        && DirectoryReader.indexExists(writer.getDirectory())) {
       try (var reader = DirectoryReader.open(writer.getDirectory())) {
-        partition.restorePhysicalFields(
-            resolver, FieldInfos.getMergedFieldInfos(reader), hasPathMetadata);
+        partition.restorePhysicalFields(FieldInfos.getMergedFieldInfos(reader));
       }
     }
     return Optional.of(partition);
   }
 
-  private void recordLegacyPath(String path) {
-    this.legacyPaths.add(path);
-  }
-
-  private void restorePhysicalFields(
-      SearchFieldDefinitionResolver resolver, FieldInfos fields, boolean hasPathMetadata) {
+  private void restorePhysicalFields(FieldInfos fields) {
     for (var field : fields) {
       if (field.getVectorDimension() == 0) {
         continue;
@@ -129,17 +107,6 @@ final class TypeSetVectorWriter {
           && !binding.dimensionInFieldName()
           && !FieldName.TypeField.isInferredVectorField(field.name)) {
         this.legacyFields.add(field.name);
-      }
-      if (!hasPathMetadata && path.contains(".")) {
-        var rule = resolver.getTypeSetVectorRule(FieldPath.parse(path), Optional.empty());
-        if (rule.isPresent()
-            && rule.get()
-                .numDimensions()
-                .or(() -> Optional.ofNullable(binding).map(Binding::dimensions))
-                .filter(n -> n == dims)
-                .isPresent()) {
-          recordLegacyPath(path);
-        }
       }
     }
   }
@@ -283,9 +250,6 @@ final class TypeSetVectorWriter {
             combined.put(
                 COMMIT_PREFIX + path,
                 (binding.dimensionInFieldName() ? DIMENSIONED : "") + binding.dimensions()));
-    combined.put(PATH_FORMAT, "2");
-    this.legacyPaths.forEach(path -> combined.put(VectorDimensions.LEGACY_PATH_PREFIX + path, "1"));
-    this.legacySpellings.forEach(shape -> combined.put(VectorDimensions.PATH_PREFIX + shape, "1"));
     writer.setLiveCommitData(combined.entrySet());
     writer.commit();
   }

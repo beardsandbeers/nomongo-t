@@ -458,6 +458,10 @@ public class SingleLuceneIndexWriterTest {
           writer.forceMerge(1);
           writer.commit(EncodedUserData.EMPTY);
           try (var reader = DirectoryReader.open(directory)) {
+            assertThat(reader.getIndexCommit().getUserData())
+                .doesNotContainKey("typeSetVectorSourcePath/a.b");
+            assertThat(reader.getIndexCommit().getUserData())
+                .doesNotContainKey("typeSetVectorSourcePathVersion");
             assertThat(reader.leaves()).hasSize(1);
             assertThrows(
                 LuceneIndexMappingExporter.AmbiguousVectorPathException.class,

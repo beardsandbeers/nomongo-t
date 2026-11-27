@@ -7,8 +7,6 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Learned BSON vector dimensions shared by the partitions and readers of one index generation. */
 public final class VectorDimensions {
-  public static final String LEGACY_PATH_PREFIX = "typeSetVectorUnknownSourcePath/";
-  public static final String PATH_PREFIX = "typeSetVectorSourcePath/";
 
   public record SourcePaths(Set<String> spellings, Set<String> legacyPaths) {
     public static final SourcePaths EMPTY = new SourcePaths(Set.of(), Set.of());
