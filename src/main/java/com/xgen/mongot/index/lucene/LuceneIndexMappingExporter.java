@@ -17,6 +17,7 @@ import com.xgen.mongot.index.definition.StringFieldDefinition;
 import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
+import com.xgen.mongot.index.lucene.config.LuceneConfig;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.version.IndexFormatVersion;
@@ -41,8 +42,10 @@ import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.util.Bits;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
@@ -157,22 +160,7 @@ public final class LuceneIndexMappingExporter {
       }
       if (terms.getDocCount() == leaf.maxDoc()) return false;
       if (terms.getDocCount() < leaf.numDocs()) return true;
-      // Current documents carry the empty term. Check gaps between runs only when
-      // deletions could account for every older document in this segment.
-      var current = leaf.postings(new Term(MappingObservations.NAME, new BytesRef()));
-      var live = leaf.getLiveDocs();
-      for (int doc = 0; doc < leaf.maxDoc(); ) {
-        int next = current.advance(doc);
-        while (doc < next && doc < leaf.maxDoc()) {
-          if (live == null || live.get(doc)) {
-            return true;
-          }
-          doc++;
-        }
-        if (next == DocIdSetIterator.NO_MORE_DOCS) break;
-        doc = current.docIDRunEnd();
-      }
-      return false;
+      return hasLiveOlderPosting(leaf, null);
     }
     return true;
   }
@@ -181,6 +169,8 @@ public final class LuceneIndexMappingExporter {
   // array or a skipped vector. Neither lookup requires stored documents or a value dictionary.
   private void verifyOlderSegment(LeafReader leaf) throws IOException {
     var definition = this.resolver.indexDefinition;
+    var names = leaf.terms(FieldName.MetaField.FIELD_NAMES.getLuceneFieldName());
+    var nameLookup = names == null ? null : names.iterator();
     for (var field : leaf.getFieldInfos()) {
       var physical = FieldName.TypeField.getTypeOf(field.name);
       if (physical.isEmpty()) continue;
@@ -188,56 +178,170 @@ public final class LuceneIndexMappingExporter {
       if (type.isEmpty() && physical.get() != FieldName.TypeField.NULL) continue;
       String path = physical.get().stripPrefix(field.name);
       int dimensions = physical.get().logicalVectorDimensions(field.getVectorDimension());
-      if (FieldName.EmbeddedField.isTypeOf(field.name)) {
-        String root = FieldName.getEmbeddedRootPathOrThrow(field.name);
-        for (var scope : definition.embeddedScopes(root)) {
-          verifyCovered(
-              scope.mapping(),
-              this.scopes.get(scope.keys()),
-              path.substring(root.length() + 1),
-              type,
-              dimensions,
-              path);
-        }
-      } else {
-        verifyCovered(
-            definition.getMappings(), this.scopes.get(List.of()), path, type, dimensions, path);
-      }
+      boolean covered =
+          FieldName.EmbeddedField.isTypeOf(field.name)
+              ? coveredInEmbeddedScopes(
+                  FieldName.getEmbeddedRootPathOrThrow(field.name), path, type, dimensions)
+              : isCovered(
+                  definition.getMappings(), this.scopes.get(List.of()), path, type, dimensions);
+      if (!covered && couldHaveLiveOlderValue(leaf, field, path, nameLookup)) throw uncovered(path);
     }
-    var names = leaf.terms(FieldName.MetaField.FIELD_NAMES.getLuceneFieldName());
     if (names == null) return;
     var it = names.iterator();
     while (it.next() != null) {
       String path = it.term().utf8ToString();
-      verifyCovered(
-          definition.getMappings(), this.scopes.get(List.of()), path, Optional.empty(), 0, path);
-      // The old existence field is shared by the parent and embedded documents.
-      for (int end = path.indexOf('.'); end >= 0; end = path.indexOf('.', end + 1)) {
-        for (var scope : definition.embeddedScopes(path.substring(0, end))) {
-          verifyCovered(
-              scope.mapping(),
-              this.scopes.get(scope.keys()),
-              path.substring(end + 1),
-              Optional.empty(),
-              0,
-              path);
-        }
-      }
+      if (!coveredPresence(path) && hasLiveOlderPosting(leaf, it)) throw uncovered(path);
     }
   }
 
-  private void verifyCovered(
+  private boolean coveredPresence(String path) {
+    if (!isCovered(
+        this.resolver.indexDefinition.getMappings(),
+        this.scopes.get(List.of()),
+        path,
+        Optional.empty(),
+        0)) return false;
+    // Older existence terms were shared by parent and embedded documents.
+    for (int end = path.indexOf('.'); end >= 0; end = path.indexOf('.', end + 1)) {
+      if (!coveredInEmbeddedScopes(path.substring(0, end), path, Optional.empty(), 0)) return false;
+    }
+    return true;
+  }
+
+  private boolean coveredInEmbeddedScopes(
+      String root, String path, Optional<Type> type, int dimensions) {
+    for (var scope : this.resolver.indexDefinition.embeddedScopes(root)) {
+      if (!isCovered(
+          scope.mapping(),
+          this.scopes.get(scope.keys()),
+          path.substring(root.length() + 1),
+          type,
+          dimensions)) return false;
+    }
+    return true;
+  }
+
+  private boolean couldHaveLiveOlderValue(
+      LeafReader leaf, FieldInfo field, String path, @Nullable TermsEnum nameLookup)
+      throws IOException {
+    var documents = fieldDocuments(leaf, field);
+    if (documents != null) return intersectsLive(leaf, documents, currentDocuments(leaf));
+    // Older writers and oversized paths can lack an existence term. Retain that uncertainty.
+    return nameLookup == null
+        || !this.resolver.indexCapabilities.supportsFieldExistsQuery()
+        || path.length() > LuceneConfig.MAX_TERM_CHAR_LENGTH
+        || !nameLookup.seekExact(new BytesRef(path))
+        || hasLiveOlderPosting(leaf, nameLookup);
+  }
+
+  private static AmbiguousVectorPathException uncovered(String path) {
+    return new AmbiguousVectorPathException(
+        "Reindex the source documents before exporting mappings: older index data does not record"
+            + " every BSON spelling of '"
+            + path
+            + "'.");
+  }
+
+  private static final int BLOCK_SIZE = 4096;
+
+  /**
+   * Intersect metadata postings, the complement of the format marker, and the live-doc mask. A null
+   * term denotes every document. Buffers are bounded independently of segment size.
+   */
+  private static boolean hasLiveOlderPosting(LeafReader leaf, @Nullable TermsEnum term)
+      throws IOException {
+    var marker = new Term(MappingObservations.NAME, new BytesRef());
+    long currentCount = leaf.docFreq(marker);
+    if (term != null && term.docFreq() > currentCount + leaf.numDeletedDocs()) return true;
+    return intersectsLive(
+        leaf, term == null ? null : term.postings(null, PostingsEnum.NONE), currentDocuments(leaf));
+  }
+
+  private static @Nullable PostingsEnum currentDocuments(LeafReader leaf) throws IOException {
+    return leaf.postings(new Term(MappingObservations.NAME, new BytesRef()), PostingsEnum.NONE);
+  }
+
+  private static @Nullable DocIdSetIterator fieldDocuments(LeafReader leaf, FieldInfo field)
+      throws IOException {
+    if (field.getVectorDimension() > 0) {
+      return switch (field.getVectorEncoding()) {
+        case BYTE -> {
+          var vectors = leaf.getByteVectorValues(field.name);
+          yield vectors == null ? DocIdSetIterator.empty() : vectors.iterator();
+        }
+        case FLOAT32 -> {
+          var vectors = leaf.getFloatVectorValues(field.name);
+          yield vectors == null ? DocIdSetIterator.empty() : vectors.iterator();
+        }
+      };
+    }
+    return field.hasNorms()
+        ? leaf.getNormValues(field.name)
+        : FieldExistsQuery.getDocValuesDocIdSetIterator(field.name, leaf);
+  }
+
+  /**
+   * Tests candidates AND live documents AND NOT exclusions one aligned block at a time. A null
+   * candidate set means every document.
+   */
+  private static boolean intersectsLive(
+      LeafReader leaf, @Nullable DocIdSetIterator candidates, @Nullable DocIdSetIterator current)
+      throws IOException {
+    if (current != null) current.nextDoc();
+    if (candidates != null) candidates.nextDoc();
+    var live = leaf.getLiveDocs();
+    var structured = leaf.getLiveDocsWithDeletedIterator();
+    var dense =
+        structured == null
+            ? null
+            : BitSetIterator.getFixedBitSetOrNull(structured.liveDocsIterator());
+    var deleted = structured != null && dense == null ? structured.deletedDocsIterator() : null;
+    if (deleted != null) deleted.nextDoc();
+    var block = new FixedBitSet(BLOCK_SIZE);
+    var mask = new FixedBitSet(BLOCK_SIZE);
+    for (int base = 0; base < leaf.maxDoc(); ) {
+      if (candidates != null) {
+        if (candidates.docID() == DocIdSetIterator.NO_MORE_DOCS) break;
+        base = candidates.docID() / BLOCK_SIZE * BLOCK_SIZE;
+      }
+      int end = base + Math.min(BLOCK_SIZE, leaf.maxDoc() - base);
+      block.clear();
+      if (candidates == null) block.set(0, end - base);
+      else candidates.intoBitSet(end, block, base);
+      subtractPostings(block, mask, current, base, end);
+      if (!block.scanIsEmpty() && live != null) {
+        if (dense != null) dense.applyMask(block, base);
+        else if (deleted != null) subtractPostings(block, mask, deleted, base, end);
+        else live.applyMask(block, base);
+      }
+      if (!block.scanIsEmpty()) return true;
+      base = end;
+    }
+    return false;
+  }
+
+  private static void subtractPostings(
+      FixedBitSet block, FixedBitSet mask, @Nullable DocIdSetIterator postings, int base, int end)
+      throws IOException {
+    if (postings == null) return;
+    if (postings.docID() < base) postings.advance(base);
+    if (postings.docID() >= end) return;
+    mask.clear();
+    postings.intoBitSet(end, mask, base);
+    block.andNot(mask);
+  }
+
+  private boolean isCovered(
       HierarchicalFieldDefinition parent,
       @Nullable ObservedField observed,
       String remaining,
       Optional<Type> type,
-      int dimensions,
-      String fullPath) {
+      int dimensions) {
     var dynamic =
         this.resolver
             .getDynamicFieldDefinition(parent)
             .filter(field -> type.isEmpty() || field.hasAnyFieldDefinitionOf(Set.of(type.get())));
-    if (parent.fields().isEmpty() && dynamic.isEmpty()) return;
+    if (parent.fields().isEmpty() && dynamic.isEmpty()) return true;
     for (int end = remaining.length(); end >= 0; end = remaining.lastIndexOf('.', end - 1)) {
       String key = remaining.substring(0, end);
       var configured = parent.getField(key);
@@ -246,22 +350,20 @@ public final class LuceneIndexMappingExporter {
       var child = observed == null ? null : observed.children.get(key);
       if (end < remaining.length()) {
         var doc = effective.get().documentFieldDefinition();
-        if (doc.isPresent())
-          verifyCovered(doc.get(), child, remaining.substring(end + 1), type, dimensions, fullPath);
+        if (doc.isPresent()
+            && !isCovered(doc.get(), child, remaining.substring(end + 1), type, dimensions))
+          return false;
       } else if (configured.isEmpty()
           && (type.isEmpty() || effective.get().hasAnyFieldDefinitionOf(Set.of(type.get())))) {
         if (child == null
             || (type.isPresent() && !child.types.contains(type.get()))
             || (type.orElse(null) == Type.VECTOR
                 && !child.vectorDimensions.equals(Optional.of(dimensions)))) {
-          throw new AmbiguousVectorPathException(
-              "Reindex the source documents before exporting mappings: older index data does not"
-                  + " record every BSON spelling of '"
-                  + fullPath
-                  + "'.");
+          return false;
         }
       }
     }
+    return true;
   }
 
   private void observeLongEntries(LeafReader leaf) throws IOException {
@@ -296,16 +398,7 @@ public final class LuceneIndexMappingExporter {
   private static boolean hasLivePosting(LeafReader leaf, TermsEnum term) throws IOException {
     // If more documents have the spelling than have been deleted, at least one still has it.
     return term.docFreq() > leaf.numDeletedDocs()
-        || hasLiveDoc(term.postings(null, PostingsEnum.NONE), leaf.getLiveDocs());
-  }
-
-  private static boolean hasLiveDoc(DocIdSetIterator docs, @Nullable Bits live) throws IOException {
-    for (int doc = docs.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = docs.nextDoc()) {
-      if (live == null || live.get(doc)) {
-        return true;
-      }
-    }
-    return false;
+        || intersectsLive(leaf, term.postings(null, PostingsEnum.NONE), null);
   }
 
   /**

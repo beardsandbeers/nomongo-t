@@ -231,6 +231,73 @@ public class LuceneIndexMappingExporterTest {
     assertThat(freshScore.get("$multi/a.b.nest")).isInstanceOf(BooleanSimilarity.class);
   }
 
+  @Test
+  public void exportSnapshot_deletedOlderPathIgnoresModernNamesWithLiveOlderNeighbor()
+      throws Exception {
+    try (var dir = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      var gone = new Document();
+      gone.add(new StringField("id", "gone", Field.Store.NO));
+      gone.add(new StringField("$type:string/gone", "value", Field.Store.NO));
+      gone.add(new StringField("$meta/fieldNames", "gone", Field.Store.NO));
+      writer.addDocument(gone);
+      writer.addDocument(new Document());
+      var current = observedString("literal", FieldPath.newRoot("a.b"));
+      current.add(new StringField("$meta/fieldNames", "a.b", Field.Store.NO));
+      writer.addDocument(current);
+      try (var before = DirectoryReader.open(writer)) {
+        assertThrows(
+            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            () -> snapshot(List.of(before)));
+        writer.deleteDocuments(new Term("id", "gone"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(snapshot(List.of(after)).getDocument("fields").keySet())
+              .containsExactly("a.b");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void
+      exportSnapshot_interleavedOldAndCurrentPostings_findsRemainingOlderDocumentAcrossBlocks()
+          throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      var old = new Document();
+      old.add(new StringField("group", "old", Field.Store.NO));
+      old.add(new StringField("$meta/fieldNames", "older", Field.Store.NO));
+      var current = new Document();
+      new MappingObservations().finish(current);
+      for (int i = 0; i < 4200; i++) {
+        writer.addDocument(old);
+        writer.addDocument(current);
+      }
+      var last = new Document();
+      last.add(new StringField("group", "last", Field.Store.NO));
+      last.add(new StringField("$meta/fieldNames", "older", Field.Store.NO));
+      writer.addDocument(last);
+      var obsolete = new Document();
+      obsolete.add(new StringField("group", "obsolete", Field.Store.NO));
+      new MappingObservations().finish(obsolete);
+      writer.addDocument(obsolete);
+      writer.commit();
+      writer.deleteDocuments(new Term("group", "old"), new Term("group", "obsolete"));
+      try (var before = guardDocumentReads(DirectoryReader.open(writer))) {
+        assertThrows(
+            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            () -> snapshot(List.of(before)));
+        writer.deleteDocuments(new Term("group", "last"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(snapshot(List.of(after)).getDocument("fields").isEmpty()).isTrue();
+        }
+      }
+    }
+  }
+
   private static BsonDocument snapshot(List<DirectoryReader> readers) throws IOException {
     return LuceneIndexMappingExporter.exportSnapshot(
         SearchIndexDefinitionBuilder.VALID_INDEX, IndexFormatVersion.CURRENT, readers);
