@@ -41,6 +41,7 @@ public class DocumentWrapper extends AbstractDocumentWrapper {
 
   private final Optional<FieldPath> embeddedRoot;
   private final Optional<MappingObservations> observations;
+  private final int observationScopeDepth;
 
   int firstFieldToObserve() {
     return this.observations.isPresent() ? this.luceneDocument.getFields().size() : 0;
@@ -50,11 +51,7 @@ public class DocumentWrapper extends AbstractDocumentWrapper {
     if (this.observations.isPresent()) {
       this.observations
           .get()
-          .recordScalarFields(
-              this.luceneDocument,
-              start,
-              path,
-              this.embeddedRoot.map(root -> root.getPathHierarchy().size()).orElse(0));
+          .recordScalarFields(this.luceneDocument, start, path, this.observationScopeDepth);
     }
   }
 
@@ -70,9 +67,19 @@ public class DocumentWrapper extends AbstractDocumentWrapper {
     super(luceneDocument, resolver.indexCapabilities, indexingMetricsUpdater, featureFlags);
     this.embeddedRoot = embeddedRoot;
     this.observations =
-        resolver.hasTypeSetVectorFields()
+        resolver.indexDefinition.requiresMappingObservations()
             ? Optional.of(new MappingObservations())
             : Optional.empty();
+    // Unique roots already identify the scope. Keep the compact relative encoding for them.
+    // Aliased roots need their original BSON boundaries in the observation itself.
+    this.observationScopeDepth =
+        embeddedRoot
+            .filter(
+                root ->
+                    this.observations.isPresent()
+                        && resolver.indexDefinition.embeddedScopes(root.toString()).size() == 1)
+            .map(root -> root.getPathHierarchy().size())
+            .orElse(0);
     this.observations.ifPresent(luceneDocument::add);
     this.isNumberAndDateSortable =
         embeddedRoot.isEmpty() || resolver.indexCapabilities.supportsEmbeddedNumericAndDateV2();

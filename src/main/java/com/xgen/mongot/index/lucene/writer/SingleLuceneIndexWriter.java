@@ -104,6 +104,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
   private volatile LuceneIndexingPolicy indexingPolicy;
 
   private final Optional<TypeSetVectorWriter> typeSetVectors;
+  private final boolean recordsMappingObservations;
 
   /**
    * An optional upper limit for fields in an index. To support different indexing patterns, this
@@ -152,7 +153,9 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
       IndexMetricsUpdater.IndexingMetricsUpdater indexingMetricsUpdater,
       Set<FieldPath> fieldPathsToFilterOut,
       FeatureFlags featureFlags,
-      Optional<TypeSetVectorWriter> typeSetVectors) {
+      Optional<TypeSetVectorWriter> typeSetVectors,
+      boolean recordsMappingObservations) {
+    this.recordsMappingObservations = recordsMappingObservations;
     this.typeSetVectors = typeSetVectors;
     HashMap<String, Object> defaultKeyValues = new HashMap<>();
     defaultKeyValues.put("indexId", indexId);
@@ -240,7 +243,8 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             indexingMetricsUpdater,
             customVectorEngineFields,
             featureFlags,
-            Optional.empty());
+            Optional.empty(),
+            false);
 
     writer
         .logger
@@ -376,7 +380,8 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             indexingMetricsUpdater,
             Set.of(),
             featureFlags,
-            typeSetVectors);
+            typeSetVectors,
+            resolver.indexDefinition.requiresMappingObservations());
 
     writer
         .logger
@@ -812,7 +817,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
   private void updateDocuments(
       byte[] encodedDocumentId, DocumentEvent event, List<Document> documentBlock)
       throws IOException, FieldExceededLimitsException {
-    if (this.typeSetVectors.isPresent()) {
+    if (this.recordsMappingObservations) {
       for (var document : documentBlock) {
         if (document.getField(MappingObservations.NAME)
             instanceof MappingObservations observations) {

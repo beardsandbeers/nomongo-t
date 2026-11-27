@@ -3376,6 +3376,95 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void getIndexMappings_scalarAndVectorOnDifferentSpellings_preservesBothQueries()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id = f.create("typed-aliases", MIXED_VECTOR_MAPPING);
+      String literal = "{_id:1,'a.b':'snow'}";
+      String nested = "{_id:2,a:{b:" + bsonFloatVector(1, 0) + "}}";
+      f.upsert(id, literal);
+      f.upsert(id, nested);
+
+      var fixed = f.create("typed-static", exportMappings(f, id).getDefinitionJson());
+      f.upsert(fixed, literal);
+      f.upsert(fixed, nested);
+
+      assertSameSingleHit(f, fixed, id, exactVectorQuery("a.b", "[1,0]"));
+      assertSameSingleHit(f, fixed, id, "{text:{path:'a.b',query:'snow'}}");
+    }
+  }
+
+  @Test
+  public void upsert_wrongDimensionBeforeValidAlias_preservesValidVectorAcrossReplay()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id = f.create("dimension-alias", MIXED_VECTOR_MAPPING);
+      String valid = bsonFloatVector(1, 0);
+      String first = "{_id:1,a:{b:" + valid + "}}";
+      String second = "{_id:2,'a.b':" + bsonFloatVector(1, 0, 0) + ",a:{b:" + valid + "}}";
+      f.upsert(id, first);
+      f.upsert(id, second);
+
+      var fixed = f.create("dimension-static", exportMappings(f, id).getDefinitionJson());
+      f.upsert(fixed, first);
+      f.upsert(fixed, second);
+      String query = exactVectorQuery("a.b", "[1,0]");
+      var original = f.query(id, query).getArray("results");
+
+      assertThat(original).hasSize(2);
+      assertThat(f.query(fixed, query).getArray("results")).containsExactlyElementsIn(original);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_aliasedEmbeddedRoots_preservesDistinctChildrenAfterRestart()
+      throws Exception {
+    assertDistinctEmbeddedChildren(
+        """
+        {mappings:{dynamic:{typeSet:'v'},fields:{'a.b':{type:'embeddedDocuments',dynamic:true},
+            a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}},
+         typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}
+        """);
+  }
+
+  @Test
+  public void getIndexMappings_aliasedEmbeddedRootsWithoutVectors_preservesDistinctChildren()
+      throws Exception {
+    assertDistinctEmbeddedChildren(
+        """
+        {mappings:{dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:true},
+            a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}}
+        """);
+  }
+
+  private void assertDistinctEmbeddedChildren(String definition) throws Exception {
+    var directory = data();
+    String id;
+    try (var f = new Fixture(directory)) {
+      id = f.create("embedded-aliases", definition);
+      f.upsert(id, "{_id:1,'a.b':[{leftOnly:'snow'}]}");
+      f.upsert(id, "{_id:2,a:{b:[{rightOnly:'rain'}]}}");
+    }
+    try (var f = new Fixture(directory)) {
+      f.ready(id, 1);
+      var fields =
+          BsonDocument.parse(exportMappings(f, id).getMappingsJson()).getDocument("fields");
+      assertThat(fields.getDocument("a.b").getDocument("fields").keySet())
+          .containsExactly("leftOnly");
+      assertThat(
+              fields
+                  .getDocument("a")
+                  .getDocument("fields")
+                  .getDocument("b")
+                  .getDocument("fields")
+                  .keySet())
+          .containsExactly("rightOnly");
+    }
+  }
+
+  @Test
   public void upsert_binaryAliases_preservesCandidateOrderOnReplay() throws Exception {
     Similarity.load();
     try (var f = new Fixture(data())) {
@@ -3404,7 +3493,7 @@ public class StandaloneGrpcServerTest {
 
       var query = "{vectorSearch:{path:'a.b',exact:true,queryVector:[1,0,0,0,0,0,0,0],limit:10}}";
       var original = f.query(id, query).getArray("results");
-      assertThat(original).hasSize(5);
+      assertThat(original).hasSize(docs.size());
       assertThat(f.query(fixed, query).getArray("results")).containsExactlyElementsIn(original);
     }
   }

@@ -2,6 +2,9 @@ package com.xgen.mongot.index.definition;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
+import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
@@ -32,6 +35,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.collections4.Trie;
@@ -121,6 +125,9 @@ public final class SearchIndexDefinition implements IndexDefinition {
   private final Optional<String> analyzerName;
   private final Optional<String> searchAnalyzerName;
   private final DocumentFieldDefinition mappings;
+  private final ImmutableListMultimap<String, EmbeddedScope> embeddedScopes;
+  private final Supplier<Boolean> hasTypeSetVectorFields =
+      Suppliers.memoize(() -> dynamicVectorFields().findAny().isPresent());
   private final AutoEmbedFieldSet autoEmbedFields;
   private final Optional<List<CustomAnalyzerDefinition>> analyzers;
   private final int indexFeatureVersion;
@@ -200,6 +207,11 @@ public final class SearchIndexDefinition implements IndexDefinition {
                             CollectionUtils.toMapUnsafe(
                                 TypeSetDefinition::name, Function.identity())))
             .orElse(Collections.emptyMap());
+    var scopes = ImmutableListMultimap.<String, EmbeddedScope>builder();
+    if (hasEmbeddedFields()) {
+      collectEmbeddedScopes(this.mappings, Optional.empty(), scopes);
+    }
+    this.embeddedScopes = scopes.build();
     this.definitionVersion = definitionVersion;
     this.definitionVersionCreatedAt = definitionVersionCreatedAt;
     this.definitionVersionId = definitionVersionId;
@@ -561,6 +573,46 @@ public final class SearchIndexDefinition implements IndexDefinition {
         .map(entry -> typeFilter.apply(entry.getValue()).map(val -> Map.entry(entry.getKey(), val)))
         .flatMap(Optional::stream)
         .collect(Collectors.toSet());
+  }
+
+  public record EmbeddedScope(
+      ImmutableList<String> keys, EmbeddedDocumentsFieldDefinition mapping) {}
+
+  public ImmutableList<EmbeddedScope> embeddedScopes(String dottedRoot) {
+    return this.embeddedScopes.get(dottedRoot);
+  }
+
+  public boolean hasTypeSetVectorFields() {
+    return this.hasTypeSetVectorFields.get();
+  }
+
+  public boolean requiresMappingObservations() {
+    return hasTypeSetVectorFields()
+        || this.embeddedScopes.size() > this.embeddedScopes.keySet().size();
+  }
+
+  private static void collectEmbeddedScopes(
+      HierarchicalFieldDefinition parent,
+      Optional<FieldPath> prefix,
+      ImmutableListMultimap.Builder<String, EmbeddedScope> scopes) {
+    parent
+        .fields()
+        .forEach(
+            (name, field) -> {
+              var path = prefix.map(p -> p.newChild(name)).orElseGet(() -> FieldPath.newRoot(name));
+              field
+                  .documentFieldDefinition()
+                  .ifPresent(doc -> collectEmbeddedScopes(doc, Optional.of(path), scopes));
+              field
+                  .embeddedDocumentsFieldDefinition()
+                  .ifPresent(
+                      embedded -> {
+                        scopes.put(
+                            path.toString(),
+                            new EmbeddedScope(ImmutableList.copyOf(path.getSegments()), embedded));
+                        collectEmbeddedScopes(embedded, Optional.of(path), scopes);
+                      });
+            });
   }
 
   /** Returns the fields in the static configuration. */
@@ -953,7 +1005,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
           path.map(p -> p.newChild(entry.getKey()))
               .orElseGet(() -> FieldPath.parse(entry.getKey()));
 
-      fields.put(childPath.toString(), childDefinition);
+      fields.merge(childPath.toString(), childDefinition, FieldDefinition::mergeQueryAliases);
 
       if (childDefinition.documentFieldDefinition().isPresent()) {
         registerFields(

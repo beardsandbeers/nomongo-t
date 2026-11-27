@@ -517,7 +517,10 @@ public class IndexableFieldFactory {
       boolean dimensionInFieldName) {
     // Intrinsically invalid input cannot reserve a dotted path shared with another BSON key.
     int dimensions = vector.numDimensions();
-    if (dimensions < 1
+    if (dimensions != specification.numDimensions()
+        || vector.getVectorType() == Vector.VectorType.FLOAT16
+        || (specification.similarity() == VectorSimilarity.COSINE && vector.isZeroVector())
+        || dimensions < 1
         || dimensions > VectorFieldSpecification.MAX_DIMENSIONS
         || !VectorFieldSpecification.validQuantizationDimensions(
             dimensions, specification.quantization())) {
@@ -539,8 +542,14 @@ public class IndexableFieldFactory {
       Optional<String> sourcePath) {
     // This is the field name we use to check for duplicate vectors and invalid vectors. The
     // embeddedRoot is set to be empty when we are retrieving the field name for this purpose.
+    // An inferred path can receive different lengths from distinct BSON spellings in the same
+    // document. Keep the first valid candidate of each length until the partition writer selects
+    // the committed length under the discovery lock.
     String checkFieldName =
-        FieldName.TypeField.KNN_VECTOR.getLuceneFieldName(field, Optional.empty());
+        dimensionInFieldName
+            ? FieldName.TypeField.KNN_VECTOR.getInferredVectorFieldName(
+                field, specification.numDimensions())
+            : FieldName.TypeField.KNN_VECTOR.getLuceneFieldName(field, Optional.empty());
 
     // Skip vectors of invalid size to not fail indexing.
     // Note: we need to do duplicate and validity check before the dimension check and similarity

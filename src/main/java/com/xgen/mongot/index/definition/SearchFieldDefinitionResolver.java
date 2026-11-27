@@ -1,6 +1,5 @@
 package com.xgen.mongot.index.definition;
 
-import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableMap;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.version.IndexCapabilities;
@@ -8,7 +7,6 @@ import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
  * FieldDefinitionResolver retrieves the correct FieldDefinition for a combination of path +
@@ -21,10 +19,9 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
   public final SearchIndexCapabilities indexCapabilities;
 
   private final VectorDimensions vectorDimensions;
-  private final Supplier<Boolean> hasTypeSetVectorFields;
 
   public boolean hasTypeSetVectorFields() {
-    return this.hasTypeSetVectorFields.get();
+    return this.indexDefinition.hasTypeSetVectorFields();
   }
 
   public VectorDimensions vectorDimensions() {
@@ -38,8 +35,6 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
     this.indexDefinition = indexDefinition;
     this.indexCapabilities = indexDefinition.getIndexCapabilities(indexFormatVersion);
     this.vectorDimensions = vectorDimensions;
-    this.hasTypeSetVectorFields =
-        Suppliers.memoize(() -> indexDefinition.dynamicVectorFields().findAny().isPresent());
   }
 
   SearchFieldDefinitionResolver(

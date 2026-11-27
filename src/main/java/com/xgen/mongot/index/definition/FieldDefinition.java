@@ -191,7 +191,31 @@ public record FieldDefinition(
         this.typeSetVectorFieldDefinition);
   }
 
-  static FieldDefinition fromValidatedFieldTypeDefinitions(List<FieldTypeDefinition> definitions) {
+  /**
+   * Builds the query lookup for BSON spellings sharing a dotted name. Ingestion reads the
+   * individual definitions from the mapping tree. Keep the later mapping's document hierarchy and
+   * precedence for competing vector specifications or definitions of the same type.
+   */
+  static FieldDefinition mergeQueryAliases(FieldDefinition previous, FieldDefinition current) {
+    var otherLeafTypes =
+        previous
+            .getAllDefinitions()
+            .flatMap(Optional::stream)
+            .filter(
+                definition ->
+                    switch (definition.getType()) {
+                      case DOCUMENT, EMBEDDED_DOCUMENTS -> false;
+                      case AUTO_EMBED, VECTOR, KNN_VECTOR ->
+                          current.vectorFieldSpecification().isEmpty();
+                      default -> true;
+                    });
+    return fromValidatedFieldTypeDefinitions(
+        Stream.concat(otherLeafTypes, current.getAllDefinitions().flatMap(Optional::stream))
+            .toList());
+  }
+
+  static FieldDefinition fromValidatedFieldTypeDefinitions(
+      List<? extends FieldTypeDefinition> definitions) {
     @Var Optional<AutocompleteFieldDefinition> autocompleteFieldDefinition = Optional.empty();
     @Var Optional<BooleanFieldDefinition> booleanFieldDefinition = Optional.empty();
     @Var Optional<DateFieldDefinition> dateFieldDefinition = Optional.empty();

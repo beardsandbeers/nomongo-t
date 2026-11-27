@@ -19,9 +19,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.DirectoryReader;
@@ -37,6 +40,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.StoredFieldVisitor;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.Terms;
@@ -126,6 +130,155 @@ public class LuceneIndexMappingExporterTest {
     }
   }
 
+  @Test
+  public void exportSnapshot_mixedLegacyFields_reusesStoredEvidenceOnRepeatedExport()
+      throws Exception {
+    var old = new Document();
+    old.add(new StringField("id", "old", Field.Store.NO));
+    old.add(new StringField("$type:string/title", "old", Field.Store.YES));
+    var storedText = new FieldType(StringField.TYPE_STORED);
+    storedText.setTokenized(true);
+    old.add(new Field("$type:string/blank", "", storedText));
+    var reads = new AtomicInteger();
+    try (var directory = new ByteBuffersDirectory();
+        var analyzer = new StandardAnalyzer();
+        var writer =
+            new IndexWriter(
+                directory,
+                new IndexWriterConfig(analyzer).setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(observedString("one", FieldPath.newRoot("owner")));
+      writer.addDocument(observedString("two", FieldPath.newRoot("project")));
+      writer.commit();
+      var initial = DirectoryReader.open(writer);
+      try (var counted = guardDocumentReads(initial, Optional.of(reads))) {
+        var first =
+            LuceneIndexMappingExporter.exportSnapshot(
+                SearchIndexDefinitionBuilder.VALID_INDEX,
+                IndexFormatVersion.CURRENT,
+                List.of(counted));
+        assertThat(first.getDocument("fields").keySet())
+            .containsExactly("title", "blank", "owner", "project");
+        assertThat(reads.get()).isEqualTo(1);
+
+        var second =
+            LuceneIndexMappingExporter.exportSnapshot(
+                SearchIndexDefinitionBuilder.VALID_INDEX,
+                IndexFormatVersion.CURRENT,
+                List.of(counted));
+        assertThat(second).isEqualTo(first);
+        assertThat(reads.get()).isEqualTo(1);
+
+        writer.deleteDocuments(new Term("id", "old"));
+        writer.commit();
+        try (var after = guardDocumentReads(DirectoryReader.openIfChanged(initial))) {
+          var fields =
+              LuceneIndexMappingExporter.exportSnapshot(
+                      SearchIndexDefinitionBuilder.VALID_INDEX,
+                      IndexFormatVersion.CURRENT,
+                      List.of(after))
+                  .getDocument("fields");
+          assertThat(fields.keySet()).containsExactly("owner", "project");
+        }
+        assertThat(
+                LuceneIndexMappingExporter.exportSnapshot(
+                    SearchIndexDefinitionBuilder.VALID_INDEX,
+                    IndexFormatVersion.CURRENT,
+                    List.of(counted)))
+            .isEqualTo(first);
+        assertThat(reads.get()).isEqualTo(1);
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_preObservationDocument_retainsBothExplicitSpellings()
+      throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'string'},a:{type:'document',fields:{b:{type:'string'}}},
+                     emb:{type:'document',dynamic:{typeSet:'v'}}}}
+                    """))
+            .typeSets(vectorTypeSet())
+            .build();
+    var old = new Document();
+    old.add(new StringField("$type:string/a.b", "snow", Field.Store.YES));
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig())) {
+      writer.addDocument(old);
+      writer.commit();
+      try (var reader = DirectoryReader.open(directory)) {
+        var fields =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(reader))
+                .getDocument("fields");
+        assertThat(fields.getDocument("a.b"))
+            .isEqualTo(fields.getDocument("a").getDocument("fields").getDocument("b"));
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderRelativeEmbeddedKeys_requiresEvidenceToSelectScope()
+      throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:true},
+                     a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}
+                    """))
+            .build();
+    String field = "$embedded:3/a.b/$type:string/a.b.leftOnly";
+    var previous = new Document();
+    previous.add(new StringField(field, "old", Field.Store.NO));
+    previous.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    previous.add(
+        new StringField(
+            MappingObservations.NAME, field.length() + ":" + field + "leftOnly", Field.Store.NO));
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig())) {
+      writer.addDocument(previous);
+      writer.commit();
+      try (var reader = DirectoryReader.open(directory)) {
+        assertThrows(
+            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            () ->
+                LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(reader)));
+        var unique =
+            SearchIndexDefinitionBuilder.builder()
+                .defaultMetadata()
+                .mappings(
+                    mappings(
+                        """
+                        {dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:false},
+                         a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}
+                        """))
+                .build();
+        var fields =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    unique, IndexFormatVersion.CURRENT, List.of(reader))
+                .getDocument("fields");
+        assertThat(fields.getDocument("a.b").getDocument("fields").isEmpty()).isTrue();
+        assertThat(
+                fields
+                    .getDocument("a")
+                    .getDocument("fields")
+                    .getDocument("b")
+                    .getDocument("fields")
+                    .containsKey("leftOnly"))
+            .isTrue();
+      }
+    }
+  }
+
   private static Document observedString(String id, FieldPath path) throws IOException {
     var document = new Document();
     var observations = new MappingObservations();
@@ -139,6 +292,11 @@ public class LuceneIndexMappingExporterTest {
   }
 
   private static DirectoryReader guardDocumentReads(DirectoryReader reader) throws IOException {
+    return guardDocumentReads(reader, Optional.empty());
+  }
+
+  private static DirectoryReader guardDocumentReads(
+      DirectoryReader reader, Optional<AtomicInteger> reads) throws IOException {
     return new FilterDirectoryReader(
         reader,
         new FilterDirectoryReader.SubReaderWrapper() {
@@ -146,8 +304,18 @@ public class LuceneIndexMappingExporterTest {
           public LeafReader wrap(LeafReader leaf) {
             return new FilterLeafReader(leaf) {
               @Override
-              public StoredFields storedFields() {
-                throw new AssertionError("opening stored documents during mapping export");
+              public StoredFields storedFields() throws IOException {
+                if (reads.isEmpty()) {
+                  throw new AssertionError("opening stored documents during mapping export");
+                }
+                var stored = in.storedFields();
+                return new StoredFields() {
+                  @Override
+                  public void document(int doc, StoredFieldVisitor visitor) throws IOException {
+                    reads.get().incrementAndGet();
+                    stored.document(doc, visitor);
+                  }
+                };
               }
 
               @Override
@@ -188,7 +356,7 @@ public class LuceneIndexMappingExporterTest {
         }) {
       @Override
       protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
-        return guardDocumentReads(in);
+        return guardDocumentReads(in, reads);
       }
 
       @Override

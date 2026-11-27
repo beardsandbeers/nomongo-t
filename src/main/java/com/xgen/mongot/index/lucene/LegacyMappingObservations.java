@@ -17,14 +17,12 @@ import org.apache.lucene.index.Term;
 import org.apache.lucene.search.DocIdSet;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.util.BitSetIterator;
-import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.DocIdSetBuilder;
 import org.apache.lucene.util.FixedBitSet;
-import org.jetbrains.annotations.Nullable;
 
 /** Builds postings once for stored V1 observations and keeps pre-observation documents separate. */
-record LegacyMappingObservations(Map<Entry, DocIdSet> stored, FixedBitSet unrecorded) {
+record LegacyMappingObservations(Map<Entry, DocIdSet> stored, LegacyMappingFields unrecorded) {
   private static final Cache<IndexReader.CacheKey, LegacyMappingObservations> CACHE =
       CacheBuilder.newBuilder().build();
 
@@ -56,7 +54,7 @@ record LegacyMappingObservations(Map<Entry, DocIdSet> stored, FixedBitSet unreco
     }
     unrecorded.flip(0, leaf.maxDoc());
     if (leaf.getFieldInfos().fieldInfo(MappingObservations.STORED_V1) == null) {
-      return new LegacyMappingObservations(Map.of(), unrecorded);
+      return new LegacyMappingObservations(Map.of(), new LegacyMappingFields(unrecorded));
     }
 
     var stored = leaf.storedFields();
@@ -80,15 +78,6 @@ record LegacyMappingObservations(Map<Entry, DocIdSet> stored, FixedBitSet unreco
     }
     var postings = new HashMap<Entry, DocIdSet>();
     builders.forEach((entry, builder) -> postings.put(entry, builder.build()));
-    return new LegacyMappingObservations(postings, unrecorded);
-  }
-
-  FixedBitSet liveUnrecorded(@Nullable Bits live) {
-    if (live == null || this.unrecorded.scanIsEmpty()) {
-      return this.unrecorded;
-    }
-    var result = this.unrecorded.clone();
-    live.applyMask(result, 0);
-    return result;
+    return new LegacyMappingObservations(postings, new LegacyMappingFields(unrecorded));
   }
 }

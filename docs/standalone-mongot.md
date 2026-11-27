@@ -179,7 +179,8 @@ ordinary documents. This example uses scalar quantization and learns dimensions 
 Set `numDimensions` on the vector entry to require that length at every matching path.
 When omitted, the first successfully indexed vector at each path sets its length for the
 local index generation, across partitions and restarts. Subsequent vectors of a different
-length at that path are skipped. Independently built indexes can learn different lengths
+length at that path are skipped. When literal and nested BSON keys in one document share a dotted
+path, the first valid vector of the accepted length is indexed. Independently built indexes can learn different lengths
 if their input mixes dimensions. A vector query on a shard that has yet to observe the path
 returns an empty local result. Numeric arrays require an explicit static vector mapping.
 
@@ -198,9 +199,13 @@ on their first export. The server shares the resulting postings across snapshots
 including after deletions. A restart or merge drops this in-memory index. Reindexing the source
 documents persists the current format.
 
-Documents predating both formats may lack these key segments. The server uses the mapping and earlier checkpoint
-metadata when they identify a unique spelling. If a live legacy field has multiple possible
-spellings, reindex its source documents before exporting.
+For documents that predate path recording, the server caches stored-field evidence per segment
+and applies the current reader’s deletions. Explicit mappings are always included. If the available
+evidence leaves more than one possible exported mapping, reindex the affected source documents.
+
+Indexes with literal and nested embedded-document roots sharing a dotted name also record the
+full BSON paths of their children. Older records that contain only a relative child path can be
+exported when the configured mappings identify its root or already specify every possible match.
 
 The supported quantization settings are `none` (default), `scalar`, and `binary`.
 The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.

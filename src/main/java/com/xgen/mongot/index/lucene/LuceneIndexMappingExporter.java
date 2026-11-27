@@ -1,5 +1,6 @@
 package com.xgen.mongot.index.lucene;
 
+import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
 import com.xgen.mongot.index.definition.EmbeddedDocumentsFieldDefinition;
@@ -49,7 +50,7 @@ public final class LuceneIndexMappingExporter {
   private final SearchFieldDefinitionResolver resolver;
   private final Map<String, List<List<String>>> vectorSourcePaths = new HashMap<>();
   private final Set<String> legacyPaths;
-  private final Map<Optional<FieldPath>, ObservedField> scopes = new HashMap<>();
+  private final Map<List<String>, ObservedField> scopes = new HashMap<>();
 
   private static final class ObservedField {
     private Optional<Integer> vectorDimensions = Optional.empty();
@@ -104,7 +105,7 @@ public final class LuceneIndexMappingExporter {
     return exportDocument(
         this.resolver.indexDefinition.getMappings(),
         new BsonDocument(),
-        this.scopes.getOrDefault(Optional.empty(), new ObservedField()),
+        this.scopes.getOrDefault(List.of(), new ObservedField()),
         Optional.empty());
   }
 
@@ -166,16 +167,8 @@ public final class LuceneIndexMappingExporter {
         observeEntry(leaf, entry.getKey());
       }
     }
-    var legacy = older.liveUnrecorded(leaf.getLiveDocs());
-    if (!legacy.scanIsEmpty()) {
-      for (var field : leaf.getFieldInfos()) {
-        if (FieldName.TypeField.getTypeOf(field.name)
-                .flatMap(LuceneIndexMappingExporter::publicType)
-                .isPresent()
-            && LegacyMappingFields.contains(leaf, field, legacy)) {
-          observe(field, Optional.empty(), true);
-        }
-      }
+    for (String name : older.unrecorded().liveFields(leaf)) {
+      observe(leaf.getFieldInfos().fieldInfo(name), Optional.empty(), true);
     }
   }
 
@@ -265,21 +258,21 @@ public final class LuceneIndexMappingExporter {
     if (publicType.isEmpty()) {
       return;
     }
-    Optional<FieldPath> embeddedRoot =
-        FieldName.EmbeddedField.isTypeOf(name)
-            ? Optional.of(FieldPath.parse(FieldName.getEmbeddedRootPathOrThrow(name)))
-            : Optional.empty();
     var path = FieldPath.parse(physicalType.get().stripPrefix(name));
+    if (FieldName.EmbeddedField.isTypeOf(name)) {
+      observeEmbedded(field, path, physicalType.get(), publicType.get(), source, liveLegacy);
+      return;
+    }
     // Static vector definitions already contain their dimensions. Two explicitly mapped BSON
     // paths can share a dotted spelling while using different physical vector encodings.
     if (publicType.get() == Type.VECTOR
         && this.resolver
-            .getFieldDefinition(path, embeddedRoot)
+            .getFieldDefinition(path, Optional.empty())
             .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
             .isEmpty()) {
       return;
     }
-    var root = this.scopes.computeIfAbsent(embeddedRoot, ignored -> new ObservedField());
+    var root = this.scopes.computeIfAbsent(List.of(), ignored -> new ObservedField());
     if (source.isPresent()) {
       observeType(root, source.get(), publicType.get(), physicalType.get(), field);
       return;
@@ -289,35 +282,117 @@ public final class LuceneIndexMappingExporter {
       if (shapes == null
           || this.legacyPaths.contains(path.toString())
           || (liveLegacy && shapes.size() > 1)) {
-        var legacyShape =
-            legacyShape(path, Type.VECTOR, this.resolver.indexDefinition.getMappings());
-        observeType(root, legacyShape, publicType.get(), physicalType.get(), field);
+        observeLegacyRoot(field, path, physicalType.get(), publicType.get());
       }
       if (shapes != null) {
         for (var keys : shapes) {
           observeType(root, keys, publicType.get(), physicalType.get(), field);
         }
       }
+    } else if (liveLegacy) {
+      observeLegacyRoot(field, path, physicalType.get(), publicType.get());
     } else {
-      // Keep scalar observations under their ordinary nested path. A literal token mapping
-      // named "a.b" must not claim a string produced by the dynamic document "a".
-      @Var
-      Iterable<String> keys =
-          embeddedRoot.isEmpty()
-              ? path.getSegments()
-              : path.getPathHierarchy().stream()
-                  .filter(part -> part.isChildOf(embeddedRoot.get()))
-                  .map(FieldPath::getLeaf)
-                  .toList();
-      if (liveLegacy) {
-        var parent =
-            embeddedRoot
-                .<HierarchicalFieldDefinition>map(
-                    scope -> this.resolver.getEmbeddedDocumentsFieldDefinition(scope).orElseThrow())
-                .orElse(this.resolver.indexDefinition.getMappings());
-        keys = legacyShape(FieldPath.parse(String.join(".", keys)), publicType.get(), parent);
+      observeType(root, path.getSegments(), publicType.get(), physicalType.get(), field);
+    }
+  }
+
+  private void observeLegacyRoot(
+      FieldInfo field, FieldPath path, FieldName.TypeField physical, Type type) {
+    if (path.isAtRoot()) {
+      observeType(
+          this.scopes.computeIfAbsent(List.of(), unused -> new ObservedField()),
+          path.getSegments(),
+          type,
+          physical,
+          field);
+      return;
+    }
+    var matches = new LegacyMatches();
+    findShapes(
+        this.resolver.indexDefinition.getMappings(),
+        path.toString(),
+        type,
+        List.of(),
+        new ArrayList<>(),
+        matches);
+    observeLegacyMatch(matches, path, type, physical, field);
+  }
+
+  private void observeEmbedded(
+      FieldInfo field,
+      FieldPath path,
+      FieldName.TypeField physical,
+      Type type,
+      Optional<List<String>> source,
+      boolean liveLegacy) {
+    if (type == Type.VECTOR) {
+      return;
+    }
+    String root = FieldName.getEmbeddedRootPathOrThrow(field.name);
+    var scopes = this.resolver.indexDefinition.embeddedScopes(root);
+    if (scopes.isEmpty()) {
+      return;
+    }
+    // Old entries held relative keys. A full path always has the additional root and separator,
+    // even when a BSON key contains a literal dot or is empty.
+    if (source.isPresent() && String.join(".", source.get()).equals(path.toString())) {
+      var keys = source.get();
+      for (var scope : scopes) {
+        int depth = scope.keys().size();
+        if (keys.size() > depth && keys.subList(0, depth).equals(scope.keys())) {
+          observeType(
+              this.scopes.computeIfAbsent(scope.keys(), unused -> new ObservedField()),
+              keys.subList(depth, keys.size()),
+              type,
+              physical,
+              field);
+          return;
+        }
       }
-      observeType(root, keys, publicType.get(), physicalType.get(), field);
+      return;
+    }
+    String relative = path.toString().substring(root.length() + 1);
+    if (scopes.size() == 1 && (source.isPresent() || !liveLegacy)) {
+      var scope =
+          this.scopes.computeIfAbsent(scopes.getFirst().keys(), unused -> new ObservedField());
+      observeType(
+          scope, source.orElseGet(() -> List.of(relative.split("\\.", -1))), type, physical, field);
+      return;
+    }
+    var matches = new LegacyMatches();
+    for (var scope : scopes) {
+      if (source.isPresent()) {
+        matchRecordedKeys(scope.mapping(), scope.keys(), source.get(), type, matches);
+      } else {
+        findShapes(scope.mapping(), relative, type, scope.keys(), new ArrayList<>(), matches);
+      }
+    }
+    observeLegacyMatch(matches, path, type, physical, field);
+  }
+
+  private void matchRecordedKeys(
+      @Var HierarchicalFieldDefinition parent,
+      List<String> scope,
+      List<String> keys,
+      Type type,
+      LegacyMatches matches) {
+    for (int i = 0; i < keys.size(); ++i) {
+      var explicit = parent.getField(keys.get(i));
+      var field = explicit.isPresent() ? explicit : this.resolver.getDynamicFieldDefinition(parent);
+      if (field.isEmpty()) {
+        return;
+      }
+      if (i + 1 == keys.size()) {
+        if (field.get().hasAnyFieldDefinitionOf(Set.of(type))) {
+          matches.add(scope, keys, explicit.isPresent());
+        }
+      } else {
+        var document = field.get().documentFieldDefinition();
+        if (document.isEmpty()) {
+          return;
+        }
+        parent = document.get();
+      }
     }
   }
 
@@ -352,51 +427,80 @@ public final class LuceneIndexMappingExporter {
     }
   }
 
-  private List<String> legacyShape(FieldPath path, Type type, HierarchicalFieldDefinition parent) {
-    if (path.isAtRoot()) {
-      return List.of(path.getLeaf());
+  // Explicit matches are already in the exported definition. Ambiguity matters only if
+  // choosing between candidates would change which dynamic fields are emitted.
+  private static final class LegacyMatches {
+    private boolean explicit;
+    private boolean ambiguous;
+    private List<String> scope = List.of();
+    private Optional<List<String>> dynamicKeys = Optional.empty();
+
+    void add(List<String> scope, List<String> keys, boolean configured) {
+      if (configured) {
+        this.explicit = true;
+      } else {
+        this.ambiguous |= this.dynamicKeys.isPresent();
+        this.scope = scope;
+        this.dynamicKeys = Optional.of(List.copyOf(keys));
+      }
+      this.ambiguous |= this.explicit && this.dynamicKeys.isPresent();
     }
-    List<List<String>> matches = new ArrayList<>(2);
-    findShapes(parent, path.toString(), type, new ArrayList<>(), matches);
-    if (matches.size() != 1) {
-      throw new AmbiguousVectorPathException(path, type);
-    }
-    return matches.getFirst();
   }
 
-  // A dot may be a key character or a document boundary. Stop after proving ambiguity.
+  private void observeLegacyMatch(
+      LegacyMatches matches,
+      FieldPath path,
+      Type type,
+      FieldName.TypeField physical,
+      FieldInfo field) {
+    if (matches.ambiguous || (!matches.explicit && matches.dynamicKeys.isEmpty())) {
+      throw new AmbiguousVectorPathException(path, type);
+    }
+    matches.dynamicKeys.ifPresent(
+        keys ->
+            observeType(
+                this.scopes.computeIfAbsent(matches.scope, unused -> new ObservedField()),
+                keys,
+                type,
+                physical,
+                field));
+  }
+
   private void findShapes(
       HierarchicalFieldDefinition parent,
       String remaining,
       Type type,
+      List<String> scope,
       List<String> prefix,
-      List<List<String>> matches) {
-    var dynamic = this.resolver.getDynamicFieldDefinition(parent);
+      LegacyMatches matches) {
+    // An implicit document inherits the same dynamic rule at every descendant.
+    var dynamic =
+        this.resolver
+            .getDynamicFieldDefinition(parent)
+            .filter(field -> field.hasAnyFieldDefinitionOf(Set.of(type)));
     if (parent.fields().isEmpty() && dynamic.isEmpty()) {
       return;
     }
     for (int end = remaining.length();
-        end >= 0 && matches.size() < 2;
+        end >= 0 && !matches.ambiguous;
         end = remaining.lastIndexOf('.', end - 1)) {
       String key = remaining.substring(0, end);
-      var field = parent.getField(key).or(() -> dynamic);
+      var explicit = parent.getField(key);
+      var field = explicit.or(() -> dynamic);
       if (field.isEmpty()) {
         continue;
       }
       prefix.add(key);
       if (end == remaining.length()) {
-        if (field
-            .get()
-            .getAllDefinitions()
-            .flatMap(Optional::stream)
-            .anyMatch(def -> def.getType() == type)) {
-          matches.add(List.copyOf(prefix));
+        if (field.get().hasAnyFieldDefinitionOf(Set.of(type))) {
+          matches.add(scope, prefix, explicit.isPresent());
         }
       } else if (field.get().documentFieldDefinition().isPresent()) {
         findShapes(
             field.get().documentFieldDefinition().get(),
             remaining.substring(end + 1),
             type,
+            scope,
             prefix,
             matches);
       }
@@ -457,7 +561,8 @@ public final class LuceneIndexMappingExporter {
             exportDocument(
                 embedded,
                 mapping,
-                this.scopes.getOrDefault(Optional.of(path), new ObservedField()),
+                this.scopes.getOrDefault(
+                    ImmutableList.copyOf(path.getSegments()), new ObservedField()),
                 Optional.of(path));
         default -> {
           // All scalar options, including string multi fields, are already in toBson().
@@ -468,7 +573,7 @@ public final class LuceneIndexMappingExporter {
     return result;
   }
 
-  private static Optional<FieldTypeDefinition.Type> publicType(FieldName.TypeField type) {
+  static Optional<FieldTypeDefinition.Type> publicType(FieldName.TypeField type) {
     return switch (type) {
       case AUTOCOMPLETE -> Optional.of(Type.AUTOCOMPLETE);
       case BOOLEAN -> Optional.of(Type.BOOLEAN);
