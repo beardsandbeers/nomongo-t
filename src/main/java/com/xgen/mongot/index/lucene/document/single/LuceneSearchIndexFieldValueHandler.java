@@ -358,11 +358,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         this.path.getPathHierarchy().stream().anyMatch(part -> part.getLeaf().contains("."))
             ? FieldPath.parse(this.path.toString())
             : this.path;
-    var rule =
-        this.documentWrapper
-            .resolver
-            .getFieldDefinition(canonicalPath, Optional.empty())
-            .flatMap(FieldDefinition::typeSetVectorFieldDefinition);
+    var rule = this.documentWrapper.resolver.getTypeSetVectorRule(canonicalPath, Optional.empty());
     if (rule.isEmpty()) {
       return;
     }

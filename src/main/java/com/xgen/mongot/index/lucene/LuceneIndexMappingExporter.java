@@ -327,8 +327,7 @@ public final class LuceneIndexMappingExporter {
             // A failed discovery by a writer using the older naming scheme can also leave metadata.
             return !qualified
                 && resolver
-                    .getFieldDefinition(FieldPath.parse(path), Optional.empty())
-                    .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
+                    .getTypeSetVectorRule(FieldPath.parse(path), Optional.empty())
                     .filter(rule -> rule.numDimensions().isEmpty())
                     .isEmpty();
           }
@@ -367,10 +366,7 @@ public final class LuceneIndexMappingExporter {
     // Static vector definitions already contain their dimensions. Two explicitly mapped BSON
     // paths can share a dotted spelling while using different physical vector encodings.
     if (publicType.get() == Type.VECTOR
-        && this.resolver
-            .getFieldDefinition(path, Optional.empty())
-            .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
-            .isEmpty()) {
+        && this.resolver.getTypeSetVectorRule(path, Optional.empty()).isEmpty()) {
       return;
     }
     var root = this.scopes.computeIfAbsent(List.of(), ignored -> new ObservedField());

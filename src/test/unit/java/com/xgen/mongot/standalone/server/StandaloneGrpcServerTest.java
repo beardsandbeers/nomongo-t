@@ -3504,6 +3504,48 @@ public class StandaloneGrpcServerTest {
     }
   }
 
+  private static final String ALIAS_TYPE_SETS =
+      """
+      {mappings:{dynamic:{typeSet:'d'},fields:{a:{type:'document',dynamic:{typeSet:'s'}}}},
+       typeSets:[{name:'d',types:[{type:'vector',similarity:'euclidean'},%s]},
+                {name:'s',types:[%s]}]}
+      """;
+
+  @Test
+  public void getIndexMappings_literalVectorUnderClosedAncestor_preservesOnlyLiteralHit()
+      throws Exception {
+    Similarity.load();
+    String template =
+        "{mappings:{dynamic:{typeSet:'d'},fields:{a:%s}},"
+            + "typeSets:[{name:'d',types:[{type:'vector',similarity:'euclidean'}]}]}";
+    var docs =
+        List.of(
+            "{_id:1,'a.b':" + bsonFloatVector(1, 0) + "}",
+            "{_id:2,a:{b:" + bsonFloatVector(1, 0) + "}}");
+    var queries = Map.of(exactVectorQuery("a.b", "[1,0]"), 1);
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f, "closed", template.formatted("{type:'document',dynamic:false}"), docs, queries);
+      assertReplayQueries(f, "scalar", template.formatted("{type:'string'}"), docs, queries);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_dynamicGeoAlias_acceptsGeoQueryBeforeAndAfterReplay()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "geo",
+          ALIAS_TYPE_SETS.formatted("{type:'geo',indexShapes:true}", "{type:'string'}"),
+          List.of("{_id:1,'a.b':{type:'Point',coordinates:[1,1]}}", "{_id:2,a:{b:'green'}}"),
+          Map.of(
+              "{geoWithin:{path:'a.b',circle:{center:{type:'Point',coordinates:[1,1]},radius:5}}}",
+                  1,
+              "{text:{path:'a.b',query:'green'}}", 1));
+    }
+  }
+
   private static void assertReplayQueries(
       Fixture f,
       String name,

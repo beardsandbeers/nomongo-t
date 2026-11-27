@@ -1,12 +1,14 @@
 package com.xgen.mongot.index.definition;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.version.IndexCapabilities;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * FieldDefinitionResolver retrieves the correct FieldDefinition for a combination of path +
@@ -64,8 +66,18 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
       return baseStringFieldDefinition;
     }
 
-    return baseStringFieldDefinition.flatMap(
-        field -> field.getMultiDefinition(stringPath.asMultiField().getMulti()));
+    String multi = stringPath.asMultiField().getMulti();
+    return baseStringFieldDefinition
+        .flatMap(field -> field.getMultiDefinition(multi))
+        .or(
+            () ->
+                findAlias(
+                    stringPath.getBaseFieldPath(),
+                    embeddedRoot,
+                    field ->
+                        field
+                            .stringFieldDefinition()
+                            .flatMap(string -> string.getMultiDefinition(multi))));
   }
 
   /**
@@ -104,19 +116,80 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
   public Optional<VectorFieldSpecification> getVectorFieldSpecification(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
     var field = getFieldDefinition(path, embeddedRoot);
-    var rule = field.flatMap(FieldDefinition::typeSetVectorFieldDefinition);
-    if (rule.isPresent() && embeddedRoot.isEmpty()) {
-      return rule.get().resolve(() -> this.vectorDimensions.get(path));
-    }
-    return field.flatMap(FieldDefinition::vectorFieldSpecification);
+    var explicit = field.flatMap(FieldDefinition::vectorFieldSpecification);
+    return explicit.or(
+        () ->
+            getTypeSetVectorRule(path, embeddedRoot)
+                .flatMap(rule -> rule.resolve(() -> this.vectorDimensions.get(path))));
   }
 
   public Optional<TypeSetVectorFieldDefinition> getTypeSetVectorRule(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return embeddedRoot.isPresent()
-        ? Optional.empty()
-        : getFieldDefinition(path, embeddedRoot)
-            .flatMap(FieldDefinition::typeSetVectorFieldDefinition);
+    if (embeddedRoot.isPresent() || !hasTypeSetVectorFields()) return Optional.empty();
+    var canonical = getFieldDefinition(path, embeddedRoot);
+    if (canonical.flatMap(FieldDefinition::vectorFieldSpecification).isPresent())
+      return Optional.empty();
+    return canonical
+        .flatMap(FieldDefinition::typeSetVectorFieldDefinition)
+        .or(() -> findAlias(path, embeddedRoot, FieldDefinition::typeSetVectorFieldDefinition));
+  }
+
+  public boolean hasGeoField(FieldPath path, Optional<FieldPath> embeddedRoot, boolean shapes) {
+    Function<FieldDefinition, Optional<GeoFieldDefinition>> select =
+        field -> field.geoFieldDefinition().filter(geo -> !shapes || geo.indexShapes());
+    return getFieldDefinition(path, embeddedRoot)
+        .flatMap(select)
+        .or(() -> findAlias(path, embeddedRoot, select))
+        .isPresent();
+  }
+
+  /** Resolve alternate BSON key boundaries against the configured schema alone. */
+  private <T> Optional<T> findAlias(
+      FieldPath path, Optional<FieldPath> root, Function<FieldDefinition, Optional<T>> select) {
+    String dotted = path.toString();
+    if (root.isEmpty()) {
+      return dotted.contains(".")
+          ? findAlias(this.indexDefinition.getMappings(), dotted, select)
+          : Optional.empty();
+    }
+    String prefix = root.get() + ".";
+    if (!dotted.startsWith(prefix)) return Optional.empty();
+    for (var scope : this.indexDefinition.embeddedScopes(root.get().toString())) {
+      var match = findAlias(scope.mapping(), dotted.substring(prefix.length()), select);
+      if (match.isPresent()) return match;
+    }
+    return Optional.empty();
+  }
+
+  private <T> Optional<T> findAlias(
+      HierarchicalFieldDefinition parent,
+      String remaining,
+      Function<FieldDefinition, Optional<T>> select) {
+    if (parent.fields().isEmpty()) return getDynamicFieldDefinition(parent).flatMap(select);
+    var whole = parent.getField(remaining);
+    var exact = whole.flatMap(select);
+    if (exact.isPresent()) return exact;
+    @Var boolean implicitDocument = false;
+    for (int end = remaining.lastIndexOf('.');
+        end >= 0;
+        end = remaining.lastIndexOf('.', end - 1)) {
+      var prefix = parent.getField(remaining.substring(0, end));
+      if (prefix.isEmpty()) {
+        implicitDocument = true;
+      } else if (prefix.get().documentFieldDefinition().isPresent()) {
+        var match =
+            findAlias(
+                prefix.get().documentFieldDefinition().get(), remaining.substring(end + 1), select);
+        if (match.isPresent()) return match;
+      }
+    }
+    var dynamic = getDynamicFieldDefinition(parent);
+    if (whole.isEmpty()
+        || (implicitDocument
+            && dynamic.flatMap(FieldDefinition::documentFieldDefinition).isPresent())) {
+      return dynamic.flatMap(select);
+    }
+    return Optional.empty();
   }
 
   public IndexCapabilities getIndexCapabilities() {

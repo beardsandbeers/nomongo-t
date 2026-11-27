@@ -1,7 +1,6 @@
 package com.xgen.mongot.index.query;
 
 import com.xgen.mongot.index.definition.FieldDefinition;
-import com.xgen.mongot.index.definition.GeoFieldDefinition;
 import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
@@ -24,20 +23,13 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
 
   @Override
   public boolean indexedAsGeoPoint(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::geoFieldDefinition)
-        .isPresent();
+    return this.fieldDefinitionResolver.hasGeoField(path, embeddedRoot, false);
   }
 
   /** Path stores geo shapes. */
   @Override
   public boolean indexedAsGeoShape(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    Optional<GeoFieldDefinition> geoFieldDefinition =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(path, embeddedRoot)
-            .flatMap(FieldDefinition::geoFieldDefinition);
-    return geoFieldDefinition.isPresent() && geoFieldDefinition.get().indexShapes();
+    return this.fieldDefinitionResolver.hasGeoField(path, embeddedRoot, true);
   }
 
   /** Validate that the path has proper storage as a string field in the index. */
