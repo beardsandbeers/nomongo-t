@@ -180,9 +180,11 @@ Set `numDimensions` on the vector entry to require that length at every matching
 When omitted, the first successfully indexed vector at each path sets its length for the
 local index generation, across partitions and restarts. Subsequent vectors of a different
 length at that path are skipped. When literal and nested BSON keys in one document share a dotted
-path, the first valid vector of the accepted length is indexed. Independently built indexes can learn different lengths
-if their input mixes dimensions. A vector query on a shard that has yet to observe the path
-returns an empty local result. Numeric arrays require an explicit static vector mapping.
+path, the first valid vector of the accepted length is indexed. An explicit Search vector
+mapping at that dotted path supplies the encoding for compatible BSON vectors discovered through
+the type set. Independently built indexes can learn different lengths if their input mixes
+dimensions. A vector query on a shard that has yet to observe the path returns an empty local
+result. Numeric arrays require an explicit static vector mapping.
 
 For indexes using vector type sets, Lucene indexes each distinct combination of field type and BSON key
 segments with the IDs of the documents that contain it. Mapping export reads these combinations
@@ -206,7 +208,9 @@ export checks field metadata against explicit mappings and live observations fro
 If those already cover every possible spelling, export succeeds. Otherwise it returns
 `FAILED_PRECONDITION`. Rebuild the affected index from its source documents before retrying export.
 Queries remain available during this compatibility check. Other Search indexes use the ordinary
-field-metadata export.
+field-metadata export. Export also returns `FAILED_PRECONDITION` if an older generation indexed
+a token or autocomplete field with the index-wide analyzer because another mapping masked its
+field-specific analyzer. Rebuild the affected index to export a static mapping with matching analysis.
 
 The supported quantization settings are `none` (default), `scalar`, and `binary`.
 The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.
@@ -346,8 +350,9 @@ Legacy indexes without initialization records reopen only when all commits are v
 legacy data requires restoration or an explicit rebuild. Older binaries cannot open a version-4
 catalog. A catalog mutation can upgrade older metadata, so retain a stopped backup before upgrade.
 Catalog version 5 identifies generations using scoped analyzers and type-set scoring, and
-definitions that declare a vector type set. New Search generations use scoped analysis when
-they reference a named type set or multiple BSON paths map to the same dotted field in a scope.
+definitions that declare a vector type set or a static `bsonVectorOnly` field. New Search
+generations use scoped analysis when they reference a named type set or multiple BSON paths map
+to the same dotted field in a scope.
 Reopening a generation or applying a content-preserving update retains its original analyzers
 and scoring. A rebuild selects the current rules. Catalogs containing only ordinary definitions
 and generation records can still be written as version 4 and reopened by a version-4 binary.

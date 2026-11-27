@@ -8,8 +8,10 @@ import com.xgen.mongot.index.definition.GeoFieldDefinition;
 import com.xgen.mongot.index.definition.NumberFacetFieldDefinition;
 import com.xgen.mongot.index.definition.NumberFieldDefinition;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
+import com.xgen.mongot.index.definition.SearchIndexVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SortableNumberBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.ingestion.handlers.DocumentHandler;
 import com.xgen.mongot.index.ingestion.handlers.FieldValueHandler;
@@ -329,11 +331,10 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     var bsonOnly =
         this.fieldDefinition
             .searchIndexVectorFieldDefinition()
-            .filter(field -> field.bsonVectorOnly());
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly);
     if ((configured.isEmpty() && bsonOnly.isEmpty())
         || this.isMultiValued
         || this.documentWrapper.getEmbeddedRoot().isPresent()
-        || this.path.toString().isEmpty()
         || binarySize <= BsonVectorParser.BSON_VECTOR_HEADER_SIZE
         || binarySize
             > BsonVectorParser.BSON_VECTOR_HEADER_SIZE
@@ -358,24 +359,34 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         this.path.getPathHierarchy().stream().anyMatch(part -> part.getLeaf().contains("."))
             ? FieldPath.parse(this.path.toString())
             : this.path;
-    var rule = this.documentWrapper.resolver.getTypeSetVectorRule(canonicalPath, Optional.empty());
-    if (rule.isEmpty()) {
+    var resolver = this.documentWrapper.resolver;
+    var explicit = resolver.getExplicitSearchVectorSpecification(canonicalPath);
+    var rule =
+        explicit.isPresent()
+            ? Optional.<TypeSetVectorFieldDefinition>empty()
+            : resolver.getTypeSetVectorRule(canonicalPath, Optional.empty());
+    if (explicit.isEmpty() && rule.isEmpty()) {
       return;
     }
-    var parsed = supplier.get();
-    if (parsed.isEmpty()) {
-      return;
-    }
-    var vector = parsed.get();
-    // The partition writer checks inferred lengths so its commit can also record a binding
-    // when this partition's first occurrence of the path has a different length.
-    boolean dimensionInFieldName = rule.get().numDimensions().isEmpty();
-    rule.get()
-        .resolve(() -> Optional.of(vector.numDimensions()))
+    // Only an inferred type-set rule can bind a length in the partition writer.
+    boolean dimensionInFieldName =
+        rule.filter(dynamic -> dynamic.numDimensions().isEmpty()).isPresent();
+    supplier
+        .get()
         .ifPresent(
-            spec ->
-                IndexableFieldFactory.addBsonVectorField(
-                    this.documentWrapper, this.path, vector, spec, dimensionInFieldName));
+            vector -> {
+              // Explicit mappings own the physical encoding shared by both BSON spellings.
+              var spec =
+                  explicit.or(
+                      () ->
+                          rule.flatMap(
+                              dynamic ->
+                                  dynamic.resolve(() -> Optional.of(vector.numDimensions()))));
+              spec.ifPresent(
+                  mapping ->
+                      IndexableFieldFactory.addBsonVectorField(
+                          this.documentWrapper, this.path, vector, mapping, dimensionInFieldName));
+            });
   }
 
   @Override
@@ -387,7 +398,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         || this.isMultiValued
         || this.fieldDefinition
             .searchIndexVectorFieldDefinition()
-            .filter(field -> field.bsonVectorOnly())
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
             .isPresent()) {
       return;
     }
@@ -498,6 +509,10 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         && this.fieldDefinition.objectIdFieldDefinition().isEmpty()
         && this.fieldDefinition.geoFieldDefinition().isEmpty()
         && this.fieldDefinition.documentFieldDefinition().isEmpty()
+        && this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
+            .isEmpty()
         && this.fieldDefinition.sortableDateBetaV1FieldDefinition().isEmpty()
         && this.fieldDefinition.sortableNumberBetaV1FieldDefinition().isEmpty()
         && this.fieldDefinition.sortableStringBetaV1FieldDefinition().isEmpty()

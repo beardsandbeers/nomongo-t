@@ -109,7 +109,7 @@ public class LuceneIndexMappingExporterTest {
         writer.deleteDocuments(new Term("id", "literal"));
         try (var deleted = DirectoryReader.openIfChanged(current)) {
           assertThrows(
-              LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+              LuceneIndexMappingExporter.MappingExportException.class,
               () -> snapshot(List.of(deleted, oldReader)));
         }
         assertThat(snapshot(List.of(oldReader, current))).isEqualTo(expected);
@@ -230,6 +230,29 @@ public class LuceneIndexMappingExporterTest {
   }
 
   @Test
+  public void export_legacyMaskedTokenAndAutocomplete_rejectsChangedAnalysis() throws Exception {
+    for (String type : List.of("token", "autocomplete")) {
+      var old =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(
+                  mappings(
+                      """
+                      {fields:{a:{type:'document',fields:{b:{type:'%s'}}},'a.b':{type:'number'}}}
+                      """
+                          .formatted(type)))
+              .build();
+      var error =
+          assertThrows(
+              LuceneIndexMappingExporter.MappingExportException.class,
+              () ->
+                  LuceneIndexMappingExporter.export(
+                      old, IndexFormatVersion.CURRENT, List.of(infos("$type:" + type + "/a.b"))));
+      assertThat(error).hasMessageThat().contains("default analyzer");
+    }
+  }
+
+  @Test
   public void similarity_legacyEmbeddedAlias_preservesWinningEmbeddedScope() throws Exception {
     var old =
         SearchIndexDefinitionBuilder.builder()
@@ -321,7 +344,7 @@ public class LuceneIndexMappingExporterTest {
       writer.addDocument(current);
       try (var before = DirectoryReader.open(writer)) {
         assertThrows(
-            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            LuceneIndexMappingExporter.MappingExportException.class,
             () -> snapshot(List.of(before)));
         writer.deleteDocuments(new Term("id", "gone"));
         try (var after = DirectoryReader.openIfChanged(before)) {
@@ -361,7 +384,7 @@ public class LuceneIndexMappingExporterTest {
       writer.deleteDocuments(new Term("group", "old"), new Term("group", "obsolete"));
       try (var before = guardDocumentReads(DirectoryReader.open(writer))) {
         assertThrows(
-            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            LuceneIndexMappingExporter.MappingExportException.class,
             () -> snapshot(List.of(before)));
         writer.deleteDocuments(new Term("group", "last"));
         try (var after = DirectoryReader.openIfChanged(before)) {
@@ -448,7 +471,8 @@ public class LuceneIndexMappingExporterTest {
             .mappings(
                 mappings(
                     """
-                    {dynamic:false,fields:{'a.b':{type:'string'},a:{type:'document',fields:{b:{type:'string'}}},
+                    {dynamic:false,fields:{'a.b':{type:'string'},
+                     a:{type:'document',fields:{b:{type:'string'}}},
                      emb:{type:'document',dynamic:{typeSet:'v'}}}}
                     """))
             .typeSets(vectorTypeSet())
@@ -479,7 +503,8 @@ public class LuceneIndexMappingExporterTest {
             .mappings(
                 mappings(
                     """
-                    {dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:true},a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}
+                    {dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:true},
+                     a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}
                     """))
             .build();
     var old = new Document();
@@ -498,7 +523,7 @@ public class LuceneIndexMappingExporterTest {
               definition, IndexFormatVersion.CURRENT, List.of(second));
         }
         assertThrows(
-            LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+            LuceneIndexMappingExporter.MappingExportException.class,
             () ->
                 LuceneIndexMappingExporter.exportSnapshot(
                     definition, IndexFormatVersion.CURRENT, List.of(first)));
@@ -532,8 +557,9 @@ public class LuceneIndexMappingExporterTest {
 
               @Override
               public Terms terms(String field) throws IOException {
-                if (field.startsWith("$type:"))
+                if (field.startsWith("$type:")) {
                   throw new AssertionError("opening value terms during mapping export: " + field);
+                }
                 var terms = super.terms(field);
                 if (terms == null || !field.equals(MappingObservations.NAME)) {
                   return terms;
@@ -699,7 +725,7 @@ public class LuceneIndexMappingExporterTest {
     // Newer writes established one spelling. The legacy segment could contain the other.
     var paths = new SourcePaths(Set.of("a\0b"), Set.of("a.b"));
     assertThrows(
-        LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+        LuceneIndexMappingExporter.MappingExportException.class,
         () ->
             LuceneIndexMappingExporter.export(
                 definition, IndexFormatVersion.CURRENT, List.of(vectorInfo("a.b")), paths));

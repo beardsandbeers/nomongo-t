@@ -147,6 +147,8 @@ public final class SearchIndexDefinition implements IndexDefinition {
   private final ImmutableListMultimap<String, EmbeddedScope> embeddedScopes;
   private final Supplier<Boolean> hasTypeSetVectorFields =
       Suppliers.memoize(() -> dynamicVectorFields().findAny().isPresent());
+  private final Supplier<Boolean> hasStaticBsonVectorOnlyFields =
+      Suppliers.memoize(() -> hasStaticBsonVectorOnlyFields(getMappings()));
   private final Supplier<Boolean> hasAliasedFields = Suppliers.memoize(this::hasAliasedFields);
   private final Supplier<FieldHierarchyContext> legacyFields =
       Suppliers.memoize(() -> FieldHierarchyContext.legacy(getMappings()));
@@ -359,6 +361,28 @@ public final class SearchIndexDefinition implements IndexDefinition {
   /** An unused vector type set still needs a reader that understands its BSON schema. */
   public boolean declaresVectorTypeSet() {
     return this.declaresVectorTypeSet.get();
+  }
+
+  public boolean hasStaticBsonVectorOnlyFields() {
+    return this.hasStaticBsonVectorOnlyFields.get();
+  }
+
+  private static boolean hasStaticBsonVectorOnlyFields(HierarchicalFieldDefinition scope) {
+    return scope.fields().values().stream()
+        .anyMatch(
+            field ->
+                field
+                        .searchIndexVectorFieldDefinition()
+                        .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
+                        .isPresent()
+                    || field
+                        .documentFieldDefinition()
+                        .filter(SearchIndexDefinition::hasStaticBsonVectorOnlyFields)
+                        .isPresent()
+                    || field
+                        .embeddedDocumentsFieldDefinition()
+                        .filter(SearchIndexDefinition::hasStaticBsonVectorOnlyFields)
+                        .isPresent());
   }
 
   private boolean usesNamedTypeSet() {

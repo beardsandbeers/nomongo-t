@@ -699,7 +699,8 @@ public final class LocalIndexCatalog implements Closeable {
                     def instanceof SearchIndexDefinition search
                         && (search.getMappingVersion()
                                 != SearchIndexDefinition.MappingVersion.LEGACY
-                            || search.declaresVectorTypeSet()));
+                            || search.declaresVectorTypeSet()
+                            || search.hasStaticBsonVectorOnlyFields()));
     boolean useVersioned =
         requiresV5
             || this.versioned

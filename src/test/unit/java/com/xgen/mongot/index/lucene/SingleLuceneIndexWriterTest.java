@@ -464,7 +464,7 @@ public class SingleLuceneIndexWriterTest {
                 .doesNotContainKey("typeSetVectorSourcePathVersion");
             assertThat(reader.leaves()).hasSize(1);
             assertThrows(
-                LuceneIndexMappingExporter.AmbiguousVectorPathException.class,
+                LuceneIndexMappingExporter.MappingExportException.class,
                 () -> exportFields(reader, recovered));
           }
           writer

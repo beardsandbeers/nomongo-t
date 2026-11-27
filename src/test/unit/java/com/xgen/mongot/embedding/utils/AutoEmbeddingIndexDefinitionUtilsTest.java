@@ -17,6 +17,8 @@ import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SearchAutoEmbedFieldDefinition;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.definition.SearchIndexVectorFieldDefinition;
+import com.xgen.mongot.index.definition.SimilarityDefinition;
+import com.xgen.mongot.index.definition.TypeSetDefinition;
 import com.xgen.mongot.index.definition.VectorAutoEmbedFieldDefinition;
 import com.xgen.mongot.index.definition.VectorAutoEmbedFieldSpecification;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
@@ -34,6 +36,7 @@ import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.testing.mongot.index.definition.DocumentFieldDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.FieldDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.SearchIndexDefinitionBuilder;
+import com.xgen.testing.mongot.index.definition.StringFieldDefinitionBuilder;
 import com.xgen.testing.mongot.index.definition.VectorIndexDefinitionBuilder;
 import java.util.List;
 import java.util.Map;
@@ -992,6 +995,42 @@ public class AutoEmbeddingIndexDefinitionUtilsTest {
         new VectorIndexingAlgorithm.HnswIndexingAlgorithm(
             new VectorFieldSpecification.HnswOptions(32, 200)),
         vectorField.specification().indexingAlgorithm());
+  }
+
+  @Test
+  public void getDerivedSearchIndexDefinition_scopedGeneration_preservesMappingVersion() {
+    var mappings =
+        DocumentFieldDefinitionBuilder.builder()
+            .dynamic("strings")
+            .field(
+                "content",
+                FieldDefinitionBuilder.builder()
+                    .searchAutoEmbed(new SearchAutoEmbedFieldDefinition("voyage-3-large"))
+                    .build())
+            .build();
+    var raw =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(mappings)
+            .typeSets(
+                new TypeSetDefinition(
+                    "strings",
+                    List.of(
+                        StringFieldDefinitionBuilder.builder()
+                            .similarity(SimilarityDefinition.BOOLEAN)
+                            .build())))
+            .build()
+            .forNewGeneration();
+    var metadata =
+        new MaterializedViewCollectionMetadata.MaterializedViewSchemaMetadata(
+            1L, Map.of(FieldPath.parse("content"), FieldPath.parse("_autoEmbed.content")));
+
+    var derived =
+        AutoEmbeddingIndexDefinitionUtils.getDerivedSearchIndexDefinition(
+            raw, MV_DATABASE_NAME, UUID.randomUUID(), metadata);
+
+    Truth.assertThat(derived.getMappingVersion())
+        .isEqualTo(SearchIndexDefinition.MappingVersion.SCOPED);
   }
 
   @Test

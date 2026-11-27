@@ -51,6 +51,25 @@ public class LocalIndexCatalogTest {
     }
   }
 
+  @Test
+  public void createIndex_staticBsonVectorOnly_usesVersionFiveCatalog() throws Exception {
+    var dir = this.folder.getRoot().toPath();
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      catalog.createIndex(
+          createRequest(
+              "bson-only",
+              """
+              {mappings:{dynamic:false,fields:{
+                v:{type:'vector',numDimensions:2,similarity:'euclidean',bsonVectorOnly:true}}}}
+              """));
+      var disk = BsonDocument.parse(Files.readString(dir.resolve("indexes.json")));
+      assertThat(disk.getInt32("catalogVersion").getValue()).isEqualTo(5);
+    }
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      assertThat(catalog.definitions()).hasSize(1);
+    }
+  }
+
   private static CreateIndexRequest createRequest(String name, String json) {
     return CreateIndexRequest.newBuilder()
         .setType(IndexType.INDEX_TYPE_SEARCH)

@@ -125,6 +125,13 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
                 .flatMap(rule -> rule.resolve(() -> this.vectorDimensions.get(path))));
   }
 
+  /** The static Search vector encoding takes precedence for all spellings of a dotted field. */
+  public Optional<VectorFieldSpecification> getExplicitSearchVectorSpecification(FieldPath path) {
+    return getFieldDefinition(path, Optional.empty())
+        .flatMap(FieldDefinition::searchIndexVectorFieldDefinition)
+        .map(SearchIndexVectorFieldDefinition::specification);
+  }
+
   public Optional<TypeSetVectorFieldDefinition> getTypeSetVectorRule(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
     if (embeddedRoot.isPresent() || !hasTypeSetVectorFields()) return Optional.empty();

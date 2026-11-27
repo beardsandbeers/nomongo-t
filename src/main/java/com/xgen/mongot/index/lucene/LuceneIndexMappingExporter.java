@@ -179,6 +179,11 @@ public final class LuceneIndexMappingExporter {
       var type = publicType(physical.get());
       if (type.isEmpty() && physical.get() != FieldName.TypeField.NULL) continue;
       String path = physical.get().stripPrefix(field.name);
+      if (type.isPresent()
+          && usesDefaultAnalyzer(field, type.get())
+          && couldHaveLiveOlderValue(leaf, field, path, nameLookup)) {
+        throw unsupportedAnalysis(field, type.get());
+      }
       int dimensions = physical.get().logicalVectorDimensions(field.getVectorDimension());
       boolean covered =
           FieldName.EmbeddedField.isTypeOf(field.name)
@@ -236,8 +241,8 @@ public final class LuceneIndexMappingExporter {
         || hasLiveOlderPosting(leaf, nameLookup);
   }
 
-  private static AmbiguousVectorPathException uncovered(String path) {
-    return new AmbiguousVectorPathException(
+  private static MappingExportException uncovered(String path) {
+    return new MappingExportException(
         "Reindex the source documents before exporting mappings: older index data does not record"
             + " every BSON spelling of '"
             + path
@@ -422,7 +427,7 @@ public final class LuceneIndexMappingExporter {
           var terms = leaf.terms(field.name);
           if ((points == null || points.getDocCount() <= leaf.numDeletedDocs())
               && (terms == null || terms.getDocCount() <= leaf.numDeletedDocs())) {
-            throw new AmbiguousVectorPathException(
+            throw new MappingExportException(
                 "Reindex before exporting the empty BSON key: older index data does not identify"
                     + " its live type.");
           }
@@ -488,6 +493,9 @@ public final class LuceneIndexMappingExporter {
     if (publicType.isEmpty()) {
       return;
     }
+    if (usesDefaultAnalyzer(field, publicType.get())) {
+      throw unsupportedAnalysis(field, publicType.get());
+    }
     var path = FieldPath.parse(physicalType.get().stripPrefix(name));
     if (FieldName.EmbeddedField.isTypeOf(name)) {
       observeEmbedded(field, path, physicalType.get(), publicType.get(), source);
@@ -496,6 +504,7 @@ public final class LuceneIndexMappingExporter {
     // Static vector definitions already contain their dimensions. Two explicitly mapped BSON
     // paths can share a dotted spelling while using different physical vector encodings.
     if (publicType.get() == Type.VECTOR
+        && !(source.isPresent() && this.resolver.hasTypeSetVectorFields())
         && this.resolver.getTypeSetVectorRule(path, Optional.empty()).isEmpty()) {
       return;
     }
@@ -589,12 +598,12 @@ public final class LuceneIndexMappingExporter {
     observeLegacyMatch(matches, path, type, physical, field);
   }
 
-  public static final class AmbiguousVectorPathException extends IllegalStateException {
-    private AmbiguousVectorPathException(String message) {
+  public static final class MappingExportException extends IllegalStateException {
+    private MappingExportException(String message) {
       super(message);
     }
 
-    private AmbiguousVectorPathException(FieldPath path, Type type) {
+    private MappingExportException(FieldPath path, Type type) {
       super(
           "Cannot export the original BSON key segments of legacy "
               + type.name().toLowerCase(java.util.Locale.ROOT)
@@ -655,7 +664,7 @@ public final class LuceneIndexMappingExporter {
       FieldName.TypeField physical,
       FieldInfo field) {
     if (matches.ambiguous || (!matches.explicit && matches.dynamicKeys.isEmpty())) {
-      throw new AmbiguousVectorPathException(path, type);
+      throw new MappingExportException(path, type);
     }
     matches.dynamicKeys.ifPresent(
         keys ->
@@ -763,24 +772,28 @@ public final class LuceneIndexMappingExporter {
                 FieldName.MultiField.getLuceneFieldName(path, name, embeddedRoot));
           }
         }
-        case TokenFieldDefinition token ->
-            mapping =
-                this.analyzers
-                    .resolve(FieldName.TypeField.TOKEN.getLuceneFieldName(path, embeddedRoot))
-                    .orElse(token)
-                    .toBson();
+        case TokenFieldDefinition token -> {
+          String physical = FieldName.TypeField.TOKEN.getLuceneFieldName(path, embeddedRoot);
+          mapping = this.analyzers.resolve(physical).orElse(token).toBson();
+        }
         case AutocompleteFieldDefinition ac -> {
           String physical = FieldName.TypeField.AUTOCOMPLETE.getLuceneFieldName(path, embeddedRoot);
           mapping = this.analyzers.resolve(physical).orElse(ac).toBson();
           fixSimilarity(mapping, physical);
         }
         case TypeSetVectorFieldDefinition vector -> {
-          // The queryable dotted path determines the encoding, including for literal BSON keys.
-          var rule =
+          // An explicit vector at an aliased path can supply the encoding for this spelling.
+          var dotted = FieldPath.parse(path.toString());
+          var spec =
               this.resolver
-                  .getTypeSetVectorRule(FieldPath.parse(path.toString()), Optional.empty())
-                  .orElse(vector);
-          var spec = rule.resolve(() -> observed.vectorDimensions).orElseThrow();
+                  .getExplicitSearchVectorSpecification(dotted)
+                  .or(
+                      () ->
+                          this.resolver
+                              .getTypeSetVectorRule(dotted, Optional.empty())
+                              .orElse(vector)
+                              .resolve(() -> observed.vectorDimensions))
+                  .orElseThrow();
           mapping = new SearchIndexVectorFieldDefinition(spec, true).toBson();
         }
         case DocumentFieldDefinition document ->
@@ -800,6 +813,20 @@ public final class LuceneIndexMappingExporter {
       result.add(mapping);
     }
     return result;
+  }
+
+  private boolean usesDefaultAnalyzer(FieldInfo field, Type type) {
+    return (type == Type.TOKEN || type == Type.AUTOCOMPLETE)
+        && this.analyzers.resolve(field.name).isEmpty();
+  }
+
+  private static MappingExportException unsupportedAnalysis(FieldInfo field, Type type) {
+    return new MappingExportException(
+        "Reindex before exporting '"
+            + FieldName.getFieldPath(field.name)
+            + "': this "
+            + type.name().toLowerCase(java.util.Locale.ROOT)
+            + " field used the index's default analyzer, which the static mapping cannot express.");
   }
 
   private void fixStringAnalysis(BsonDocument mapping, String physicalName) {

@@ -3179,6 +3179,70 @@ public class StandaloneGrpcServerTest {
   }
 
   @Test
+  public void getIndexMappings_staticAndDynamicVectorAlias_preservesBothCompatibleValues()
+      throws Exception {
+    Similarity.load();
+    String schema =
+        """
+        {mappings:{dynamic:{typeSet:'v'},fields:{
+          'a.b':{type:'vector',numDimensions:2,similarity:'euclidean'}}},
+         typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}
+        """;
+    String vector = bsonFloatVector(1, 0);
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "static-and-dynamic",
+          schema,
+          List.of("{_id:1,a:{b:" + vector + "}}", "{_id:2,'a.b':" + vector + "}"),
+          Map.of(exactVectorQuery("a.b", "[1,0]"), 2));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_vectorAndNullArray_preservesBothQueries() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "null-array",
+          MIXED_VECTOR_MAPPING.replace("{type:'string'},", ""),
+          List.of("{_id:1,v:[null]}", "{_id:2,v:" + bsonFloatVector(1, 0) + "}"),
+          Map.of("{equals:{path:'v',value:null}}", 1, exactVectorQuery("v", "[1,0]"), 1));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_emptyKeyVector_preservesVectorQuery() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      assertReplayQueries(
+          f,
+          "empty-vector",
+          MIXED_VECTOR_MAPPING,
+          List.of("{_id:1,'':" + bsonFloatVector(1, 0) + "}"),
+          Map.of(exactVectorQuery("", "[1,0]"), 1));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_tokenAlias_preservesFacetBuckets() throws Exception {
+    try (var f = new Fixture(data())) {
+      String original =
+          f.create("original", ALIAS_TYPE_SETS.formatted("{type:'token'}", "{type:'string'}"));
+      var docs = List.of("{_id:1,'a.b':'snow'}", "{_id:2,a:{b:'other'}}");
+      for (String doc : docs) f.upsert(original, doc);
+      String replay = f.create("replay", exportMappings(f, original).getDefinitionJson());
+      for (String doc : docs) f.upsert(replay, doc);
+      String query = "{index:'%s',facet:{facets:{terms:{type:'string',path:'a.b'}}}}";
+      var before = metadata(f.queries.searchMeta(metaRequest(query.formatted("original"))));
+      var after = metadata(f.queries.searchMeta(metaRequest(query.formatted("replay"))));
+      assertThat(before.getDocument("facet").getDocument("terms").getArray("buckets")).hasSize(1);
+      assertThat(after).isEqualTo(before);
+    }
+  }
+
+  @Test
   public void getIndexMappings_vectorTypeSet_exportedDefinitionReproducesSearchResults()
       throws Exception {
     Similarity.load();

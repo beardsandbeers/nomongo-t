@@ -454,7 +454,7 @@ public final class StandaloneRuntime implements Closeable {
             .asRuntimeException();
       }
       return response.setDefinitionJson(external.toJson()).build();
-    } catch (LuceneIndexMappingExporter.AmbiguousVectorPathException error) {
+    } catch (LuceneIndexMappingExporter.MappingExportException error) {
       throw Status.FAILED_PRECONDITION
           .withDescription(error.getMessage())
           .withCause(error)
