@@ -22,13 +22,21 @@ public record TypeSetDefinition(String name, List<FieldTypeDefinition> types)
         Field.builder("types")
             .listOf(
                 Value.builder()
-                    .classValue(FieldTypeDefinition::fromBson)
+                    .classValue(TypeSetDefinition::parseFieldType)
                     .disallowUnknownFields()
                     .required())
             .mustHaveUniqueAttribute("type", FieldTypeDefinition::getType)
             .validate(TypeSetDefinition::ensureValidFieldTypes)
             .mustNotBeEmpty()
             .required();
+  }
+
+  private static FieldTypeDefinition parseFieldType(DocumentParser parser)
+      throws BsonParseException {
+    var type = parser.getField(FieldTypeDefinition.Fields.TYPE).unwrap();
+    return type == FieldTypeDefinition.Type.VECTOR
+        ? TypeSetVectorFieldDefinition.fromBson(parser)
+        : FieldTypeDefinition.parseType(parser, type);
   }
 
   public static TypeSetDefinition fromBson(DocumentParser parser) throws BsonParseException {
@@ -71,7 +79,6 @@ public record TypeSetDefinition(String name, List<FieldTypeDefinition> types)
           DATE_FACET,
           DOCUMENT,
           EMBEDDED_DOCUMENTS,
-          VECTOR,
           KNN_VECTOR,
           NUMBER_FACET,
           SORTABLE_DATE_BETA_V1,
@@ -79,7 +86,8 @@ public record TypeSetDefinition(String name, List<FieldTypeDefinition> types)
           SORTABLE_STRING_BETA_V1,
           STRING_FACET ->
           true;
-      case AUTOCOMPLETE, BOOLEAN, DATE, GEO, NUMBER, OBJECT_ID, STRING, TOKEN, UUID -> false;
+      case AUTOCOMPLETE, BOOLEAN, DATE, GEO, NUMBER, OBJECT_ID, STRING, TOKEN, UUID, VECTOR ->
+          false;
     };
   }
 

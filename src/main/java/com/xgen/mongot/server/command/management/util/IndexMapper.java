@@ -51,30 +51,31 @@ public class IndexMapper {
     return switch (indexDefinition) {
       case UserSearchIndexDefinition searchIndexDefinition ->
           SearchIndexDefinition.create(
-              newIndexId,
-              indexName,
-              db,
-              collectionName,
-              collectionUuid,
-              view,
-              searchIndexDefinition.numPartitions(),
-              searchIndexDefinition.mappings(),
-              searchIndexDefinition.analyzer(),
-              searchIndexDefinition.searchAnalyzer(),
-              searchIndexDefinition.analyzers(),
-              SearchIndexCapabilities.CURRENT_FEATURE_VERSION,
-              searchIndexDefinition.synonyms(),
-              searchIndexDefinition.storedSource(),
-              searchIndexDefinition.typeSets(),
-              searchIndexDefinition.sort(),
-              Optional.of(definitionVersion),
-              Optional.of(definitionVersionCreatedAt),
-              // Older releases reject the field, so definitionVersionId is not assigned here.
-              Optional.empty(),
-              Optional.of(newIndexId),
-              Optional.empty(),
-              // Preserve prior value on update; stamp v1 on create
-              existingMaterializedViewNameFormatVersion.or(() -> Optional.of(1L)));
+                  newIndexId,
+                  indexName,
+                  db,
+                  collectionName,
+                  collectionUuid,
+                  view,
+                  searchIndexDefinition.numPartitions(),
+                  searchIndexDefinition.mappings(),
+                  searchIndexDefinition.analyzer(),
+                  searchIndexDefinition.searchAnalyzer(),
+                  searchIndexDefinition.analyzers(),
+                  SearchIndexCapabilities.CURRENT_FEATURE_VERSION,
+                  searchIndexDefinition.synonyms(),
+                  searchIndexDefinition.storedSource(),
+                  searchIndexDefinition.typeSets(),
+                  searchIndexDefinition.sort(),
+                  Optional.of(definitionVersion),
+                  Optional.of(definitionVersionCreatedAt),
+                  // Older releases reject the field, so definitionVersionId is not assigned here.
+                  Optional.empty(),
+                  Optional.of(newIndexId),
+                  Optional.empty(),
+                  // Preserve prior value on update; stamp v1 on create
+                  existingMaterializedViewNameFormatVersion.or(() -> Optional.of(1L)))
+              .forNewGeneration();
       case UserVectorIndexDefinition vectorIndexDefinition ->
           new VectorIndexDefinition(
               newIndexId,

@@ -1,13 +1,13 @@
 package com.xgen.mongot.index.query;
 
 import com.xgen.mongot.index.definition.FieldDefinition;
-import com.xgen.mongot.index.definition.GeoFieldDefinition;
 import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.path.string.StringFieldPath;
+import com.xgen.mongot.index.path.string.StringMultiFieldPath;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.FloatVector;
@@ -24,20 +24,13 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
 
   @Override
   public boolean indexedAsGeoPoint(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::geoFieldDefinition)
-        .isPresent();
+    return this.fieldDefinitionResolver.hasGeoField(path, embeddedRoot, false);
   }
 
   /** Path stores geo shapes. */
   @Override
   public boolean indexedAsGeoShape(FieldPath path, Optional<FieldPath> embeddedRoot) {
-    Optional<GeoFieldDefinition> geoFieldDefinition =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(path, embeddedRoot)
-            .flatMap(FieldDefinition::geoFieldDefinition);
-    return geoFieldDefinition.isPresent() && geoFieldDefinition.get().indexShapes();
+    return this.fieldDefinitionResolver.hasGeoField(path, embeddedRoot, true);
   }
 
   /** Validate that the path has proper storage as a string field in the index. */
@@ -110,11 +103,17 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
       FieldPath fieldPath, Optional<FieldPath> embeddedRoot, int dimensions)
       throws InvalidQueryException {
     Optional<VectorFieldSpecification> definition =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(fieldPath, embeddedRoot)
-            .flatMap(FieldDefinition::vectorFieldSpecification);
+        this.fieldDefinitionResolver.getVectorFieldSpecification(fieldPath, embeddedRoot);
 
     if (definition.isEmpty()) {
+      var rule = this.fieldDefinitionResolver.getTypeSetVectorRule(fieldPath, embeddedRoot);
+      if (rule.isPresent()) {
+        if (rule.get().resolve(() -> Optional.of(dimensions)).isEmpty()) {
+          throw new InvalidQueryException(
+              "Query dimensions are incompatible with the vector mapping.");
+        }
+        return;
+      }
       throw new InvalidQueryException(
           String.format("%s must be indexed as \"vector\".", fieldPath));
     }
@@ -156,9 +155,19 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
   @Override
   public boolean isHighlightableStringField(StringPath path, Optional<FieldPath> embeddedRoot) {
     return this.fieldDefinitionResolver
-        .getStringFieldDefinition(path, embeddedRoot)
-        .map(StringFieldDefinition::storeFlag)
-        .orElse(false);
+        .getStringFieldDefinition(path, embeddedRoot, StringFieldDefinition::storeFlag)
+        .isPresent();
+  }
+
+  public boolean hasUnstoredStringAlias(StringPath path, Optional<FieldPath> embeddedRoot) {
+    return path.getBaseFieldPath().isNested()
+        && this.fieldDefinitionResolver
+            .getStringFieldDefinition(path, embeddedRoot, field -> !field.storeFlag())
+            .isPresent();
+  }
+
+  public boolean storesMultiInBase(StringMultiFieldPath multi, Optional<FieldPath> embeddedRoot) {
+    return this.fieldDefinitionResolver.storesMultiInBase(multi, embeddedRoot);
   }
 
   @Override

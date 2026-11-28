@@ -25,7 +25,8 @@
                 "objectId",
                 "string",
                 "token",
-                "uuid"
+                "uuid",
+                "vector"
               ],
               "markdownEnumDescriptions": [
                 "Data type to use to index string type fields for autocompletion, including any string fields inside arrays and embedded documents. You can use this field type only for [static mappings](https://dochub.mongodb.org/core/static-and-dynamic-mappings-fts). To learn more about this data type, see [autocomplete Type](https://dochub.mongodb.org/core/autocomplete-type-fts).",
@@ -36,7 +37,8 @@
                 "Data type to use to index fields with [ObjectId](https://dochub.mongodb.org/core/objectid-bson-fts) values, including ObjectId fields inside arrays and embedded documents. To learn more about this data type, see [objectId Type](https://dochub.mongodb.org/core/objectid-type-fts).",
                 "Data type to use to index fields with string values. To learn more about this data type, see [string Type](https://dochub.mongodb.org/core/string-type-fts).",
                 "Data type to use to index fields of type `string` for sorting or filtering search results with equals, in or range. To learn more about this data type, see [token Type](https://dochub.mongodb.org/core/token-type-fts).",
-                "Data type to use to index fields with `uuid` values, including UUID fields inside arrays and embedded documents. To learn more about this data type, see [uuid Type](https://dochub.mongodb.org/core/uuid-type-fts)."
+                "Data type to use to index fields with `uuid` values, including UUID fields inside arrays and embedded documents. To learn more about this data type, see [uuid Type](https://dochub.mongodb.org/core/uuid-type-fts).",
+                "Indexes BSON binary subtype 9 vectors. Omit numDimensions to learn the dimensions independently for each field path."
               ]
             }
           },
@@ -68,6 +70,24 @@
             },
             {
               "$ref": "mappings/fields/uuid.json"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": { "const": "vector" },
+                "numDimensions": {
+                  "$ref": "mappings/fields/vector.json#/properties/numDimensions"
+                },
+                "similarity": { "$ref": "mappings/fields/vector.json#/properties/similarity" },
+                "quantization": { "$ref": "mappings/fields/vector.json#/properties/quantization" }
+              },
+              "required": ["type", "similarity"],
+              "if": {
+                "properties": { "quantization": { "const": "binary" } },
+                "required": ["quantization"]
+              },
+              "then": { "properties": { "numDimensions": { "multipleOf": 8 } } },
+              "additionalProperties": false
             }
           ],
           "definitions": {

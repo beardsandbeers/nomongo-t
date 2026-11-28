@@ -29,6 +29,7 @@ mongot_java_unit_test_suite(
         "//src/main/java/com/xgen/mongot/standalone/runtime",
         "//src/main/java/com/xgen/mongot/standalone/server",
         "//src/main/java/com/xgen/mongot/util",
+        "//src/main/java/com/xgen/mongot/util/bson",
         "//src/main/java/com/xgen/mongot/util/bson/parser",
         "//src/main/java/com/xgen/testing/mongot/server/grpc",
         "//src/proto/standalone/v1:standalone_java_grpc",

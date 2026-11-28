@@ -44,6 +44,72 @@
   ],
   "invalid": [
     {
+      "description": "zero vector dimensions",
+      "value": {
+        "name": "vectors",
+        "types": [
+          {
+            "type": "vector",
+            "similarity": "cosine",
+            "numDimensions": 0
+          }
+        ]
+      }
+    },
+    {
+      "description": "oversize vector dimensions",
+      "value": {
+        "name": "vectors",
+        "types": [
+          {
+            "type": "vector",
+            "similarity": "cosine",
+            "numDimensions": 8193
+          }
+        ]
+      }
+    },
+    {
+      "description": "unaligned binary dimensions",
+      "value": {
+        "name": "vectors",
+        "types": [
+          {
+            "type": "vector",
+            "similarity": "cosine",
+            "numDimensions": 9,
+            "quantization": "binary"
+          }
+        ]
+      }
+    },
+    {
+      "description": "unknown vector quantization",
+      "value": {
+        "name": "vectors",
+        "types": [
+          {
+            "type": "vector",
+            "similarity": "cosine",
+            "quantization": "unknown"
+          }
+        ]
+      }
+    },
+    {
+      "description": "static-only vector options",
+      "value": {
+        "name": "vectors",
+        "types": [
+          {
+            "type": "vector",
+            "similarity": "cosine",
+            "indexingMethod": "flat"
+          }
+        ]
+      }
+    },
+    {
       "description": "missing name",
       "value": {
         "types": [

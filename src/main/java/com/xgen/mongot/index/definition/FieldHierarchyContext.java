@@ -1,6 +1,5 @@
 package com.xgen.mongot.index.definition;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
@@ -108,7 +107,7 @@ public class FieldHierarchyContext {
    */
   static FieldHierarchyContext createForDocumentsField(Map<String, FieldDefinition> fields)
       throws IllegalEmbeddedFieldException {
-    return create(fields, false);
+    return create(fields, false, true);
   }
 
   /**
@@ -118,11 +117,21 @@ public class FieldHierarchyContext {
    */
   static FieldHierarchyContext createForEmbeddedDocumentsField(Map<String, FieldDefinition> fields)
       throws IllegalEmbeddedFieldException {
-    return create(fields, true);
+    return create(fields, true, true);
+  }
+
+  /** Reconstruct the whole-field, last-declaration-wins view used by older Lucene generations. */
+  static FieldHierarchyContext legacy(HierarchicalFieldDefinition field) {
+    try {
+      return create(field.fields(), field instanceof EmbeddedDocumentsFieldDefinition, false);
+    } catch (IllegalEmbeddedFieldException e) {
+      throw new IllegalStateException(
+          "Previously validated mapping has conflicting embedded roots", e);
+    }
   }
 
   private static FieldHierarchyContext create(
-      Map<String, FieldDefinition> fields, boolean isEmbeddedDocs)
+      Map<String, FieldDefinition> fields, boolean isEmbeddedDocs, boolean mergeAliases)
       throws IllegalEmbeddedFieldException {
     Map<FieldPath, Map<FieldPath, FieldDefinition>> fieldsByEmbeddedRoot = new HashMap<>();
     Map<FieldPath, FieldDefinition> rootFields = new HashMap<>();
@@ -134,6 +143,7 @@ public class FieldHierarchyContext {
                 populateRelativeRoots(
                     field.getKey(),
                     field.getValue(),
+                    mergeAliases,
                     fieldsByEmbeddedRoot,
                     rootFields,
                     embeddedFieldDefinitionByEmbeddedRoot));
@@ -155,10 +165,10 @@ public class FieldHierarchyContext {
         numEmbeddedDocumentLayers);
   }
 
-  @VisibleForTesting
-  static void populateRelativeRoots(
+  private static void populateRelativeRoots(
       String leafPath,
       FieldDefinition field,
+      boolean mergeAliases,
       Map<FieldPath, Map<FieldPath, FieldDefinition>> fieldsByEmbeddedRoot,
       Map<FieldPath, FieldDefinition> rootFields,
       Map<FieldPath, EmbeddedDocumentsFieldDefinition> embeddedFieldDefinitionByEmbeddedRoot)
@@ -185,78 +195,87 @@ public class FieldHierarchyContext {
       throw IllegalEmbeddedFieldException.withConflictingRelativeRoots(conflictingRelativeRoots);
     }
 
-    // For embedded field, get all embedded fields maps, prepend new root path, and add to field by
-    // embedded root map for this node.
-    populateFieldsByEmbeddedRoot(
-        field.embeddedDocumentsFieldDefinition(),
-        leafPath,
-        fieldsByEmbeddedRoot,
-        embeddedFieldDefinitionByEmbeddedRoot);
+    var embedded =
+        field
+            .embeddedDocumentsFieldDefinition()
+            .map(doc -> mergeAliases ? doc.fieldHierarchyContext() : legacy(doc));
+    var document =
+        field
+            .documentFieldDefinition()
+            .map(doc -> mergeAliases ? doc.fieldHierarchyContext() : legacy(doc));
+    embedded.ifPresent(
+        context ->
+            context.prependEmbeddedFields(
+                leafPath,
+                fieldsByEmbeddedRoot,
+                embeddedFieldDefinitionByEmbeddedRoot,
+                mergeAliases));
+    document.ifPresent(
+        context ->
+            context.prependEmbeddedFields(
+                leafPath,
+                fieldsByEmbeddedRoot,
+                embeddedFieldDefinitionByEmbeddedRoot,
+                mergeAliases));
 
-    // For document field, get all embedded fields maps, prepend new root path, and add to field by
-    // embedded root map for this node.
-    populateFieldsByEmbeddedRoot(
-        field.documentFieldDefinition(),
-        leafPath,
-        fieldsByEmbeddedRoot,
-        embeddedFieldDefinitionByEmbeddedRoot);
-
-    // for embedded field - add "rootFields" map as value in fieldsByEmbeddedRoot map after
-    // prepending leaf path
+    embedded.ifPresent(
+        context ->
+            putEmbeddedFields(
+                fieldsByEmbeddedRoot,
+                FieldPath.newRoot(leafPath),
+                prependPaths(context.rootFields, leafPath),
+                mergeAliases));
     field
         .embeddedDocumentsFieldDefinition()
-        .map(EmbeddedDocumentsFieldDefinition::fieldHierarchyContext)
-        .map(FieldHierarchyContext::getRootFields)
         .ifPresent(
-            embeddedHierarchyFields ->
-                fieldsByEmbeddedRoot.put(
-                    FieldPath.newRoot(leafPath), prependPaths(embeddedHierarchyFields, leafPath)));
-    field
-        .embeddedDocumentsFieldDefinition()
-        .ifPresent(
-            fieldDefinition ->
-                embeddedFieldDefinitionByEmbeddedRoot.put(
-                    FieldPath.newRoot(leafPath), fieldDefinition));
-    // for document field - add "rootFields" map as value to rootFields map after prepending leaf
-    // path
-    field
-        .documentFieldDefinition()
-        .map(DocumentFieldDefinition::fieldHierarchyContext)
-        .map(FieldHierarchyContext::getRootFields)
-        .ifPresent(
-            documentHierarchyFields ->
-                rootFields.putAll(prependPaths(documentHierarchyFields, leafPath)));
-
-    rootFields.put(FieldPath.newRoot(leafPath), field);
+            def -> embeddedFieldDefinitionByEmbeddedRoot.put(FieldPath.newRoot(leafPath), def));
+    document.ifPresent(
+        context ->
+            prependPaths(context.rootFields, leafPath)
+                .forEach((path, child) -> putField(rootFields, path, child, mergeAliases)));
+    putField(rootFields, FieldPath.newRoot(leafPath), field, mergeAliases);
   }
 
-  private static void populateFieldsByEmbeddedRoot(
-      Optional<? extends HierarchicalFieldDefinition> hierarchicalFieldDefinition,
+  private void prependEmbeddedFields(
       String leafPath,
-      Map<FieldPath, Map<FieldPath, FieldDefinition>> fieldsByEmbeddedRoot,
-      Map<FieldPath, EmbeddedDocumentsFieldDefinition> embeddedRootDocuments) {
-    if (hierarchicalFieldDefinition.isEmpty()) {
+      Map<FieldPath, Map<FieldPath, FieldDefinition>> scopes,
+      Map<FieldPath, EmbeddedDocumentsFieldDefinition> roots,
+      boolean mergeAliases) {
+    this.fieldsByEmbeddedRoot.forEach(
+        (path, children) ->
+            putEmbeddedFields(
+                scopes,
+                path.withNewRoot(leafPath),
+                prependPaths(children, leafPath),
+                mergeAliases));
+    this.embeddedFieldDefinitionByEmbeddedRoot.forEach(
+        (path, definition) -> roots.put(path.withNewRoot(leafPath), definition));
+  }
+
+  private static void putEmbeddedFields(
+      Map<FieldPath, Map<FieldPath, FieldDefinition>> scopes,
+      FieldPath root,
+      Map<FieldPath, FieldDefinition> children,
+      boolean mergeAliases) {
+    if (!mergeAliases) {
+      scopes.put(root, children);
       return;
     }
+    var fields = scopes.computeIfAbsent(root, unused -> new HashMap<>());
+    children.forEach(
+        (path, child) -> fields.merge(path, child, FieldDefinition::mergeQueryAliases));
+  }
 
-    hierarchicalFieldDefinition
-        .get()
-        .fieldHierarchyContext()
-        .getFieldsByEmbeddedRoot()
-        .forEach(
-            (embeddedRootPath, embeddedFieldMap) ->
-                fieldsByEmbeddedRoot.put(
-                    embeddedRootPath.withNewRoot(leafPath),
-                    prependPaths(embeddedFieldMap, leafPath)));
-
-    hierarchicalFieldDefinition
-        .get()
-        .fieldHierarchyContext()
-        .getEmbeddedFieldDefinitionByEmbeddedRoot()
-        .forEach(
-            (embeddedRootPath, embeddedDocumentsFieldDefinition) ->
-                embeddedRootDocuments.put(
-                    embeddedRootPath.withNewRoot(leafPath), embeddedDocumentsFieldDefinition));
+  private static void putField(
+      Map<FieldPath, FieldDefinition> fields,
+      FieldPath path,
+      FieldDefinition child,
+      boolean mergeAliases) {
+    if (mergeAliases) {
+      fields.merge(path, child, FieldDefinition::mergeQueryAliases);
+    } else {
+      fields.put(path, child);
+    }
   }
 
   private static <T> ImmutableMap<FieldPath, T> prependPaths(

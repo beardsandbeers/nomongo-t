@@ -106,7 +106,24 @@ public class HighlightResolver {
                 Collectors.toMap(
                     Function.identity(), this::getStoredLuceneField, (a, b) -> a, HashMap::new));
 
-    return Highlight.create(storedLuceneFieldNameMap, unresolvedHighlight);
+    var partialStorage =
+        resolvedValidatedLuceneFieldNames.stream()
+            .filter(
+                name -> {
+                  if (FieldName.MultiField.isTypeOf(name)) {
+                    return this.queryTimeMappingChecks.hasUnstoredStringAlias(
+                        FieldName.MultiField.getFieldPath(name), returnScope);
+                  }
+                  return FieldName.TypeField.STRING.isTypeOf(name)
+                      && this.queryTimeMappingChecks.hasUnstoredStringAlias(
+                          new StringFieldPath(FieldName.getFieldPath(name)), returnScope);
+                })
+            .collect(Collectors.toUnmodifiableSet());
+    return new Highlight(
+        storedLuceneFieldNameMap,
+        unresolvedHighlight.maxNumPassages(),
+        unresolvedHighlight.maxCharsToExamine(),
+        partialStorage);
   }
 
   private static Stream<StringPath> resolveWildcardPaths(
@@ -296,9 +313,6 @@ public class HighlightResolver {
    * corresponding base field, but only if the base field is stored. If the base field is not
    * stored, or if the input is not a multi-field, the original field name is returned unchanged.
    *
-   * <p>Note: Since we do not consider highlighting fields that are indexed inside embedded
-   * documents, this method does not explicitly handle embedded document paths.
-   *
    * @param luceneFieldName the original Lucene field name, which may be a multi-field
    * @return the resolved base field name if it is stored; otherwise, the original field name
    */
@@ -311,9 +325,12 @@ public class HighlightResolver {
     StringMultiFieldPath multiFieldPath = FieldName.MultiField.getFieldPath(luceneFieldName);
     FieldPath baseFieldPath = multiFieldPath.getFieldPath();
 
-    return this.queryTimeMappingChecks.isHighlightableStringField(
-            new StringFieldPath(baseFieldPath), Optional.empty())
-        ? FieldName.TypeField.STRING.getLuceneFieldName(baseFieldPath, Optional.empty())
+    Optional<FieldPath> root =
+        FieldName.EmbeddedField.isTypeOf(luceneFieldName)
+            ? Optional.of(FieldPath.parse(FieldName.getEmbeddedRootPathOrThrow(luceneFieldName)))
+            : Optional.empty();
+    return this.queryTimeMappingChecks.storesMultiInBase(multiFieldPath, root)
+        ? FieldName.TypeField.STRING.getLuceneFieldName(baseFieldPath, root)
         : luceneFieldName;
   }
 }

@@ -19,6 +19,7 @@ import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.util.LuceneDoubleConversionUtils;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.ReturnScope;
+import com.xgen.mongot.index.query.aggregation.NumericBucketOrdinals;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.index.query.operators.EmbeddedDocumentScope;
@@ -27,6 +28,7 @@ import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.FieldPath;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.facet.range.LongRange;
 import org.bson.BsonNumber;
@@ -91,12 +93,14 @@ public class LuceneFacetContext {
       FacetDefinition.StringFacetDefinition stringFacetDefinition, Optional<FieldPath> returnScope)
       throws InvalidQueryException {
     FieldPath path = FieldPath.parse(stringFacetDefinition.path());
-    var def = this.fieldDefinitionResolver.getFieldDefinition(path, returnScope);
-
     Optional<FacetableStringFieldDefinition> stringFacetFieldDef =
-        def.flatMap(FieldDefinition::stringFacetFieldDefinition);
+        getFacetField(
+            path,
+            returnScope,
+            field -> field.stringFacetFieldDefinition().map(Function.identity()));
     Optional<FacetableStringFieldDefinition> tokenFieldDef =
-        def.flatMap(FieldDefinition::tokenFieldDefinition);
+        getFacetField(
+            path, returnScope, field -> field.tokenFieldDefinition().map(Function.identity()));
 
     if (returnScope.isPresent()) {
       // faceting using stringFacet field not supported in embedded documents
@@ -166,6 +170,39 @@ public class LuceneFacetContext {
 
   SearchFieldDefinitionResolver getFieldDefinitionResolver() {
     return this.fieldDefinitionResolver;
+  }
+
+  Optional<NumericBucketOrdinals> numericBucketOrdinals(
+      FacetDefinition.BoundaryFacetDefinition<?> facet,
+      Optional<FieldPath> root,
+      FieldName.TypeField type) {
+    if (facet instanceof FacetDefinition.NumericFacetDefinition numeric
+        && usesNumericBucketOrdinals(numeric, root, type)) {
+      return Optional.of(
+          new NumericBucketOrdinals(FieldPath.parse(numeric.path()), root, numeric.boundaries()));
+    }
+    return Optional.empty();
+  }
+
+  private boolean usesNumericBucketOrdinals(
+      FacetDefinition.NumericFacetDefinition facet,
+      Optional<FieldPath> root,
+      FieldName.TypeField type) {
+    var path = FieldPath.parse(facet.path());
+    // An export may contain only the observed spelling. Compare against the same BSON
+    // boundaries even if the other representation is absent from the static mapping.
+    return path.isNested()
+        && v2Types.contains(type)
+        && (this.fieldDefinitionResolver.hasBothNumericRepresentations(path, root)
+            || NumericBucketOrdinals.hasInexactBoundary(type, facet.boundaries()));
+  }
+
+  static LongRange[] ordinalRanges(FacetDefinition.BoundaryFacetDefinition<?> facet) {
+    var ranges = new LongRange[facet.boundaries().size() - 1];
+    for (int i = 0; i < ranges.length; i++) {
+      ranges[i] = new LongRange(facet.boundaries().get(i).toString(), i, true, i, true);
+    }
+    return ranges;
   }
 
   LongRange[] getRanges(
@@ -271,15 +308,18 @@ public class LuceneFacetContext {
         && value.asDouble().getValue() > Long.MAX_VALUE;
   }
 
+  private <T> Optional<T> getFacetField(
+      FieldPath path, Optional<FieldPath> scope, Function<FieldDefinition, Optional<T>> select) {
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(path, scope, select);
+  }
+
   private void validateDefinition(FacetDefinition facetDefinition, Optional<FieldPath> embeddedPath)
       throws InvalidQueryException {
-    Optional<FieldDefinition> maybeFieldDef =
-        this.fieldDefinitionResolver.getFieldDefinition(
-            FieldPath.parse(facetDefinition.path()), embeddedPath);
+    FieldPath path = FieldPath.parse(facetDefinition.path());
     switch (facetDefinition) {
       case FacetDefinition.StringFacetDefinition stringFacetDefinition:
-        if (maybeFieldDef.flatMap(FieldDefinition::stringFacetFieldDefinition).isEmpty()
-            && maybeFieldDef.flatMap(FieldDefinition::tokenFieldDefinition).isEmpty()) {
+        if (getFacetField(path, embeddedPath, FieldDefinition::stringFacetFieldDefinition).isEmpty()
+            && getFacetField(path, embeddedPath, FieldDefinition::tokenFieldDefinition).isEmpty()) {
           throwFieldNotIndexed(
               facetDefinition.path(), "token", embeddedPath.map(FieldPath::toString));
         }
@@ -290,8 +330,9 @@ public class LuceneFacetContext {
           throwEmbeddedNumberDateV2NotSupported();
         }
 
-        if (maybeFieldDef.flatMap(FieldDefinition::numberFacetFieldDefinition).isEmpty()
-            && maybeFieldDef.flatMap(FieldDefinition::numberFieldDefinition).isEmpty()) {
+        if (getFacetField(path, embeddedPath, FieldDefinition::numberFacetFieldDefinition).isEmpty()
+            && getFacetField(path, embeddedPath, FieldDefinition::numberFieldDefinition)
+                .isEmpty()) {
           throwFieldNotIndexed(
               facetDefinition.path(), "number", embeddedPath.map(FieldPath::toString));
         }
@@ -303,8 +344,8 @@ public class LuceneFacetContext {
           throwEmbeddedNumberDateV2NotSupported();
         }
 
-        if (maybeFieldDef.flatMap(FieldDefinition::dateFacetFieldDefinition).isEmpty()
-            && maybeFieldDef.flatMap(FieldDefinition::dateFieldDefinition).isEmpty()) {
+        if (getFacetField(path, embeddedPath, FieldDefinition::dateFacetFieldDefinition).isEmpty()
+            && getFacetField(path, embeddedPath, FieldDefinition::dateFieldDefinition).isEmpty()) {
           throwFieldNotIndexed(
               facetDefinition.path(), "date", embeddedPath.map(FieldPath::toString));
         }
@@ -315,15 +356,19 @@ public class LuceneFacetContext {
   private void assertNoDuplicateResolvedBoundaries(
       FacetDefinition.NumericFacetDefinition facetDefinition, Optional<FieldPath> returnScope)
       throws InvalidQueryException {
-    NumericFieldOptions.Representation numericRepresentation =
-        getNumberFacetFieldDefinition(facetDefinition, returnScope).options().representation();
     FieldName.TypeField typeField = getBoundaryFacetFieldType(facetDefinition, returnScope);
-    List<Long> resolvedBoundaries =
-        facetDefinition.boundaries().stream()
-            .map((val) -> getNumericRangeValue(val, numericRepresentation, typeField))
+    if (usesNumericBucketOrdinals(facetDefinition, returnScope, typeField)) {
+      // BSON validation checks ordering across both types. One column can have an empty
+      // range between two adjacent edges that the other column can distinguish.
+      return;
+    }
+    var representation =
+        getNumberFacetFieldDefinition(facetDefinition, returnScope).options().representation();
+    if (facetDefinition.boundaries().stream()
+            .map(value -> getNumericRangeValue(value, representation, typeField))
             .distinct()
-            .toList();
-    if (resolvedBoundaries.size() < facetDefinition.boundaries().size()) {
+            .count()
+        < facetDefinition.boundaries().size()) {
       throw new InvalidQueryException(
           "Cannot use multiple consecutive boundaries that resolve to the same number.  This can "
               + "happen when resolving very large or very small numbers, depending on the chosen "
@@ -352,14 +397,16 @@ public class LuceneFacetContext {
     Optional<NumberFacetFieldDefinition> numberFacetFieldDef =
         returnScope.isPresent()
             ? Optional.empty()
-            : this.fieldDefinitionResolver
-                .getFieldDefinition(FieldPath.parse(facetDefinition.path()), returnScope)
-                .flatMap(FieldDefinition::numberFacetFieldDefinition);
+            : getFacetField(
+                FieldPath.parse(facetDefinition.path()),
+                returnScope,
+                FieldDefinition::numberFacetFieldDefinition);
 
     Optional<NumberFieldDefinition> numberFieldDef =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(FieldPath.parse(facetDefinition.path()), returnScope)
-            .flatMap(FieldDefinition::numberFieldDefinition);
+        getFacetField(
+            FieldPath.parse(facetDefinition.path()),
+            returnScope,
+            FieldDefinition::numberFieldDefinition);
 
     if (returnScope.isPresent()) {
       if (numberFieldDef.isEmpty()) {
@@ -393,14 +440,16 @@ public class LuceneFacetContext {
     Optional<DateFacetFieldDefinition> dateFacetFieldDef =
         returnScope.isPresent()
             ? Optional.empty()
-            : this.fieldDefinitionResolver
-                .getFieldDefinition(FieldPath.parse(facetDefinition.path()), Optional.empty())
-                .flatMap(FieldDefinition::dateFacetFieldDefinition);
+            : getFacetField(
+                FieldPath.parse(facetDefinition.path()),
+                Optional.empty(),
+                FieldDefinition::dateFacetFieldDefinition);
 
     Optional<DateFieldDefinition> dateFieldDef =
-        this.fieldDefinitionResolver
-            .getFieldDefinition(FieldPath.parse(facetDefinition.path()), returnScope)
-            .flatMap(FieldDefinition::dateFieldDefinition);
+        getFacetField(
+            FieldPath.parse(facetDefinition.path()),
+            returnScope,
+            FieldDefinition::dateFieldDefinition);
 
     if (returnScope.isPresent()) {
       if (dateFieldDef.isEmpty()) {

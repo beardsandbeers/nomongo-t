@@ -113,6 +113,12 @@ public class Composite {
     }
 
     @Override
+    public void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {
+      this.first.handleBsonVector(supplier, binarySize);
+      this.second.handleBsonVector(supplier, binarySize);
+    }
+
+    @Override
     public void handleNull() {
       this.first.handleNull();
       this.second.handleNull();

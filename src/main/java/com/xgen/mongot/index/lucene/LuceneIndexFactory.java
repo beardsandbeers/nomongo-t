@@ -723,7 +723,8 @@ public class LuceneIndexFactory implements IndexFactory {
 
     boolean hasVectorField =
         !LuceneCodecUtils.extractVectorFieldsFromSearchMappings(searchDefinition.getMappings())
-            .isEmpty();
+                .isEmpty()
+            || searchDefinition.dynamicVectorFields().findAny().isPresent();
     return LuceneSearchIndex.createDiskBacked(
         this.indexDirectoryHelper.getIndexDirectoryPath(definitionGeneration),
         this.indexDirectoryHelper.getIndexMetadataPath(definitionGeneration),

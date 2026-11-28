@@ -40,6 +40,9 @@ public interface FieldValueHandler {
 
   void handleKnnVector(Supplier<Optional<Vector>> supplier);
 
+  /** Additional subtype 9 callback for dynamic mappings. The size includes the two-byte header. */
+  default void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {}
+
   void handleNull();
 
   void handleObjectId(Supplier<ObjectId> supplier);

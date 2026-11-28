@@ -11,6 +11,11 @@
       "const": "vector",
       "$ref": "../field.json#/definitions/typeErrorMessage"
     },
+    "bsonVectorOnly": {
+      "type": "boolean",
+      "default": false,
+      "description": "Index only single BSON subtype 9 vectors. Numeric arrays are skipped."
+    },
     "numDimensions": {
       "suggestSortText": "1",
       "type": "integer",

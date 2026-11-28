@@ -428,11 +428,17 @@ public final class StandaloneRuntime implements Closeable {
               .setActiveVersion(this.reads.version(definition));
       if (lease.reader() instanceof SearchIndexReader reader) {
         reader.refresh();
-        var mappings =
-            LuceneIndexMappingExporter.export(
-                definition.asSearchDefinition(),
-                lease.index().getGenerationId().generation.formatVersion.asLucene(),
-                reader.getFieldInfos());
+        var search = definition.asSearchDefinition();
+        var version = lease.index().getGenerationId().generation.formatVersion.asLucene();
+        org.bson.BsonDocument mappings;
+        if (search.requiresMappingObservations()) {
+          try (var snapshot = reader.acquireStatisticsSnapshot()) {
+            mappings =
+                LuceneIndexMappingExporter.exportSnapshot(search, version, snapshot.readers());
+          }
+        } else {
+          mappings = LuceneIndexMappingExporter.export(search, version, reader.getFieldInfos());
+        }
         external.put("mappings", mappings);
         response
             .setMappingsJson(mappings.toJson())
@@ -448,6 +454,11 @@ public final class StandaloneRuntime implements Closeable {
             .asRuntimeException();
       }
       return response.setDefinitionJson(external.toJson()).build();
+    } catch (LuceneIndexMappingExporter.MappingExportException error) {
+      throw Status.FAILED_PRECONDITION
+          .withDescription(error.getMessage())
+          .withCause(error)
+          .asRuntimeException();
     } catch (IOException | ReaderClosedException error) {
       throw Status.UNAVAILABLE
           .withDescription("Cannot read index field metadata")

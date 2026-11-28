@@ -1,6 +1,7 @@
 package com.xgen.mongot.index.lucene.writer;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.RateLimiter;
 import com.google.errorprone.annotations.Var;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
@@ -26,6 +27,7 @@ import com.xgen.mongot.index.lucene.document.LuceneIndexingPolicy;
 import com.xgen.mongot.index.lucene.document.builder.DocumentBlockBuilder;
 import com.xgen.mongot.index.lucene.document.context.IndexingPolicyBuilderContext;
 import com.xgen.mongot.index.lucene.field.FieldName;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.lucene.merge.InstrumentedConcurrentMergeScheduler;
 import com.xgen.mongot.index.lucene.similarity.LuceneSimilarity;
 import com.xgen.mongot.index.lucene.sort.LuceneIndexSortCompatibilityValidator;
@@ -101,6 +103,9 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
    */
   private volatile LuceneIndexingPolicy indexingPolicy;
 
+  private final Optional<TypeSetVectorWriter> typeSetVectors;
+  private final boolean recordsMappingObservations;
+
   /**
    * An optional upper limit for fields in an index. To support different indexing patterns, this
    * limit is not enforced by LuceneIndexWriter, instead, callers must separately call
@@ -147,7 +152,11 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
       IndexCapabilities indexCapabilities,
       IndexMetricsUpdater.IndexingMetricsUpdater indexingMetricsUpdater,
       Set<FieldPath> fieldPathsToFilterOut,
-      FeatureFlags featureFlags) {
+      FeatureFlags featureFlags,
+      Optional<TypeSetVectorWriter> typeSetVectors,
+      boolean recordsMappingObservations) {
+    this.recordsMappingObservations = recordsMappingObservations;
+    this.typeSetVectors = typeSetVectors;
     HashMap<String, Object> defaultKeyValues = new HashMap<>();
     defaultKeyValues.put("indexId", indexId);
     defaultKeyValues.put("indexFormatVersion", indexCapabilities);
@@ -233,7 +242,9 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             indexCapabilities,
             indexingMetricsUpdater,
             customVectorEngineFields,
-            featureFlags);
+            featureFlags,
+            Optional.empty(),
+            false);
 
     writer
         .logger
@@ -343,6 +354,18 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
     org.apache.lucene.index.IndexWriter luceneIndexWriter =
         new org.apache.lucene.index.IndexWriter(directory, indexWriterConfig);
 
+    Optional<TypeSetVectorWriter> typeSetVectors;
+    try {
+      typeSetVectors = TypeSetVectorWriter.open(resolver, luceneIndexWriter);
+    } catch (IOException | RuntimeException error) {
+      try {
+        luceneIndexWriter.rollback();
+      } catch (IOException cleanup) {
+        error.addSuppressed(cleanup);
+      }
+      throw error;
+    }
+
     LuceneIndexingPolicy luceneIndexingPolicy =
         DefaultIndexingPolicy.create(indexAnalyzer, resolver, indexingMetricsUpdater, featureFlags);
 
@@ -356,7 +379,9 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
             resolver.indexCapabilities,
             indexingMetricsUpdater,
             Set.of(),
-            featureFlags);
+            featureFlags,
+            typeSetVectors,
+            resolver.indexDefinition.requiresMappingObservations());
 
     writer
         .logger
@@ -509,13 +534,21 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
       ensureOpen("commit");
       LuceneCommitData commitData =
           new LuceneCommitData(LuceneCommitData.IndexWriterData.EMPTY, userData);
-      this.luceneWriter.setLiveCommitData(commitData.toDataMapEntries());
       try {
-        this.luceneWriter.commit();
+        commitWithDimensions(commitData);
       } catch (Exception e) {
         recordIndexingFailure(e, "commit");
         throw e;
       }
+    }
+  }
+
+  private void commitWithDimensions(LuceneCommitData commitData) throws IOException {
+    if (this.typeSetVectors.isPresent()) {
+      this.typeSetVectors.get().commit(this.luceneWriter, commitData.toDataMapEntries());
+    } else {
+      this.luceneWriter.setLiveCommitData(commitData.toDataMapEntries());
+      this.luceneWriter.commit();
     }
   }
 
@@ -543,7 +576,6 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
     try (LockGuard ignored = LockGuard.with(this.shutdownSharedLock)) {
       LuceneCommitData commitData =
           new LuceneCommitData(new LuceneCommitData.IndexWriterData(true), userData);
-      this.luceneWriter.setLiveCommitData(commitData.toDataMapEntries());
       try {
         this.luceneWriter.deleteAll();
       } catch (Exception e) {
@@ -551,7 +583,7 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         throw e;
       }
       try {
-        this.luceneWriter.commit();
+        commitWithDimensions(commitData);
       } catch (Exception e) {
         recordIndexingFailure(e, "commit");
         throw e;
@@ -693,7 +725,12 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
         throw WriterClosedException.create("getFieldNames");
       }
 
-      return this.luceneWriter.getFieldNames();
+      var fields = this.luceneWriter.getFieldNames();
+      return fields.contains(MappingObservations.NAME)
+              || fields.contains(MappingObservations.INDEXED_V2)
+              || fields.contains(MappingObservations.STORED_V1)
+          ? Sets.filter(fields, name -> !MappingObservations.isInternalField(name))
+          : fields;
     }
   }
 
@@ -751,29 +788,17 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
 
       List<Document> documentBlock = builder.buildBlock();
 
-      if (this.fieldLimit.isPresent()) {
-        // Try to fail early so we don't exceed field limits.
-        // This condition is sufficient but not necessary to exceed field limits (imagine a document
-        // passing this test but pushing the index over the limit). See exceededLimits().
-        throwIfDocumentBlockExceedsFieldLimit(documentBlock, this.fieldLimit.get());
-      }
-      // It's possible that the document event we're seeing is an insert from the change stream
-      // for a document that we already inserted during the initial sync collection scan. Also,
-      // the same might happen after restart during ongoing indexing, because async background
-      // commits might include events from a new batch, while resume token in CommitUserData
-      // is from the previous (fully processed) batch. If we were simply to call addDocument for an
-      // insert, in this situation we would end up having multiple documents in lucene with the same
-      // _id. One future optimization could be to denote in the DocumentEvent whether or not it's
-      // possible that this is a re-insert (i.e. we're still not up to minValidOpTime), and then
-      // call addDocument when we know it's safe.
-      try {
-        this.luceneWriter.updateDocuments(
-            LuceneDocumentIdEncoder.documentIdTerm(encodedDocumentId), documentBlock);
-      } catch (RegexLimitExceededException | RegexInterruptedException e) {
-        throw e;
-      } catch (Exception e) {
-        recordIndexingFailure(e, event.getEventType().name());
-        throw e;
+      if (this.typeSetVectors.isPresent()) {
+        this.typeSetVectors
+            .get()
+            .write(documentBlock, () -> updateDocuments(encodedDocumentId, event, documentBlock));
+        if (documentBlock.stream()
+            .flatMap(doc -> doc.getFields().stream())
+            .anyMatch(field -> field.fieldType().vectorDimension() > 0)) {
+          this.indexingMetricsUpdater.getVectorFieldsIndexed().increment();
+        }
+      } else {
+        updateDocuments(encodedDocumentId, event, documentBlock);
       }
     } catch (RegexLimitExceededException e) {
       this.indexingMetricsUpdater
@@ -790,12 +815,50 @@ public class SingleLuceneIndexWriter implements LuceneIndexWriter {
     }
   }
 
+  private void updateDocuments(
+      byte[] encodedDocumentId, DocumentEvent event, List<Document> documentBlock)
+      throws IOException, FieldExceededLimitsException {
+    if (this.recordsMappingObservations) {
+      for (var document : documentBlock) {
+        if (document.getField(MappingObservations.NAME)
+            instanceof MappingObservations observations) {
+          observations.finish(document);
+        }
+      }
+    }
+    if (this.fieldLimit.isPresent()) {
+      // Try to fail early so we don't exceed field limits.
+      // This condition is sufficient but not necessary to exceed field limits (imagine a document
+      // passing this test but pushing the index over the limit). See exceededLimits().
+      throwIfDocumentBlockExceedsFieldLimit(documentBlock, this.fieldLimit.get());
+    }
+    // It's possible that the document event we're seeing is an insert from the change stream
+    // for a document that we already inserted during the initial sync collection scan. Also,
+    // the same might happen after restart during ongoing indexing, because async background
+    // commits might include events from a new batch, while resume token in CommitUserData
+    // is from the previous (fully processed) batch. If we were simply to call addDocument for an
+    // insert, in this situation we would end up having multiple documents in lucene with the same
+    // _id. One future optimization could be to denote in the DocumentEvent whether or not it's
+    // possible that this is a re-insert (i.e. we're still not up to minValidOpTime), and then
+    // call addDocument when we know it's safe.
+    try {
+      this.luceneWriter.updateDocuments(
+          LuceneDocumentIdEncoder.documentIdTerm(encodedDocumentId), documentBlock);
+    } catch (RegexLimitExceededException | RegexInterruptedException e) {
+      throw e;
+    } catch (Exception e) {
+      recordIndexingFailure(e, event.getEventType().name());
+      throw e;
+    }
+  }
+
   private void throwIfDocumentBlockExceedsFieldLimit(List<Document> documentBlock, int fieldLimit)
       throws FieldExceededLimitsException {
     long fieldsIndexed =
         documentBlock.stream()
             .flatMap(d -> d.getFields().stream())
             .map(IndexableField::name)
+            .filter(name -> !MappingObservations.isInternalField(name))
             .distinct()
             .count();
     if (fieldsIndexed > fieldLimit) {

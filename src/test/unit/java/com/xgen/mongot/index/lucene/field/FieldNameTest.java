@@ -812,8 +812,8 @@ public class FieldNameTest {
     // Case: No delimiter
     assertThat(FieldName.TypeField.getTypeOf("$type:uuid")).isEmpty();
 
-    // Case: Delimiter exists, but there's no content after the delimiter
-    assertThat(FieldName.TypeField.getTypeOf("$type:string/")).isEmpty();
+    // A BSON key can be the empty string.
+    assertThat(FieldName.TypeField.getTypeOf("$type:string/")).hasValue(FieldName.TypeField.STRING);
 
     // Case: Non-$type prefix
     assertThat(FieldName.TypeField.getTypeOf("$invalidPrefix/someField")).isEmpty();

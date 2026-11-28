@@ -161,6 +161,74 @@ A write targets exactly one index. For multiple text/vector indexes, the caller 
 to each index. There is no fan-out, cross-index transaction, collection, document read API,
 strict INSERT, request-ID deduplication, or replay endpoint.
 
+### Vector fields in Search type sets
+
+A Search index can discover single-valued BSON binary subtype 9 vectors at the root or inside
+ordinary documents. This example uses scalar quantization and learns dimensions per path.
+
+```json
+{
+  "mappings": { "dynamic": { "typeSet": "embeddings" } },
+  "typeSets": [{
+    "name": "embeddings",
+    "types": [{ "type": "vector", "similarity": "cosine", "quantization": "scalar" }]
+  }]
+}
+```
+
+Set `numDimensions` on the vector entry to require that length at every matching path.
+When omitted, the first successfully indexed vector at each path sets its length for the
+local index generation, across partitions and restarts. Subsequent vectors of a different
+length at that path are skipped. When literal and nested BSON keys in one document share a dotted
+path, the first valid vector of the accepted length is indexed. An explicit Search vector
+mapping at that dotted path supplies the encoding for compatible BSON vectors discovered through
+the type set. Independently built indexes can learn different lengths if their input mixes
+dimensions. A vector query on a shard that has yet to observe the path returns an empty local
+result. Numeric arrays require an explicit static vector mapping.
+
+For indexes using vector type sets, Lucene indexes each distinct combination of field type and BSON key
+segments with the IDs of the documents that contain it. Mapping export reads these combinations
+once per segment. On segments with deletions, it checks matching IDs for a surviving document
+when the document frequency alone cannot establish that one survives. The literal key `"a.b"`
+and the nested path in `{"a":{"b":1}}` have separate entries. Each spelling can hold both a string
+and a vector. Replacing or deleting its last occurrence removes that spelling from the next
+refreshed export. Embedded document mappings that use a vector type set also record the BSON
+spellings of their scalar fields.
+
+Exported vector fields use `bsonVectorOnly: true`. Numeric arrays require an ordinary static
+vector mapping. A wrong-length vector at an explicitly mapped spelling leaves the other spelling
+eligible in the same document.
+
+Numeric facets on a shared dotted path read both `int64` and `double` representations. For example,
+if one document has `{"a.b":2,"a":{"b":3}}`, it counts once in the range `[0,5)`. Values in
+different ranges count once in each range. Bucket boundaries retain their BSON precision even when
+only one representation was observed before export. A `sum` or `avg` metric skips a document with multiple
+numeric values at the metric path. Highlighting reads the stored string values for the requested
+path or multi-field. These rules also apply after replaying an exported static mapping.
+
+An empty BSON key is a valid field path. `GetIndexFieldStats` includes observed fields at that key,
+and a request with `paths: [""]` selects it.
+
+An exact-path export also preserves fields that matched `exists` or contained null even
+when no typed value was indexed. For example, two valid vectors in one document can share a
+dotted name while only one vector is searchable. A path observed solely through its presence
+is exported as an empty static `document` mapping. This lets the reindexed document match
+`exists` and null queries. Embedded-document roots with the same dotted name keep their own children.
+
+Indexes using a vector type set or aliased embedded-document roots need exact BSON paths for
+export. For segments written before those paths and field presence were recorded together,
+export checks field metadata against explicit mappings and live observations from all partitions.
+If those already cover every possible spelling, export succeeds. Otherwise it returns
+`FAILED_PRECONDITION`. Rebuild the affected index from its source documents before retrying export.
+Queries remain available during this compatibility check. Other Search indexes use the ordinary
+field-metadata export. Export also returns `FAILED_PRECONDITION` if an older generation indexed
+a token or autocomplete field with the index-wide analyzer because another mapping masked its
+field-specific analyzer. Rebuild the affected index to export a static mapping with matching analysis.
+
+The supported quantization settings are `none` (default), `scalar`, and `binary`.
+The ordinary vector encoding and similarity rules apply. Dimensions range from 1 to 8192.
+Binary quantization requires a multiple of eight in both dimension modes.
+
 ### Delete by query
 
 `DocumentService.DeleteByQuery` streams matching IDs into bounded delete batches from one index. Its
@@ -294,6 +362,15 @@ durable commit before the index is ready. After readiness, missing commits fail 
 Legacy indexes without initialization records reopen only when all commits are valid; incomplete
 legacy data requires restoration or an explicit rebuild. Older binaries cannot open a version-4
 catalog. A catalog mutation can upgrade older metadata, so retain a stopped backup before upgrade.
+Catalog version 5 identifies generations using scoped analyzers and type-set scoring, and
+definitions that declare a vector type set or a static `bsonVectorOnly` field. New Search
+generations use scoped analysis when they reference a named type set or multiple BSON paths map
+to the same dotted field in a scope.
+Reopening a generation or applying a content-preserving update retains its original analyzers
+and scoring. A rebuild selects the current rules. Catalogs containing only ordinary definitions
+and generation records can still be written as version 4 and reopened by a version-4 binary.
+To roll back a version-5 catalog, restore a stopped backup made with the earlier binary.
+
 If `indexes.json` is missing and the journal still contains a live or staged locally owned
 generation, startup stops before altering the journal or deleting index files. Restore the
 matching stopped backup before restarting. A fresh directory and a journal containing only

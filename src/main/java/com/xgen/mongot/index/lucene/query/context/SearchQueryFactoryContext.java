@@ -21,6 +21,7 @@ import com.xgen.mongot.index.definition.SortableStringBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.TokenFieldDefinition;
 import com.xgen.mongot.index.definition.UuidFieldDefinition;
 import com.xgen.mongot.index.definition.VectorAutoEmbedFieldSpecification;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorAutoEmbedQuantization;
@@ -84,72 +85,62 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
 
   public Optional<AutocompleteFieldDefinition> getAutocompleteDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::autocompleteFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::autocompleteFieldDefinition);
   }
 
   public Optional<BooleanFieldDefinition> getBooleanFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::booleanFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::booleanFieldDefinition);
   }
 
   public Optional<DateFieldDefinition> getDateFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::dateFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::dateFieldDefinition);
   }
 
   public Optional<NumberFieldDefinition> getNumericFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::numberFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::numberFieldDefinition);
   }
 
   public Optional<ObjectIdFieldDefinition> getObjectIdFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::objectIdFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::objectIdFieldDefinition);
   }
 
   public Optional<TokenFieldDefinition> getTokenFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::tokenFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::tokenFieldDefinition);
   }
 
   public Optional<SortableDateBetaV1FieldDefinition> getSortableDateFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableDateBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableDateBetaV1FieldDefinition);
   }
 
   public Optional<SortableNumberBetaV1FieldDefinition> getSortableNumberFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableNumberBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableNumberBetaV1FieldDefinition);
   }
 
   public Optional<SortableStringBetaV1FieldDefinition> getSortableStringFieldDefinition(
       FieldPath path) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, Optional.empty())
-        .flatMap(FieldDefinition::sortableStringBetaV1FieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, Optional.empty(), FieldDefinition::sortableStringBetaV1FieldDefinition);
   }
 
   public Optional<UuidFieldDefinition> getUuidFieldDefinition(
       FieldPath path, Optional<FieldPath> embeddedRoot) {
-    return this.fieldDefinitionResolver
-        .getFieldDefinition(path, embeddedRoot)
-        .flatMap(FieldDefinition::uuidFieldDefinition);
+    return this.fieldDefinitionResolver.getQueryFieldDefinition(
+        path, embeddedRoot, FieldDefinition::uuidFieldDefinition);
   }
 
   public Optional<EmbeddedDocumentsFieldDefinition> getEmbeddedDocumentsFieldDefinition(
@@ -185,9 +176,13 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
 
     Optional<VectorSimilarity> vectorSimilarity =
         this.fieldDefinitionResolver
-            .getFieldDefinition(fieldPath, embeddedRoot)
-            .flatMap(FieldDefinition::vectorFieldSpecification)
-            .map(VectorFieldSpecification::similarity);
+            .getVectorFieldSpecification(fieldPath, embeddedRoot)
+            .map(VectorFieldSpecification::similarity)
+            .or(
+                () ->
+                    this.fieldDefinitionResolver
+                        .getTypeSetVectorRule(fieldPath, embeddedRoot)
+                        .map(rule -> rule.similarity()));
 
     if (vectorSimilarity.isEmpty()) {
       throw new InvalidQueryException(
@@ -200,13 +195,39 @@ public class SearchQueryFactoryContext implements QueryFactoryContext {
   @Override
   public VectorQuantization getIndexedQuantization(
       FieldPath fieldPath, Optional<FieldPath> embeddedRoot) {
-    Optional<FieldDefinition> fieldDefinition =
-        this.fieldDefinitionResolver.getFieldDefinition(fieldPath, embeddedRoot);
-    if (fieldDefinition.isEmpty() || fieldDefinition.get().vectorFieldSpecification().isEmpty()) {
-      return VectorQuantization.NONE;
-    }
+    return this.fieldDefinitionResolver
+        .getVectorFieldSpecification(fieldPath, embeddedRoot)
+        .map(VectorFieldSpecification::quantization)
+        .or(
+            () ->
+                this.fieldDefinitionResolver
+                    .getTypeSetVectorRule(fieldPath, embeddedRoot)
+                    .map(rule -> rule.quantization()))
+        .orElse(VectorQuantization.NONE);
+  }
 
-    return fieldDefinition.get().vectorFieldSpecification().get().quantization();
+  @Override
+  public VectorField resolveVectorField(FieldPath path, Optional<FieldPath> root, int dimensions)
+      throws InvalidQueryException {
+    var rule = this.fieldDefinitionResolver.getTypeSetVectorRule(path, root);
+    if (rule.isEmpty()) {
+      return QueryFactoryContext.super.resolveVectorField(path, root, dimensions);
+    }
+    var configured = rule.get();
+    var binding = this.fieldDefinitionResolver.vectorDimensions().binding(path.toString());
+    var expected =
+        configured.numDimensions().or(() -> binding.map(VectorDimensions.Binding::dimensions));
+    if (expected.isPresent() && expected.get() != dimensions) {
+      throw new InvalidQueryException(
+          String.format(
+              "vector field is indexed with %s dimensions but queried with %s",
+              expected.get(), dimensions));
+    }
+    if (configured.resolve(() -> Optional.of(dimensions)).isEmpty()) {
+      throw new InvalidQueryException("Query dimensions are incompatible with the vector mapping.");
+    }
+    return new VectorField(
+        configured.similarity(), configured.quantization(), binding, expected.isEmpty());
   }
 
   @Override

@@ -4,6 +4,7 @@ import com.xgen.mongot.index.analyzer.AnalyzerRegistry;
 import com.xgen.mongot.index.analyzer.wrapper.LuceneAnalyzer;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.lucene.similarity.LuceneSimilarity;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import org.apache.lucene.analysis.Analyzer;
@@ -51,15 +52,16 @@ final class LiveSearchSchema {
   LiveSearchSchema(
       SearchIndexDefinition definition, AnalyzerRegistry registry, IndexFormatVersion format) {
     this.format = format;
-    this.current = prepare(definition, registry);
+    this.current = prepare(definition, registry, new VectorDimensions());
   }
 
-  View prepare(SearchIndexDefinition definition, AnalyzerRegistry registry) {
+  View prepare(
+      SearchIndexDefinition definition, AnalyzerRegistry registry, VectorDimensions dimensions) {
     return new View(
         definition,
         registry,
         LuceneAnalyzer.indexAnalyzer(definition, registry),
-        definition.createFieldDefinitionResolver(this.format),
+        new SearchFieldDefinitionResolver(definition, this.format, dimensions),
         LuceneSimilarity.from(definition));
   }
 

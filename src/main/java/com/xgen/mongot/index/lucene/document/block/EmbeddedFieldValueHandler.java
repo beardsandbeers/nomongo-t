@@ -122,6 +122,12 @@ class EmbeddedFieldValueHandler implements FieldValueHandler {
   }
 
   @Override
+  public void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {
+    this.wrappedFieldValueHandler.ifPresent(
+        handler -> handler.handleBsonVector(supplier, binarySize));
+  }
+
+  @Override
   public void handleNull() {
     this.wrappedFieldValueHandler.ifPresent(FieldValueHandler::handleNull);
   }

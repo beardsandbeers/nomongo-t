@@ -52,6 +52,7 @@ public class AutoEmbeddingIndexDefinitionUtils {
           Optional.empty(),
           Optional.empty(),
           Optional.empty(),
+          Optional.empty(),
           Optional.empty());
 
   /**
@@ -120,30 +121,31 @@ public class AutoEmbeddingIndexDefinitionUtils {
     DocumentFieldDefinition derivedMappings =
         getDerivedSearchMappings(rawDefinition.getMappings(), schemaMetadata);
     return SearchIndexDefinition.create(
-        rawDefinition.getIndexId(),
-        rawDefinition.getName(),
-        databaseName,
-        rawDefinition.getIndexId().toHexString(),
-        materializedViewCollectionUuid,
-        Optional.empty(),
-        rawDefinition.getNumPartitions(),
-        derivedMappings,
-        rawDefinition.getAnalyzerName(),
-        rawDefinition.getSearchAnalyzerName(),
-        rawDefinition.getAnalyzers().isEmpty()
-            ? Optional.empty()
-            : Optional.of(rawDefinition.getAnalyzers()),
-        rawDefinition.getParsedIndexFeatureVersion(),
-        rawDefinition.getSynonyms(),
-        Optional.empty(),
-        rawDefinition.getTypeSets(),
-        rawDefinition.getSort(),
-        rawDefinition.getDefinitionVersion(),
-        rawDefinition.getDefinitionVersionCreatedAt(),
-        rawDefinition.getDefinitionVersionId(),
-        rawDefinition.getIndexIdAtCreationTime(),
-        rawDefinition.getAutoEmbeddingDefinitionVersion(),
-        rawDefinition.getMaterializedViewNameFormatVersion());
+            rawDefinition.getIndexId(),
+            rawDefinition.getName(),
+            databaseName,
+            rawDefinition.getIndexId().toHexString(),
+            materializedViewCollectionUuid,
+            Optional.empty(),
+            rawDefinition.getNumPartitions(),
+            derivedMappings,
+            rawDefinition.getAnalyzerName(),
+            rawDefinition.getSearchAnalyzerName(),
+            rawDefinition.getAnalyzers().isEmpty()
+                ? Optional.empty()
+                : Optional.of(rawDefinition.getAnalyzers()),
+            rawDefinition.getParsedIndexFeatureVersion(),
+            rawDefinition.getSynonyms(),
+            Optional.empty(),
+            rawDefinition.getTypeSets(),
+            rawDefinition.getSort(),
+            rawDefinition.getDefinitionVersion(),
+            rawDefinition.getDefinitionVersionCreatedAt(),
+            rawDefinition.getDefinitionVersionId(),
+            rawDefinition.getIndexIdAtCreationTime(),
+            rawDefinition.getAutoEmbeddingDefinitionVersion(),
+            rawDefinition.getMaterializedViewNameFormatVersion())
+        .withMappingVersion(rawDefinition.getMappingVersion());
   }
 
   private static List<VectorIndexFieldDefinition> getDerivedVectorIndexFields(
@@ -398,7 +400,8 @@ public class AutoEmbeddingIndexDefinitionUtils {
         original.stringFieldDefinition(),
         original.stringFacetFieldDefinition(),
         original.tokenFieldDefinition(),
-        original.uuidFieldDefinition());
+        original.uuidFieldDefinition(),
+        original.typeSetVectorFieldDefinition());
   }
 
   private static FieldDefinition documentOnlyField(DocumentFieldDefinition document) {

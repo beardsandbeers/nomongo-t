@@ -25,6 +25,24 @@ public record StringFieldDefinition(
     ImmutableMap<String, StringFieldDefinition> multi)
     implements FieldTypeDefinition {
 
+  StringFieldDefinition withQueryAliases(StringFieldDefinition other) {
+    if (other.multi().isEmpty()) return this;
+    var aliases =
+        ImmutableMap.<String, StringFieldDefinition>builder()
+            .putAll(other.multi())
+            .putAll(this.multi)
+            .buildKeepingLast();
+    return new StringFieldDefinition(
+        this.analyzerName,
+        this.searchAnalyzerName,
+        this.similarity,
+        this.ignoreAbove,
+        this.indexOptions,
+        this.storeFlag,
+        this.norms,
+        aliases);
+  }
+
   public static class Fields {
 
     static final Field.Optional<String> ANALYZER =

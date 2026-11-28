@@ -8,6 +8,7 @@ public enum IndexChangeReason {
   DEFINITION_VERSION("definitionVersion has changed"),
   AUTO_EMBEDDING_DEFINITION_VERSION("autoEmbeddingDefinitionVersion has changed"),
   VIEW("view has changed"),
+  MAPPING_VERSION("physical field analysis or scoring has changed"),
   INDEX_FEATURE_VERSION("indexFeatureVersion has changed"),
   ANALYZER("analyzer has changed"),
   SEARCH_ANALYZER("searchAnalyzer has changed"),

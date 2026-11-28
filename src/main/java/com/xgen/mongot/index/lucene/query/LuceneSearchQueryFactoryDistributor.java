@@ -14,6 +14,7 @@ import com.xgen.mongot.index.analyzer.wrapper.LuceneAnalyzer;
 import com.xgen.mongot.index.analyzer.wrapper.QueryAnalyzerWrapper;
 import com.xgen.mongot.index.definition.EmbeddedDocumentsFieldDefinition;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
+import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
 import com.xgen.mongot.index.lucene.explain.explainers.SortFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.tracing.Explain;
@@ -236,13 +237,32 @@ public class LuceneSearchQueryFactoryDistributor {
       FeatureFlags featureFlags,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry) {
 
+    return create(
+        indexDefinition.createFieldDefinitionResolver(indexFormatVersion),
+        analyzerRegistry,
+        synonymRegistry,
+        queryingMetricsUpdater,
+        enableTextOperatorNewSynonymsSyntax,
+        featureFlags,
+        dynamicFeatureFlagRegistry);
+  }
+
+  public static LuceneSearchQueryFactoryDistributor create(
+      SearchFieldDefinitionResolver resolver,
+      AnalyzerRegistry analyzerRegistry,
+      SynonymRegistry synonymRegistry,
+      IndexMetricsUpdater.QueryingMetricsUpdater queryingMetricsUpdater,
+      boolean enableTextOperatorNewSynonymsSyntax,
+      FeatureFlags featureFlags,
+      DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry) {
+    var indexDefinition = resolver.indexDefinition;
     QueryAnalyzerWrapper analyzer = LuceneAnalyzer.queryAnalyzer(indexDefinition, analyzerRegistry);
 
     SearchQueryFactoryContext queryFactoryContext =
         new SearchQueryFactoryContext(
             analyzerRegistry,
             analyzer,
-            indexDefinition.createFieldDefinitionResolver(indexFormatVersion),
+            resolver,
             synonymRegistry,
             queryingMetricsUpdater,
             featureFlags);

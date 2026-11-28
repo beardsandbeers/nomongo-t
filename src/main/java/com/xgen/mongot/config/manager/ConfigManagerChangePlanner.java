@@ -340,6 +340,10 @@ class ConfigManagerChangePlanner {
       reasons.add(IndexChangeReason.INDEX_FEATURE_VERSION.getDescription());
     }
 
+    if (existing.getMappingVersion() != desired.getMappingVersion()) {
+      reasons.add(IndexChangeReason.MAPPING_VERSION.getDescription());
+    }
+
     if (!existing.getAnalyzerName().equals(desired.getAnalyzerName())) {
       reasons.add(IndexChangeReason.ANALYZER.getDescription());
     }

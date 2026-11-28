@@ -21,6 +21,21 @@ import org.apache.lucene.facet.range.LongRangeFacetCounts;
 
 public class LuceneFacetResultUtil {
 
+  static LongRangeFacetCounts countRanges(
+      LuceneFacetContext context,
+      FacetDefinition.BoundaryFacetDefinition<?> facet,
+      Optional<FieldPath> root,
+      FacetsCollector collector)
+      throws InvalidQueryException, IOException {
+    String name = context.getBoundaryFacetPath(facet, root);
+    var mixed =
+        context.numericBucketOrdinals(facet, root, context.getBoundaryFacetFieldType(facet, root));
+    return mixed.isPresent()
+        ? new LongRangeFacetCounts(
+            name, mixed.get(), collector, LuceneFacetContext.ordinalRanges(facet))
+        : new LongRangeFacetCounts(name, collector, context.getRanges(facet, root));
+  }
+
   static FacetResult getBoundaryFacetResult(
       FacetDefinition.BoundaryFacetDefinition<?> boundaryDefinition,
       LuceneFacetContext facetContext,
@@ -41,9 +56,7 @@ public class LuceneFacetResultUtil {
     try (var unused =
         new InvocationCountingTimer.AutocloseableOptional<>(
             timings.map(t -> t.split(ExplainTimings.Type.GENERATE_FACET_COUNTS)))) {
-      facetCounts =
-          new LongRangeFacetCounts(
-              path, facetsCollector, facetContext.getRanges(boundaryDefinition, returnScope));
+      facetCounts = countRanges(facetContext, boundaryDefinition, returnScope, facetsCollector);
     }
 
     return facetCounts.getAllChildren(path);

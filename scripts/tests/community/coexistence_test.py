@@ -431,6 +431,11 @@ def run(args):
         wait_for("offline recovered index", lambda: local_ready(local.index_id, 2))
         assert len(local_results(local.index_id, "offline")) == 1
         mongod.start()
+        wait_for(
+            "writable primary after restart",
+            lambda: mongo.admin.command("hello").get("isWritablePrimary"),
+            process=mongod,
+        )
         wait_for("source recovery", lambda: native_results("concurrent"))
         collection.insert_one({"_id": "remote-three", "title": "replicated resumed"})
         wait_for("resumed replication", lambda: native_results("resumed"))

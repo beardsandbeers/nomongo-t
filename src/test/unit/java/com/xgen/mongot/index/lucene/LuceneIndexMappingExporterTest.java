@@ -1,26 +1,611 @@
 package com.xgen.mongot.index.lucene;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
+import com.xgen.mongot.index.definition.SearchIndexDefinition.MappingVersion;
 import com.xgen.mongot.index.definition.TypeSetDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
+import com.xgen.mongot.index.definition.VectorSimilarity;
+import com.xgen.mongot.index.definition.quantization.VectorQuantization;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
+import com.xgen.mongot.index.lucene.similarity.LuceneSimilarity;
 import com.xgen.mongot.index.version.IndexFormatVersion;
+import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.parser.BsonDocumentParser;
 import com.xgen.testing.mongot.index.definition.SearchIndexDefinitionBuilder;
+import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.IntStream;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValuesSkipIndexType;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexOptions;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.StoredFields;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.similarities.BM25Similarity;
+import org.apache.lucene.search.similarities.BooleanSimilarity;
+import org.apache.lucene.search.similarities.PerFieldSimilarityWrapper;
+import org.apache.lucene.store.ByteBuffersDirectory;
 import org.bson.BsonDocument;
 import org.junit.Test;
 
 public class LuceneIndexMappingExporterTest {
+  @Test
+  public void exportSnapshot_indexedObservations_readsNoStoredDocumentsAcrossDeletesAndReopen()
+      throws Exception {
+    var definition = SearchIndexDefinitionBuilder.VALID_INDEX;
+    String longKey = "猫".repeat(11_000);
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(observedString("literal", FieldPath.newRoot("a.b")));
+      writer.addDocument(observedString("nested", FieldPath.parse("a.b")));
+      writer.addDocument(observedString("long", FieldPath.newRoot(longKey)));
+      writer.commit();
+      try (var before = guardDocumentReads(DirectoryReader.open(directory))) {
+        writer.deleteDocuments(new Term("id", "literal"));
+        writer.commit();
+        try (var after = guardDocumentReads(DirectoryReader.open(directory))) {
+          var current =
+              LuceneIndexMappingExporter.exportSnapshot(
+                      definition, IndexFormatVersion.CURRENT, List.of(after))
+                  .getDocument("fields");
+          assertThat(current.keySet()).containsExactly("a", longKey);
+          assertThat(current.getDocument("a").getDocument("fields").containsKey("b")).isTrue();
+        }
+        var previous =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(before))
+                .getDocument("fields");
+        assertThat(previous.keySet()).containsExactly("a.b", "a", longKey);
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderSegment_usesEvidenceFromBothPartitionsBeforeRequestingRebuild()
+      throws Exception {
+    var old = new Document();
+    old.add(new StringField("$type:string/a.b", "old", Field.Store.YES));
+    old.add(new StringField("$meta/fieldNames", "a.b", Field.Store.NO));
+    try (var oldDir = new ByteBuffersDirectory();
+        var oldWriter = new IndexWriter(oldDir, new IndexWriterConfig());
+        var newDir = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                newDir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      oldWriter.addDocument(old);
+      writer.addDocument(observedString("literal", FieldPath.newRoot("a.b")));
+      writer.addDocument(observedString("nested", FieldPath.parse("a.b")));
+      try (var oldReader = guardDocumentReads(DirectoryReader.open(oldWriter));
+          var current = guardDocumentReads(DirectoryReader.open(writer))) {
+        var expected = snapshot(List.of(current));
+        assertThat(snapshot(List.of(oldReader, current))).isEqualTo(expected);
+        assertThat(snapshot(List.of(current, oldReader))).isEqualTo(expected);
+        writer.deleteDocuments(new Term("id", "literal"));
+        try (var deleted = DirectoryReader.openIfChanged(current)) {
+          assertThrows(
+              LuceneIndexMappingExporter.MappingExportException.class,
+              () -> snapshot(List.of(deleted, oldReader)));
+        }
+        assertThat(snapshot(List.of(oldReader, current))).isEqualTo(expected);
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_mixedSegment_doesNotReadStoredFieldsOrTermValuesAfterDeletes()
+      throws Exception {
+    var old = new Document();
+    old.add(new StringField("$type:string/title", "old", Field.Store.YES));
+    try (var dir = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(observedString("title", FieldPath.newRoot("title")));
+      for (int i = 0; i < 4000; i++) {
+        var doc = observedString(Integer.toString(i), FieldPath.newRoot("item"));
+        doc.add(new StringField("$type:string/item", "value" + i, Field.Store.NO));
+        writer.addDocument(doc);
+      }
+      try (var first = guardDocumentReads(DirectoryReader.open(writer))) {
+        var expected = snapshot(List.of(first));
+        writer.deleteDocuments(new Term("id", "1"));
+        try (var second = DirectoryReader.openIfChanged(first)) {
+          assertThat(snapshot(List.of(second))).isEqualTo(expected);
+          writer.deleteDocuments(new Term("id", "2"));
+          try (var third = DirectoryReader.openIfChanged(second)) {
+            assertThat(snapshot(List.of(third))).isEqualTo(expected);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void export_persistedGenerationSimilarity_matchesScoringForStringMultiAndAutocomplete()
+      throws Exception {
+    var mappings =
+        mappings(
+            "{dynamic:{typeSet:'custom'},fields:{plain:{type:'string'},"
+                + "items:{type:'embeddedDocuments',dynamic:{typeSet:'custom'}}}}");
+    var json =
+        BsonDocument.parse(
+            """
+            {name:'custom',types:[{type:'autocomplete',similarity:{type:'boolean'}},
+             {type:'string',similarity:{type:'boolean'},
+                  multi:{alt:{type:'string',similarity:{type:'boolean'}}}}]}
+            """);
+    try (var parser = BsonDocumentParser.fromRoot(json).build()) {
+      var old =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(mappings)
+              .typeSets(TypeSetDefinition.fromBson(parser))
+              .build();
+      var fresh = old.forNewGeneration();
+      var newScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(fresh);
+      var fields = infos("$type:string/x", "$type:autocomplete/x");
+      assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+      assertThat(newScore.get("$type:string/x")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$multi/x.alt")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$type:autocomplete/x")).isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$embedded:5/items/$type:string/items.value"))
+          .isInstanceOf(BooleanSimilarity.class);
+      assertThat(newScore.get("$type:string/plain")).isInstanceOf(BM25Similarity.class);
+      assertThat(
+              LuceneIndexMappingExporter.export(old, IndexFormatVersion.CURRENT, List.of(fields))
+                  .getDocument("fields")
+                  .getArray("x")
+                  .toString())
+          .doesNotContain("similarity");
+      assertThat(
+              LuceneIndexMappingExporter.export(fresh, IndexFormatVersion.CURRENT, List.of(fields))
+                  .getDocument("fields")
+                  .getArray("x")
+                  .toString())
+          .contains("boolean");
+      var oldBson = old.toBson();
+      assertThat(oldBson.containsKey("typeSetSimilarity")).isFalse();
+      try (var prior = BsonDocumentParser.fromRoot(oldBson).build();
+          var current = BsonDocumentParser.fromRoot(fresh.toBson()).build()) {
+        assertThat(
+                com.xgen.mongot.index.definition.IndexDefinition.fromBson(prior)
+                    .asSearchDefinition()
+                    .getMappingVersion())
+            .isEqualTo(MappingVersion.LEGACY);
+        assertThat(
+                com.xgen.mongot.index.definition.IndexDefinition.fromBson(current)
+                    .asSearchDefinition()
+                    .getMappingVersion())
+            .isEqualTo(MappingVersion.SCOPED);
+      }
+    }
+  }
+
+  @Test
+  public void similarity_legacyDottedAlias_preservesWinningWholeField() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {fields:{a:{type:'document',fields:{b:{type:'string',analyzer:'lucene.keyword',
+                      similarity:{type:'boolean'}}}},'a.b':{type:'number'}}}
+                    """))
+            .build();
+    assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+    var exported = LuceneIndexMappingExporter.export(old, IndexFormatVersion.CURRENT, List.of());
+    var string =
+        exported.getDocument("fields").getDocument("a").getDocument("fields").getDocument("b");
+    assertThat(string.containsKey("analyzer")).isFalse();
+    assertThat(string.containsKey("similarity")).isFalse();
+    var fresh = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
+    assertThat(fresh.get("$type:string/a.b")).isInstanceOf(BooleanSimilarity.class);
+  }
+
+  @Test
+  public void export_legacyMaskedTokenAndAutocomplete_rejectsChangedAnalysis() throws Exception {
+    for (String type : List.of("token", "autocomplete")) {
+      var old =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(
+                  mappings(
+                      """
+                      {fields:{a:{type:'document',fields:{b:{type:'%s'}}},'a.b':{type:'number'}}}
+                      """
+                          .formatted(type)))
+              .build();
+      var error =
+          assertThrows(
+              LuceneIndexMappingExporter.MappingExportException.class,
+              () ->
+                  LuceneIndexMappingExporter.export(
+                      old, IndexFormatVersion.CURRENT, List.of(infos("$type:" + type + "/a.b"))));
+      assertThat(error).hasMessageThat().contains("default analyzer");
+    }
+  }
+
+  @Test
+  public void similarity_legacyEmbeddedAlias_preservesWinningEmbeddedScope() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {fields:{a:{type:'document',fields:{b:{type:'embeddedDocuments',fields:{
+                      losing:{type:'string',similarity:{type:'boolean'}}}}}},
+                      'a.b':{type:'embeddedDocuments',fields:{winner:{type:'string'}}}}}
+                    """))
+            .build();
+    assertThat(LuceneSimilarity.from(old)).isInstanceOf(BM25Similarity.class);
+    var current = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
+    assertThat(current.get("$embedded:3/a.b/$type:string/a.b.losing"))
+        .isInstanceOf(BooleanSimilarity.class);
+  }
+
+  @Test
+  public void similarity_plainDynamicAndEmptyChild_useTheirOwnScopes() throws Exception {
+    var mapping =
+        mappings(
+            """
+            {dynamic:{typeSet:'outer'},fields:{a:{type:'document',dynamic:true},
+              'a.b':{type:'token'},'':{type:'document',dynamic:{typeSet:'inner'}}}}
+            """);
+    try (var parser =
+            BsonDocumentParser.fromRoot(
+                    BsonDocument.parse(
+                        "{name:'outer',types:[{type:'string',similarity:{type:'boolean'}}]}"))
+                .build();
+        var inner =
+            BsonDocumentParser.fromRoot(
+                    BsonDocument.parse("{name:'inner',types:[{type:'string'}]}"))
+                .build()) {
+      var index =
+          SearchIndexDefinitionBuilder.builder()
+              .defaultMetadata()
+              .mappings(mapping)
+              .typeSets(TypeSetDefinition.fromBson(parser), TypeSetDefinition.fromBson(inner))
+              .build()
+              .forNewGeneration();
+      var score = (PerFieldSimilarityWrapper) LuceneSimilarity.from(index);
+      assertThat(score.get("$type:string/a.b")).isInstanceOf(BM25Similarity.class);
+      assertThat(score.get("$type:string/.value")).isInstanceOf(BM25Similarity.class);
+      assertThat(score.get("$type:string/title")).isInstanceOf(BooleanSimilarity.class);
+    }
+  }
+
+  @Test
+  public void similarity_olderStaticAliases_preservesOriginalMultiSelection() throws Exception {
+    var old =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'string',
+                      multi:{lit:{type:'string',similarity:{type:'boolean'}}}},
+                      a:{type:'document',fields:{b:{type:'string',
+                      multi:{nest:{type:'string',similarity:{type:'boolean'}}}}}}}}
+                    """))
+            .build();
+    var oldScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old);
+    var freshScore = (PerFieldSimilarityWrapper) LuceneSimilarity.from(old.forNewGeneration());
+    assertThat(
+            List.of(
+                oldScore.get("$multi/a.b.lit").getClass(),
+                oldScore.get("$multi/a.b.nest").getClass()))
+        .containsExactly(BM25Similarity.class, BooleanSimilarity.class);
+    assertThat(freshScore.get("$multi/a.b.lit")).isInstanceOf(BooleanSimilarity.class);
+    assertThat(freshScore.get("$multi/a.b.nest")).isInstanceOf(BooleanSimilarity.class);
+  }
+
+  @Test
+  public void exportSnapshot_deletedOlderPathIgnoresModernNamesWithLiveOlderNeighbor()
+      throws Exception {
+    try (var dir = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      var gone = new Document();
+      gone.add(new StringField("id", "gone", Field.Store.NO));
+      gone.add(new StringField("$type:string/gone", "value", Field.Store.NO));
+      gone.add(new StringField("$meta/fieldNames", "gone", Field.Store.NO));
+      writer.addDocument(gone);
+      writer.addDocument(new Document());
+      var current = observedString("literal", FieldPath.newRoot("a.b"));
+      current.add(new StringField("$meta/fieldNames", "a.b", Field.Store.NO));
+      writer.addDocument(current);
+      try (var before = DirectoryReader.open(writer)) {
+        assertThrows(
+            LuceneIndexMappingExporter.MappingExportException.class,
+            () -> snapshot(List.of(before)));
+        writer.deleteDocuments(new Term("id", "gone"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(snapshot(List.of(after)).getDocument("fields").keySet())
+              .containsExactly("a.b");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void
+      exportSnapshot_interleavedOldAndCurrentPostings_findsRemainingOlderDocumentAcrossBlocks()
+          throws Exception {
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      var old = new Document();
+      old.add(new StringField("group", "old", Field.Store.NO));
+      old.add(new StringField("$meta/fieldNames", "older", Field.Store.NO));
+      var current = new Document();
+      new MappingObservations().finish(current);
+      for (int i = 0; i < 4200; i++) {
+        writer.addDocument(old);
+        writer.addDocument(current);
+      }
+      var last = new Document();
+      last.add(new StringField("group", "last", Field.Store.NO));
+      last.add(new StringField("$meta/fieldNames", "older", Field.Store.NO));
+      writer.addDocument(last);
+      var obsolete = new Document();
+      obsolete.add(new StringField("group", "obsolete", Field.Store.NO));
+      new MappingObservations().finish(obsolete);
+      writer.addDocument(obsolete);
+      writer.commit();
+      writer.deleteDocuments(new Term("group", "old"), new Term("group", "obsolete"));
+      try (var before = guardDocumentReads(DirectoryReader.open(writer))) {
+        assertThrows(
+            LuceneIndexMappingExporter.MappingExportException.class,
+            () -> snapshot(List.of(before)));
+        writer.deleteDocuments(new Term("group", "last"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(snapshot(List.of(after)).getDocument("fields").isEmpty()).isTrue();
+        }
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderEmptyKeyPresence_recoversLiveTypeAndDropsDeletedType()
+      throws Exception {
+    var old = new Document();
+    old.add(new StringField("id", "text", Field.Store.NO));
+    old.add(new TextField("$type:string/", "snow", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "11:$presence/0", Field.Store.NO));
+    var empty = new Document();
+    empty.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    empty.add(new StringField(MappingObservations.NAME, "11:$presence/0", Field.Store.NO));
+    try (var directory = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(
+                directory, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(empty);
+      try (var before = guardDocumentReads(DirectoryReader.open(writer))) {
+        assertThat(
+                snapshot(List.of(before))
+                    .getDocument("fields")
+                    .getDocument("")
+                    .getString("type")
+                    .getValue())
+            .isEqualTo("string");
+        writer.deleteDocuments(new Term("id", "text"));
+        try (var after = DirectoryReader.openIfChanged(before)) {
+          assertThat(
+                  snapshot(List.of(after))
+                      .getDocument("fields")
+                      .getDocument("")
+                      .getString("type")
+                      .getValue())
+              .isEqualTo("document");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_olderEmptyRootArrayChild_recoversScalarSibling() throws Exception {
+    var old = new Document();
+    old.add(new TextField("$type:string/", "snow", Field.Store.NO));
+    String child = "$type:string/.kid";
+    old.add(new TextField(child, "blue", Field.Store.NO));
+    old.add(new StringField(MappingObservations.NAME, "", Field.Store.NO));
+    old.add(
+        new StringField(
+            MappingObservations.NAME, child.length() + ":" + child + "\0kid", Field.Store.NO));
+    try (var dir = new ByteBuffersDirectory();
+        var writer = new IndexWriter(dir, new IndexWriterConfig())) {
+      writer.addDocument(old);
+      try (var reader = guardDocumentReads(DirectoryReader.open(writer))) {
+        var mappings = snapshot(List.of(reader)).getDocument("fields").getArray("");
+        assertThat(
+                mappings.stream()
+                    .map(value -> value.asDocument().getString("type").getValue())
+                    .toList())
+            .containsExactly("string", "document");
+      }
+    }
+  }
+
+  private static BsonDocument snapshot(List<DirectoryReader> readers) throws IOException {
+    return LuceneIndexMappingExporter.exportSnapshot(
+        SearchIndexDefinitionBuilder.VALID_INDEX, IndexFormatVersion.CURRENT, readers);
+  }
+
+  @Test
+  public void exportSnapshot_preObservationDocument_retainsBothExplicitSpellings()
+      throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'string'},
+                     a:{type:'document',fields:{b:{type:'string'}}},
+                     emb:{type:'document',dynamic:{typeSet:'v'}}}}
+                    """))
+            .typeSets(vectorTypeSet())
+            .build();
+    var old = new Document();
+    old.add(new StringField("$type:string/a.b", "snow", Field.Store.YES));
+    try (var directory = new ByteBuffersDirectory();
+        var writer = new IndexWriter(directory, new IndexWriterConfig())) {
+      writer.addDocument(old);
+      writer.commit();
+      try (var reader = DirectoryReader.open(directory)) {
+        var fields =
+            LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(reader))
+                .getDocument("fields");
+        assertThat(fields.getDocument("a.b"))
+            .isEqualTo(fields.getDocument("a").getDocument("fields").getDocument("b"));
+      }
+    }
+  }
+
+  @Test
+  public void exportSnapshot_oldEmbeddedScope_requiresRebuildOnlyWhileOlderDocumentIsLive()
+      throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings(
+                    """
+                    {dynamic:false,fields:{'a.b':{type:'embeddedDocuments',dynamic:true},
+                     a:{type:'document',fields:{b:{type:'embeddedDocuments',dynamic:true}}}}}
+                    """))
+            .build();
+    var old = new Document();
+    old.add(new StringField("id", "old", Field.Store.NO));
+    old.add(new StringField("$embedded:3/a.b/$type:string/a.b.left", "snow", Field.Store.NO));
+    old.add(new StringField("$meta/mappingObservationsV2", "", Field.Store.NO));
+    try (var dir = new ByteBuffersDirectory();
+        var writer =
+            new IndexWriter(dir, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+      writer.addDocument(old);
+      writer.addDocument(observedString("new", FieldPath.newRoot("extra")));
+      try (var first = guardDocumentReads(DirectoryReader.open(writer))) {
+        writer.deleteDocuments(new Term("id", "old"));
+        try (var second = DirectoryReader.openIfChanged(first)) {
+          LuceneIndexMappingExporter.exportSnapshot(
+              definition, IndexFormatVersion.CURRENT, List.of(second));
+        }
+        assertThrows(
+            LuceneIndexMappingExporter.MappingExportException.class,
+            () ->
+                LuceneIndexMappingExporter.exportSnapshot(
+                    definition, IndexFormatVersion.CURRENT, List.of(first)));
+      }
+    }
+  }
+
+  private static Document observedString(String id, FieldPath path) throws IOException {
+    var document = new Document();
+    var observations = new MappingObservations();
+    document.add(observations);
+    document.add(new StringField("id", id, Field.Store.NO));
+    int start = document.getFields().size();
+    document.add(new StringField("$type:string/" + path, "value", Field.Store.NO));
+    observations.recordScalarFields(document, start, path);
+    observations.finish(document);
+    return document;
+  }
+
+  private static DirectoryReader guardDocumentReads(DirectoryReader reader) throws IOException {
+    return new FilterDirectoryReader(
+        reader,
+        new FilterDirectoryReader.SubReaderWrapper() {
+          @Override
+          public LeafReader wrap(LeafReader leaf) {
+            return new FilterLeafReader(leaf) {
+              @Override
+              public StoredFields storedFields() throws IOException {
+                throw new AssertionError("opening stored documents during mapping export");
+              }
+
+              @Override
+              public Terms terms(String field) throws IOException {
+                if (field.startsWith("$type:")) {
+                  throw new AssertionError("opening value terms during mapping export: " + field);
+                }
+                var terms = super.terms(field);
+                if (terms == null || !field.equals(MappingObservations.NAME)) {
+                  return terms;
+                }
+                return new FilterTerms(terms) {
+                  @Override
+                  public TermsEnum iterator() throws IOException {
+                    return new FilterTermsEnum(super.iterator()) {
+                      @Override
+                      public PostingsEnum postings(PostingsEnum reuse, int flags)
+                          throws IOException {
+                        if (term().length != 0 && docFreq() > leaf.numDeletedDocs()) {
+                          throw new AssertionError(
+                              "document frequency already proves this spelling is live");
+                        }
+                        return super.postings(reuse, flags);
+                      }
+                    };
+                  }
+                };
+              }
+
+              @Override
+              public CacheHelper getCoreCacheHelper() {
+                return in.getCoreCacheHelper();
+              }
+
+              @Override
+              public CacheHelper getReaderCacheHelper() {
+                return in.getReaderCacheHelper();
+              }
+            };
+          }
+        }) {
+      @Override
+      protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
+        return guardDocumentReads(in);
+      }
+
+      @Override
+      public CacheHelper getReaderCacheHelper() {
+        return in.getReaderCacheHelper();
+      }
+    };
+  }
+
   @Test
   public void export_partitionUnion_collapsesPhysicalTypesAndExcludesInternalFields() {
     var definition = SearchIndexDefinitionBuilder.VALID_INDEX;
@@ -126,6 +711,76 @@ public class LuceneIndexMappingExporterTest {
     assertThat(
             result.getDocument("fields").getDocument("explicit").getString("analyzer").getValue())
         .isEqualTo("lucene.keyword");
+  }
+
+  @Test
+  public void export_legacyVectorWithMultipleBsonSpellings_reportsAmbiguousPath() throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(mappings("{dynamic:{typeSet:'v'}}"))
+            .typeSets(vectorTypeSet())
+            .build();
+
+    // Newer writes established one spelling. The legacy segment could contain the other.
+    var paths = new SourcePaths(Set.of("a\0b"), Set.of("a.b"));
+    assertThrows(
+        LuceneIndexMappingExporter.MappingExportException.class,
+        () ->
+            LuceneIndexMappingExporter.export(
+                definition, IndexFormatVersion.CURRENT, List.of(vectorInfo("a.b")), paths));
+  }
+
+  @Test
+  public void export_legacyVectorUnderExplicitDottedParent_recoversBsonSpelling() throws Exception {
+    var definition =
+        SearchIndexDefinitionBuilder.builder()
+            .defaultMetadata()
+            .mappings(
+                mappings("{dynamic:false,fields:{'a.b':{type:'document',dynamic:{typeSet:'v'}}}}"))
+            .typeSets(vectorTypeSet())
+            .build();
+
+    var result =
+        LuceneIndexMappingExporter.export(
+            definition, IndexFormatVersion.CURRENT, List.of(vectorInfo("a.b.v")));
+
+    var vector =
+        result.getDocument("fields").getDocument("a.b").getDocument("fields").getDocument("v");
+    assertThat(vector.getInt32("numDimensions").getValue()).isEqualTo(2);
+    assertThat(vector.getBoolean("bsonVectorOnly").getValue()).isTrue();
+  }
+
+  private static TypeSetDefinition vectorTypeSet() {
+    return new TypeSetDefinition(
+        "v",
+        List.of(
+            new TypeSetVectorFieldDefinition(
+                Optional.empty(), VectorSimilarity.COSINE, VectorQuantization.NONE)));
+  }
+
+  private static FieldInfos vectorInfo(String path) {
+    var field =
+        new FieldInfo(
+            "$type:knnByte/" + path,
+            0,
+            false,
+            false,
+            false,
+            IndexOptions.NONE,
+            DocValuesType.NONE,
+            DocValuesSkipIndexType.NONE,
+            -1L,
+            Map.of(),
+            0,
+            0,
+            0,
+            2,
+            VectorEncoding.BYTE,
+            VectorSimilarityFunction.COSINE,
+            false,
+            false);
+    return new FieldInfos(new FieldInfo[] {field});
   }
 
   private static DocumentFieldDefinition mappings(String json) throws Exception {

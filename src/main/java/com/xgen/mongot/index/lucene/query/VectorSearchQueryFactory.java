@@ -43,6 +43,7 @@ import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.ConstantScoreQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
@@ -99,9 +100,8 @@ class VectorSearchQueryFactory {
               path, path));
     }
 
-    this.factoryContext
-        .getQueryTimeMappingChecks()
-        .validateVectorField(path, embeddedRoot, queryVector.numDimensions());
+    var mappedField =
+        this.factoryContext.resolveVectorField(path, embeddedRoot, queryVector.numDimensions());
 
     // Reconcile with the indexed embedding encoding; see AutoEmbedQueryVectorReconciler.
     Optional<VectorAutoEmbedQuantization> autoEmbedQuantization =
@@ -138,8 +138,7 @@ class VectorSearchQueryFactory {
                     SingleQueryContext.createQueryRoot(queryContext.getIndexReader())))
             : Optional.empty();
 
-    VectorSimilarity indexedVectorSimilarity =
-        this.factoryContext.getIndexedVectorSimilarityFunction(path, embeddedRoot);
+    VectorSimilarity indexedVectorSimilarity = mappedField.similarity();
     if (indexedVectorSimilarity == VectorSimilarity.COSINE && queryVector.isZeroVector()) {
       throw new InvalidQueryException(
           "Cosine similarity cannot be calculated against a zero vector.");
@@ -158,15 +157,26 @@ class VectorSearchQueryFactory {
           "float16 query vectors are not supported by the Lucene engine");
     }
 
-    String fieldName = getLuceneFieldName(path, embeddedRoot, queryVector.getVectorType());
+    if (criteria instanceof ApproximateVectorSearchCriteria approximateCriteria
+        && !Explain.isEnabled()
+        && approximateCriteria.explainOptions().isPresent()) {
+      throw new InvalidQueryException(
+          "Query must be run in explain mode, because 'explainOptions' are present.");
+    }
+    if (mappedField.unbound()) {
+      return new MatchNoDocsQuery("No vectors observed at " + path);
+    }
+    String fieldName =
+        getLuceneFieldName(
+            path,
+            embeddedRoot,
+            queryVector.getVectorType(),
+            queryContext.getIndexReader(),
+            mappedField);
 
     Query childQuery;
     switch (criteria) {
       case ApproximateVectorSearchCriteria approximateCriteria:
-        if (!Explain.isEnabled() && approximateCriteria.explainOptions().isPresent()) {
-          throw new InvalidQueryException(
-              "Query must be run in explain mode, because 'explainOptions' are present.");
-        }
 
         // Whether the user omitted numCandidates. The explain path reports the resolved value as
         // AUTO; the regular query path ignores this flag.
@@ -514,11 +524,36 @@ class VectorSearchQueryFactory {
   }
 
   private String getLuceneFieldName(
-      FieldPath fieldPath, Optional<FieldPath> embeddedRoot, Vector.VectorType vectorType)
-      throws InvalidQueryException {
-    return VectorTypeFieldResolver.resolveTypeField(
-            this.factoryContext.getIndexedQuantization(fieldPath, embeddedRoot), vectorType)
-        .getLuceneFieldName(fieldPath, embeddedRoot);
+      FieldPath fieldPath,
+      Optional<FieldPath> embeddedRoot,
+      Vector.VectorType vectorType,
+      IndexReader reader,
+      QueryFactoryContext.VectorField mappedField) {
+    var type = VectorTypeFieldResolver.resolveTypeField(mappedField.quantization(), vectorType);
+    String ordinary = type.getLuceneFieldName(fieldPath, embeddedRoot);
+    var binding = mappedField.binding();
+    if (binding.isEmpty()) {
+      return ordinary;
+    }
+    int dimensions = binding.get().dimensions();
+    String qualified = type.getInferredVectorFieldName(fieldPath, dimensions);
+    if (binding.get().dimensionInFieldName()) {
+      return qualified;
+    }
+    // Physical names are local to a partition. Old checkpoints may use the ordinary name.
+    for (var leaf : reader.leaves()) {
+      if (leaf.reader().getFieldInfos().fieldInfo(qualified) != null) {
+        return qualified;
+      }
+    }
+    for (var leaf : reader.leaves()) {
+      var legacy = leaf.reader().getFieldInfos().fieldInfo(ordinary);
+      if (legacy != null
+          && type.logicalVectorDimensions(legacy.getVectorDimension()) == dimensions) {
+        return ordinary;
+      }
+    }
+    return qualified;
   }
 
   /**

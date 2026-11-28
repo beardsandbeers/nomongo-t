@@ -8,14 +8,17 @@ import com.xgen.mongot.index.definition.GeoFieldDefinition;
 import com.xgen.mongot.index.definition.NumberFacetFieldDefinition;
 import com.xgen.mongot.index.definition.NumberFieldDefinition;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
+import com.xgen.mongot.index.definition.SearchIndexVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SortableNumberBetaV1FieldDefinition;
 import com.xgen.mongot.index.definition.StringFieldDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.ingestion.handlers.DocumentHandler;
 import com.xgen.mongot.index.ingestion.handlers.FieldValueHandler;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.geo.LuceneGeometryFields;
 import com.xgen.mongot.util.FieldPath;
+import com.xgen.mongot.util.bson.BsonVectorParser;
 import com.xgen.mongot.util.bson.Vector;
 import java.io.IOException;
 import java.util.Optional;
@@ -57,10 +60,12 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleBoolean(Supplier<Boolean> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.booleanFieldDefinition().isPresent()) {
       boolean value = supplier.get();
       IndexableFieldFactory.addBooleanField(this.documentWrapper, this.path, value);
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
@@ -71,9 +76,11 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleDateTime(Supplier<Long> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     handleDateField(supplier);
     handleDateFacetField(supplier);
     handleSortableDateField(supplier);
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleDateField(Supplier<Long> supplier) {
@@ -123,6 +130,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleDouble(Supplier<Double> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<NumberFieldDefinition> numberFieldDefinition =
         this.fieldDefinition.numberFieldDefinition();
     Optional<NumberFacetFieldDefinition> numberFacetFieldDefinition =
@@ -138,6 +146,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     numberFacetFieldDefinition.ifPresent(
         definition -> handleDoubleFacetField(supplier, numberFieldDefinition, definition));
     sortableNumberFieldDefinition.ifPresent(definition -> handleSortBetaDoubleField(supplier));
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleDoubleField(
@@ -201,6 +210,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleGeometry(Supplier<Optional<Geometry>> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<GeoFieldDefinition> geoFieldDefinition = this.fieldDefinition.geoFieldDefinition();
     if (geoFieldDefinition.isEmpty()) {
       return;
@@ -227,6 +237,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
                 this.path, this.documentWrapper.getEmbeddedRoot()),
             this.documentWrapper.indexingMetricsUpdater)
         .forEach(this.documentWrapper.luceneDocument::add);
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
@@ -236,6 +247,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleInt64(Supplier<Long> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     Optional<NumberFieldDefinition> numberFieldDefinition =
         this.fieldDefinition.numberFieldDefinition();
     Optional<NumberFacetFieldDefinition> numberFacetFieldDefinition =
@@ -251,6 +263,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     numberFacetFieldDefinition.ifPresent(
         definition -> handleInt64FacetField(supplier, numberFieldDefinition, definition));
     sortBetaNumberFieldDefinition.ifPresent(definition -> handleSortBetaLongField(supplier));
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private void handleInt64Field(
@@ -313,11 +326,80 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
   }
 
   @Override
+  public void handleBsonVector(Supplier<Optional<Vector>> supplier, int binarySize) {
+    var configured = this.fieldDefinition.typeSetVectorFieldDefinition();
+    var bsonOnly =
+        this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly);
+    if ((configured.isEmpty() && bsonOnly.isEmpty())
+        || this.isMultiValued
+        || this.documentWrapper.getEmbeddedRoot().isPresent()
+        || binarySize <= BsonVectorParser.BSON_VECTOR_HEADER_SIZE
+        || binarySize
+            > BsonVectorParser.BSON_VECTOR_HEADER_SIZE
+                + Float.BYTES * VectorFieldSpecification.MAX_DIMENSIONS) {
+      return;
+    }
+    if (bsonOnly.isPresent()) {
+      supplier
+          .get()
+          .ifPresent(
+              vector ->
+                  IndexableFieldFactory.addBsonVectorField(
+                      this.documentWrapper,
+                      this.path,
+                      vector,
+                      bsonOnly.get().specification(),
+                      false));
+      return;
+    }
+    // Lucene and queries address a field by its dotted name, even for literal dots in BSON keys.
+    var canonicalPath =
+        this.path.getPathHierarchy().stream().anyMatch(part -> part.getLeaf().contains("."))
+            ? FieldPath.parse(this.path.toString())
+            : this.path;
+    var resolver = this.documentWrapper.resolver;
+    var explicit = resolver.getExplicitSearchVectorSpecification(canonicalPath);
+    var rule =
+        explicit.isPresent()
+            ? Optional.<TypeSetVectorFieldDefinition>empty()
+            : resolver.getTypeSetVectorRule(canonicalPath, Optional.empty());
+    if (explicit.isEmpty() && rule.isEmpty()) {
+      return;
+    }
+    // Only an inferred type-set rule can bind a length in the partition writer.
+    boolean dimensionInFieldName =
+        rule.filter(dynamic -> dynamic.numDimensions().isEmpty()).isPresent();
+    supplier
+        .get()
+        .ifPresent(
+            vector -> {
+              // Explicit mappings own the physical encoding shared by both BSON spellings.
+              var spec =
+                  explicit.or(
+                      () ->
+                          rule.flatMap(
+                              dynamic ->
+                                  dynamic.resolve(() -> Optional.of(vector.numDimensions()))));
+              spec.ifPresent(
+                  mapping ->
+                      IndexableFieldFactory.addBsonVectorField(
+                          this.documentWrapper, this.path, vector, mapping, dimensionInFieldName));
+            });
+  }
+
+  @Override
   public void handleKnnVector(Supplier<Optional<Vector>> supplier) {
     Optional<VectorFieldSpecification> maybeFieldSpec =
         this.fieldDefinition.vectorFieldSpecification();
 
-    if (maybeFieldSpec.isEmpty() || this.isMultiValued) {
+    if (maybeFieldSpec.isEmpty()
+        || this.isMultiValued
+        || this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
+            .isPresent()) {
       return;
     }
 
@@ -342,19 +424,23 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     // Check the current path to see if it's already indexed, since SortedDocValues does not allow
     // multiple values to be indexed. Note that we don't need to check the embeddedRoot since all
     // fields for the wrapped Lucene document have the same embedded root.
+    this.documentWrapper.observePresence(this.path);
     IndexableFieldFactory.addNullField(this.documentWrapper, this.path);
   }
 
   @Override
   public void handleObjectId(Supplier<ObjectId> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.objectIdFieldDefinition().isPresent()) {
       ObjectId objectId = supplier.get();
       IndexableFieldFactory.addObjectIdField(this.documentWrapper, this.path, objectId);
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
   public void handleString(Supplier<String> supplier) throws IOException {
+    int start = this.documentWrapper.firstFieldToObserve();
     handleSortableString(supplier);
 
     this.fieldDefinition
@@ -371,6 +457,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     if (this.fieldDefinition.autocompleteFieldDefinition().isPresent()) {
       IndexableFieldFactory.addAutocompleteField(this.documentWrapper, this.path, supplier.get());
     }
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   private static void doHandleString(
@@ -388,6 +475,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void handleUuid(Supplier<Optional<UUID>> supplier) {
+    int start = this.documentWrapper.firstFieldToObserve();
     if (this.fieldDefinition.uuidFieldDefinition().isEmpty()) {
       return;
     }
@@ -399,6 +487,7 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
     }
 
     IndexableFieldFactory.addUuidField(this.documentWrapper, this.path, uuid.get());
+    this.documentWrapper.observeFields(start, this.path);
   }
 
   @Override
@@ -408,7 +497,9 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
 
   @Override
   public void markFieldNameExists() {
-    IndexableFieldFactory.addFieldNamesField(this.documentWrapper, this.path);
+    if (IndexableFieldFactory.addFieldNamesField(this.documentWrapper, this.path)) {
+      this.documentWrapper.observePresence(this.path);
+    }
   }
 
   @Override
@@ -418,6 +509,10 @@ public class LuceneSearchIndexFieldValueHandler implements FieldValueHandler {
         && this.fieldDefinition.objectIdFieldDefinition().isEmpty()
         && this.fieldDefinition.geoFieldDefinition().isEmpty()
         && this.fieldDefinition.documentFieldDefinition().isEmpty()
+        && this.fieldDefinition
+            .searchIndexVectorFieldDefinition()
+            .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
+            .isEmpty()
         && this.fieldDefinition.sortableDateBetaV1FieldDefinition().isEmpty()
         && this.fieldDefinition.sortableNumberBetaV1FieldDefinition().isEmpty()
         && this.fieldDefinition.sortableStringBetaV1FieldDefinition().isEmpty()

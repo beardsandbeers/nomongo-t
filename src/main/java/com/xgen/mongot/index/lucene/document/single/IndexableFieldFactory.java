@@ -192,9 +192,9 @@ public class IndexableFieldFactory {
   }
 
   // Add path to metadata keeping track of the field names we have indexed for this lucene document.
-  static void addFieldNamesField(AbstractDocumentWrapper document, FieldPath path) {
+  static boolean addFieldNamesField(AbstractDocumentWrapper document, FieldPath path) {
     if (!document.getIndexCapabilities().supportsFieldExistsQuery()) {
-      return;
+      return false;
     }
 
     String pathString = path.toString();
@@ -207,7 +207,7 @@ public class IndexableFieldFactory {
           LuceneConfig.MAX_TERM_CHAR_LENGTH,
           pathString.substring(0, 20),
           lazy(() -> getLoggingId(document)));
-      return;
+      return false;
     }
 
     IndexableField indexableField =
@@ -217,6 +217,7 @@ public class IndexableFieldFactory {
             FIELD_NAME_FIELD_TYPE_NOT_STORED);
 
     document.put(indexableField);
+    return true;
   }
 
   static void addStringField(
@@ -506,16 +507,63 @@ public class IndexableFieldFactory {
       FieldPath field,
       Vector vector,
       VectorFieldSpecification specification) {
+    addKnnVectorField(document, field, vector, specification, false, Optional.empty());
+  }
+
+  static void addBsonVectorField(
+      AbstractDocumentWrapper document,
+      FieldPath field,
+      Vector vector,
+      VectorFieldSpecification specification,
+      boolean dimensionInFieldName) {
+    // Intrinsically invalid input cannot reserve a dotted path shared with another BSON key.
+    int dimensions = vector.numDimensions();
+    if (dimensions != specification.numDimensions()
+        || vector.getVectorType() == Vector.VectorType.FLOAT16
+        || (specification.similarity() == VectorSimilarity.COSINE && vector.isZeroVector())
+        || dimensions < 1
+        || dimensions > VectorFieldSpecification.MAX_DIMENSIONS
+        || !VectorFieldSpecification.validQuantizationDimensions(
+            dimensions, specification.quantization())) {
+      return;
+    }
+    Optional<String> sourcePath =
+        field.toString().contains(".")
+            ? Optional.of(String.join("\0", field.getSegments()))
+            : Optional.empty();
+    addKnnVectorField(document, field, vector, specification, dimensionInFieldName, sourcePath);
+  }
+
+  private static void addKnnVectorField(
+      AbstractDocumentWrapper document,
+      FieldPath field,
+      Vector vector,
+      VectorFieldSpecification specification,
+      boolean dimensionInFieldName,
+      Optional<String> sourcePath) {
     // This is the field name we use to check for duplicate vectors and invalid vectors. The
     // embeddedRoot is set to be empty when we are retrieving the field name for this purpose.
+    // An inferred path can receive different lengths from distinct BSON spellings in the same
+    // document. Keep the first valid candidate of each length until the partition writer selects
+    // the committed length under the discovery lock.
     String checkFieldName =
-        FieldName.TypeField.KNN_VECTOR.getLuceneFieldName(field, Optional.empty());
+        dimensionInFieldName
+            ? FieldName.TypeField.KNN_VECTOR.getInferredVectorFieldName(
+                field, specification.numDimensions())
+            : FieldName.TypeField.KNN_VECTOR.getLuceneFieldName(field, Optional.empty());
 
-    // Skip vectors of invalid size to not fail indexing.
-    // Note: we need to do duplicate and validity check before the dimension check and similarity
-    // method check since we do not want to index any following vectors if any of the previous
-    // vectors were either already indexed or shown as invalid for indexing.
-    if (!document.canIndexVectorField(checkFieldName)) {
+    // Distinct BSON spellings can share one Lucene field. A successful vector claims that
+    // field, but an invalid value suppresses further candidates only from its own spelling.
+    String rejectionKey =
+        field.toString().contains(".")
+                && document instanceof DocumentWrapper search
+                && (search.resolver.hasTypeSetVectorFields()
+                    || search.resolver.indexDefinition.hasStaticBsonVectorOnlyFields())
+            ? checkFieldName
+                + "\0"
+                + sourcePath.orElseGet(() -> String.join("\0", field.getSegments()))
+            : checkFieldName;
+    if (!document.canIndexVectorField(checkFieldName, rejectionKey)) {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "nested embeddings are already indexed or invalid: "
               + "only first valid vector field with lucene field name %s is indexed. _id=%s",
@@ -531,7 +579,7 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "Vector dimension mismatch: expected %d, got %d. Skipping. _id=%s",
           dimensions, vector.numDimensions(), lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 
@@ -539,7 +587,7 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "Cosine similarity does not support zero vectors. Skipping. _id=%s",
           lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 
@@ -548,20 +596,25 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "float16 vectors are not supported by the Lucene engine, skipping. _id=%s",
           lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 
     VectorSimilarityFunction similarityFunction = similarity.getLuceneSimilarityFunction();
+    var type = VectorTypeFieldResolver.resolveTypeField(quantization, vector.getVectorType());
     String vectorFieldName =
-        VectorTypeFieldResolver.resolveTypeField(quantization, vector.getVectorType())
-            .getLuceneFieldName(field, document.getEmbeddedRoot());
+        dimensionInFieldName
+            ? type.getInferredVectorFieldName(field, dimensions)
+            : type.getLuceneFieldName(field, document.getEmbeddedRoot());
     try {
       switch (vector.getVectorType()) {
         case FLOAT -> {
           document.addVectorField(
               new KnnFloatVectorField(
-                  vectorFieldName, vector.asFloatVector().getFloatVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asFloatVector().getFloatVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
         // float16 is guarded out above (vectorlite-only); unreachable here.
@@ -586,7 +639,10 @@ public class IndexableFieldFactory {
           }
           document.addVectorField(
               new KnnByteVectorField(
-                  vectorFieldName, vector.asByteVector().getByteVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asByteVector().getByteVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
         case BIT -> {
@@ -605,7 +661,10 @@ public class IndexableFieldFactory {
           }
           document.addVectorField(
               new KnnByteVectorField(
-                  vectorFieldName, vector.asBitVector().getBitVector(), similarityFunction),
+                  vectorFieldName,
+                  vector.asBitVector().getBitVector(),
+                  similarityFunction,
+                  sourcePath),
               checkFieldName);
         }
       }

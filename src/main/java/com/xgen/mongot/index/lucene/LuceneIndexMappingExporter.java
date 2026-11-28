@@ -1,6 +1,9 @@
 package com.xgen.mongot.index.lucene;
 
+import com.google.common.collect.ImmutableList;
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.analyzer.wrapper.AnalyzerMapping;
+import com.xgen.mongot.index.definition.AutocompleteFieldDefinition;
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
 import com.xgen.mongot.index.definition.EmbeddedDocumentsFieldDefinition;
 import com.xgen.mongot.index.definition.FieldDefinition;
@@ -9,36 +12,67 @@ import com.xgen.mongot.index.definition.FieldTypeDefinition.Type;
 import com.xgen.mongot.index.definition.HierarchicalFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
 import com.xgen.mongot.index.definition.SearchIndexDefinition;
+import com.xgen.mongot.index.definition.SearchIndexVectorFieldDefinition;
+import com.xgen.mongot.index.definition.StringFieldDefinition;
+import com.xgen.mongot.index.definition.TokenFieldDefinition;
+import com.xgen.mongot.index.definition.TypeSetVectorFieldDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions.SourcePaths;
+import com.xgen.mongot.index.lucene.config.LuceneConfig;
 import com.xgen.mongot.index.lucene.field.FieldName;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.FieldPath;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.Predicate;
+import java.util.stream.StreamSupport;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
+import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.util.BitSetIterator;
+import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.FixedBitSet;
 import org.bson.BsonArray;
 import org.bson.BsonBoolean;
 import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.BsonValue;
+import org.jetbrains.annotations.Nullable;
 
 /** Builds static public mappings from configured mappings and materialized Lucene field types. */
 public final class LuceneIndexMappingExporter {
   private final SearchFieldDefinitionResolver resolver;
-  private final Map<Optional<FieldPath>, ObservedField> scopes = new HashMap<>();
+  private final AnalyzerMapping analyzers;
+  private final Map<String, List<List<String>>> vectorSourcePaths = new HashMap<>();
+  private final Set<String> legacyPaths;
+  private final Map<List<String>, ObservedField> scopes = new HashMap<>();
 
   private static final class ObservedField {
+    private boolean present;
+    private Optional<Integer> vectorDimensions = Optional.empty();
     private final EnumSet<Type> types = EnumSet.noneOf(Type.class);
     private final Map<String, ObservedField> children = new TreeMap<>();
   }
 
   private LuceneIndexMappingExporter(
-      SearchIndexDefinition definition, IndexFormatVersion formatVersion) {
+      SearchIndexDefinition definition, IndexFormatVersion formatVersion, Set<String> legacyPaths) {
+    this.analyzers = new AnalyzerMapping(definition);
     this.resolver = definition.createFieldDefinitionResolver(formatVersion);
+    this.legacyPaths = legacyPaths;
   }
 
   /**
@@ -54,20 +88,403 @@ public final class LuceneIndexMappingExporter {
       SearchIndexDefinition definition,
       IndexFormatVersion formatVersion,
       List<FieldInfos> fieldInfos) {
-    var exporter = new LuceneIndexMappingExporter(definition, formatVersion);
+    return export(definition, formatVersion, fieldInfos, SourcePaths.EMPTY);
+  }
+
+  public static BsonDocument export(
+      SearchIndexDefinition definition,
+      IndexFormatVersion formatVersion,
+      List<FieldInfos> fieldInfos,
+      SourcePaths sourcePaths) {
+    var exporter =
+        new LuceneIndexMappingExporter(definition, formatVersion, sourcePaths.legacyPaths());
+    for (String shape : sourcePaths.spellings()) {
+      exporter
+          .vectorSourcePaths
+          .computeIfAbsent(shape.replace('\0', '.'), ignored -> new ArrayList<>())
+          .add(List.of(shape.split("\0", -1)));
+    }
     for (var partition : fieldInfos) {
       for (var field : partition) {
-        exporter.observe(field.name);
+        exporter.observe(field, Optional.empty());
       }
     }
-    return exporter.exportDocument(
-        definition.getMappings(),
+    return exporter.mappings();
+  }
+
+  private BsonDocument mappings() {
+    return exportDocument(
+        this.resolver.indexDefinition.getMappings(),
         new BsonDocument(),
-        exporter.scopes.getOrDefault(Optional.empty(), new ObservedField()),
+        this.scopes.getOrDefault(List.of(), new ObservedField()),
+        Optional.empty(),
         Optional.empty());
   }
 
-  private void observe(String name) {
+  /** Each set of fields and BSON source segments comes from the same pinned partition reader. */
+  public static BsonDocument exportSnapshot(
+      SearchIndexDefinition definition, IndexFormatVersion version, List<DirectoryReader> readers)
+      throws IOException {
+    var exporter = new LuceneIndexMappingExporter(definition, version, Set.of());
+    var olderLeaves = new ArrayList<LeafReader>();
+    for (var reader : readers) {
+      for (var context : reader.leaves()) {
+        var leaf = context.reader();
+        if (exporter.observeAndHasOlderDocuments(leaf)) {
+          olderLeaves.add(leaf);
+        }
+      }
+    }
+    // All partitions must contribute exact evidence before checking an older segment.
+    for (var leaf : olderLeaves) exporter.verifyOlderSegment(leaf);
+    return exporter.mappings();
+  }
+
+  private boolean observeAndHasOlderDocuments(LeafReader leaf) throws IOException {
+    if (leaf.numDocs() == 0) {
+      return false;
+    }
+    var terms = leaf.terms(MappingObservations.NAME);
+    if (terms != null) {
+      @Var boolean recoverEmptyKey = false;
+      var iterator = terms.iterator();
+      while (iterator.next() != null) {
+        if (iterator.term().length == 0 || !hasLivePosting(leaf, iterator)) {
+          continue;
+        }
+        String encoded = iterator.term().utf8ToString();
+        if (encoded.equals(MappingObservations.LONG_ENTRY_MARKER)) {
+          recoverEmptyKey |= observeLongEntries(leaf);
+        } else {
+          recoverEmptyKey |= observeEntry(leaf, encoded);
+        }
+      }
+      if (recoverEmptyKey) recoverEmptyKeyTypes(leaf);
+      if (terms.getDocCount() == leaf.maxDoc()) return false;
+      if (terms.getDocCount() < leaf.numDocs()) return true;
+      return hasLiveOlderPosting(leaf, null);
+    }
+    return true;
+  }
+
+  // FieldInfos bound the possible types. FIELD_NAMES contains paths, even for an empty
+  // array or a skipped vector. Neither lookup requires stored documents or a value dictionary.
+  private void verifyOlderSegment(LeafReader leaf) throws IOException {
+    var definition = this.resolver.indexDefinition;
+    var names = leaf.terms(FieldName.MetaField.FIELD_NAMES.getLuceneFieldName());
+    var nameLookup = names == null ? null : names.iterator();
+    for (var field : leaf.getFieldInfos()) {
+      var physical = FieldName.TypeField.getTypeOf(field.name);
+      if (physical.isEmpty()) continue;
+      var type = publicType(physical.get());
+      if (type.isEmpty() && physical.get() != FieldName.TypeField.NULL) continue;
+      String path = physical.get().stripPrefix(field.name);
+      if (type.isPresent()
+          && usesDefaultAnalyzer(field, type.get())
+          && couldHaveLiveOlderValue(leaf, field, path, nameLookup)) {
+        throw unsupportedAnalysis(field, type.get());
+      }
+      int dimensions = physical.get().logicalVectorDimensions(field.getVectorDimension());
+      boolean covered =
+          FieldName.EmbeddedField.isTypeOf(field.name)
+              ? coveredInEmbeddedScopes(
+                  FieldName.getEmbeddedRootPathOrThrow(field.name), path, type, dimensions)
+              : isCovered(
+                  definition.getMappings(), this.scopes.get(List.of()), path, type, dimensions);
+      if (!covered && couldHaveLiveOlderValue(leaf, field, path, nameLookup)) throw uncovered(path);
+    }
+    if (names == null) return;
+    var it = names.iterator();
+    while (it.next() != null) {
+      String path = it.term().utf8ToString();
+      if (!coveredPresence(path) && hasLiveOlderPosting(leaf, it)) throw uncovered(path);
+    }
+  }
+
+  private boolean coveredPresence(String path) {
+    if (!isCovered(
+        this.resolver.indexDefinition.getMappings(),
+        this.scopes.get(List.of()),
+        path,
+        Optional.empty(),
+        0)) return false;
+    // Older existence terms were shared by parent and embedded documents.
+    for (int end = path.indexOf('.'); end >= 0; end = path.indexOf('.', end + 1)) {
+      if (!coveredInEmbeddedScopes(path.substring(0, end), path, Optional.empty(), 0)) return false;
+    }
+    return true;
+  }
+
+  private boolean coveredInEmbeddedScopes(
+      String root, String path, Optional<Type> type, int dimensions) {
+    for (var scope : this.resolver.indexDefinition.embeddedScopes(root)) {
+      if (!isCovered(
+          scope.mapping(),
+          this.scopes.get(scope.keys()),
+          path.substring(root.length() + 1),
+          type,
+          dimensions)) return false;
+    }
+    return true;
+  }
+
+  private boolean couldHaveLiveOlderValue(
+      LeafReader leaf, FieldInfo field, String path, @Nullable TermsEnum nameLookup)
+      throws IOException {
+    var documents = fieldDocuments(leaf, field);
+    if (documents != null) return intersectsLive(leaf, documents, currentDocuments(leaf));
+    // Older writers and oversized paths can lack an existence term. Retain that uncertainty.
+    return nameLookup == null
+        || !this.resolver.indexCapabilities.supportsFieldExistsQuery()
+        || path.length() > LuceneConfig.MAX_TERM_CHAR_LENGTH
+        || !nameLookup.seekExact(new BytesRef(path))
+        || hasLiveOlderPosting(leaf, nameLookup);
+  }
+
+  private static MappingExportException uncovered(String path) {
+    return new MappingExportException(
+        "Reindex the source documents before exporting mappings: older index data does not record"
+            + " every BSON spelling of '"
+            + path
+            + "'.");
+  }
+
+  private static final int BLOCK_SIZE = 4096;
+
+  /**
+   * Intersect metadata postings, the complement of the format marker, and the live-doc mask. A null
+   * term denotes every document. Buffers are bounded independently of segment size.
+   */
+  private static boolean hasLiveOlderPosting(LeafReader leaf, @Nullable TermsEnum term)
+      throws IOException {
+    var marker = new Term(MappingObservations.NAME, new BytesRef());
+    long currentCount = leaf.docFreq(marker);
+    if (term != null && term.docFreq() > currentCount + leaf.numDeletedDocs()) return true;
+    return intersectsLive(
+        leaf, term == null ? null : term.postings(null, PostingsEnum.NONE), currentDocuments(leaf));
+  }
+
+  private static @Nullable PostingsEnum currentDocuments(LeafReader leaf) throws IOException {
+    return leaf.postings(new Term(MappingObservations.NAME, new BytesRef()), PostingsEnum.NONE);
+  }
+
+  private static @Nullable DocIdSetIterator fieldDocuments(LeafReader leaf, FieldInfo field)
+      throws IOException {
+    if (field.getVectorDimension() > 0) {
+      return switch (field.getVectorEncoding()) {
+        case BYTE -> {
+          var vectors = leaf.getByteVectorValues(field.name);
+          yield vectors == null ? DocIdSetIterator.empty() : vectors.iterator();
+        }
+        case FLOAT32 -> {
+          var vectors = leaf.getFloatVectorValues(field.name);
+          yield vectors == null ? DocIdSetIterator.empty() : vectors.iterator();
+        }
+      };
+    }
+    return field.hasNorms()
+        ? leaf.getNormValues(field.name)
+        : FieldExistsQuery.getDocValuesDocIdSetIterator(field.name, leaf);
+  }
+
+  /**
+   * Tests candidates AND live documents AND NOT exclusions one aligned block at a time. A null
+   * candidate set means every document.
+   */
+  private static boolean intersectsLive(
+      LeafReader leaf, @Nullable DocIdSetIterator candidates, @Nullable DocIdSetIterator current)
+      throws IOException {
+    if (current != null) current.nextDoc();
+    if (candidates != null) candidates.nextDoc();
+    var live = leaf.getLiveDocs();
+    var structured = leaf.getLiveDocsWithDeletedIterator();
+    var dense =
+        structured == null
+            ? null
+            : BitSetIterator.getFixedBitSetOrNull(structured.liveDocsIterator());
+    var deleted = structured != null && dense == null ? structured.deletedDocsIterator() : null;
+    if (deleted != null) deleted.nextDoc();
+    var block = new FixedBitSet(BLOCK_SIZE);
+    var mask = new FixedBitSet(BLOCK_SIZE);
+    for (int base = 0; base < leaf.maxDoc(); ) {
+      if (candidates != null) {
+        if (candidates.docID() == DocIdSetIterator.NO_MORE_DOCS) break;
+        base = candidates.docID() / BLOCK_SIZE * BLOCK_SIZE;
+      }
+      int end = base + Math.min(BLOCK_SIZE, leaf.maxDoc() - base);
+      block.clear();
+      if (candidates == null) block.set(0, end - base);
+      else candidates.intoBitSet(end, block, base);
+      subtractPostings(block, mask, current, base, end);
+      if (!block.scanIsEmpty() && live != null) {
+        if (dense != null) dense.applyMask(block, base);
+        else if (deleted != null) subtractPostings(block, mask, deleted, base, end);
+        else live.applyMask(block, base);
+      }
+      if (!block.scanIsEmpty()) return true;
+      base = end;
+    }
+    return false;
+  }
+
+  private static void subtractPostings(
+      FixedBitSet block, FixedBitSet mask, @Nullable DocIdSetIterator postings, int base, int end)
+      throws IOException {
+    if (postings == null) return;
+    if (postings.docID() < base) postings.advance(base);
+    if (postings.docID() >= end) return;
+    mask.clear();
+    postings.intoBitSet(end, mask, base);
+    block.andNot(mask);
+  }
+
+  private boolean isCovered(
+      HierarchicalFieldDefinition parent,
+      @Nullable ObservedField observed,
+      String remaining,
+      Optional<Type> type,
+      int dimensions) {
+    var dynamic =
+        this.resolver
+            .getDynamicFieldDefinition(parent)
+            .filter(field -> type.isEmpty() || field.hasAnyFieldDefinitionOf(Set.of(type.get())));
+    if (parent.fields().isEmpty() && dynamic.isEmpty()) return true;
+    for (int end = remaining.length(); end >= 0; end = remaining.lastIndexOf('.', end - 1)) {
+      String key = remaining.substring(0, end);
+      var configured = parent.getField(key);
+      var effective = configured.or(() -> dynamic);
+      if (effective.isEmpty()) continue;
+      var child = observed == null ? null : observed.children.get(key);
+      if (end < remaining.length()) {
+        var doc = effective.get().documentFieldDefinition();
+        if (doc.isPresent()
+            && !isCovered(doc.get(), child, remaining.substring(end + 1), type, dimensions))
+          return false;
+      } else if (configured.isEmpty()
+          && (type.isEmpty() || effective.get().hasAnyFieldDefinitionOf(Set.of(type.get())))) {
+        if (child == null
+            || (type.isPresent() && !child.types.contains(type.get()))
+            || (type.orElse(null) == Type.VECTOR
+                && !child.vectorDimensions.equals(Optional.of(dimensions)))) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  private boolean observeLongEntries(LeafReader leaf) throws IOException {
+    @Var boolean recoverEmptyKey = false;
+    for (var field : leaf.getFieldInfos()) {
+      if (!field.name.startsWith(MappingObservations.LONG_ENTRY_PREFIX)) {
+        continue;
+      }
+      var terms = leaf.terms(field.name);
+      if (terms != null) {
+        var presence = terms.iterator();
+        if (presence.next() != null && hasLivePosting(leaf, presence)) {
+          String encoded = field.name.substring(MappingObservations.LONG_ENTRY_PREFIX.length());
+          recoverEmptyKey |= observeEntry(leaf, encoded);
+        }
+      }
+    }
+    return recoverEmptyKey;
+  }
+
+  private boolean observeEntry(LeafReader leaf, String encoded) {
+    var entry = MappingObservations.Entry.decode(encoded);
+    if (entry.field().startsWith(MappingObservations.PRESENCE_PREFIX)) {
+      var keys = entry.keys();
+      int depth =
+          Integer.parseInt(entry.field().substring(MappingObservations.PRESENCE_PREFIX.length()));
+      var scope =
+          this.scopes.computeIfAbsent(keys.subList(0, depth), unused -> new ObservedField());
+      descend(scope, keys.subList(depth, keys.size())).present = true;
+    } else {
+      observe(leaf.getFieldInfos().fieldInfo(entry.field()), Optional.of(entry.keys()));
+    }
+    // A child can imply the empty root's presence, including in an array containing both a
+    // scalar and a document. Either form in an older live entry warrants checking its type.
+    return encoded.charAt(0) != '0' && entry.hasEmptyRoot();
+  }
+
+  /**
+   * V3 originally recorded a scalar at the empty root key as presence alone. Its physical name is
+   * unambiguous. Consult Lucene field metadata only for leaves carrying that old entry.
+   */
+  private void recoverEmptyKeyTypes(LeafReader leaf) throws IOException {
+    for (var field : leaf.getFieldInfos()) {
+      var type = FieldName.TypeField.getTypeOf(field.name);
+      if (type.isEmpty()
+          || !type.get().stripPrefix(field.name).isEmpty()
+          || publicType(type.get()).isEmpty()) continue;
+      if (leaf.hasDeletions()) {
+        var docs = fieldDocuments(leaf, field);
+        if (docs != null) {
+          if (!intersectsLive(leaf, docs, null)) continue;
+        } else {
+          var points = leaf.getPointValues(field.name);
+          var terms = leaf.terms(field.name);
+          if ((points == null || points.getDocCount() <= leaf.numDeletedDocs())
+              && (terms == null || terms.getDocCount() <= leaf.numDeletedDocs())) {
+            throw new MappingExportException(
+                "Reindex before exporting the empty BSON key: older index data does not identify"
+                    + " its live type.");
+          }
+        }
+      }
+      observe(field, Optional.of(List.of("")));
+    }
+  }
+
+  private static boolean hasLivePosting(LeafReader leaf, TermsEnum term) throws IOException {
+    // If more documents have the spelling than have been deleted, at least one still has it.
+    return term.docFreq() > leaf.numDeletedDocs()
+        || intersectsLive(leaf, term.postings(null, PostingsEnum.NONE), null);
+  }
+
+  /**
+   * Lucene can retain the FieldInfo of a rejected document in a segment with other live documents.
+   */
+  static FieldInfos publishedFields(FieldInfos fields, SearchFieldDefinitionResolver resolver) {
+    if (!fields.hasVectorValues() || resolver.indexDefinition.getTypeSetsMap().isEmpty()) {
+      return fields;
+    }
+    Predicate<FieldInfo> published =
+        field -> {
+          if (field.getVectorDimension() == 0) {
+            return true;
+          }
+          String path = FieldName.stripAnyPrefixFromLuceneFieldName(field.name);
+          boolean qualified = FieldName.TypeField.isInferredVectorField(field.name);
+          var binding = resolver.vectorDimensions().binding(path);
+          if (binding.isEmpty()) {
+            // A failed discovery by a writer using the older naming scheme can also leave metadata.
+            return !qualified
+                && resolver
+                    .getTypeSetVectorRule(FieldPath.parse(path), Optional.empty())
+                    .filter(rule -> rule.numDimensions().isEmpty())
+                    .isEmpty();
+          }
+          return (qualified || !binding.get().dimensionInFieldName())
+              && binding.get().dimensions()
+                  == FieldName.TypeField.getTypeOf(field.name)
+                      .orElseThrow()
+                      .logicalVectorDimensions(field.getVectorDimension());
+        };
+    for (var field : fields) {
+      if (!published.test(field)) {
+        return new FieldInfos(
+            StreamSupport.stream(fields.spliterator(), false)
+                .filter(published)
+                .toArray(FieldInfo[]::new));
+      }
+    }
+    return fields;
+  }
+
+  private void observe(FieldInfo field, Optional<List<String>> source) {
+    String name = field.name;
     var physicalType = FieldName.TypeField.getTypeOf(name);
     if (physicalType.isEmpty()) {
       return;
@@ -76,28 +493,237 @@ public final class LuceneIndexMappingExporter {
     if (publicType.isEmpty()) {
       return;
     }
-    Optional<FieldPath> embeddedRoot =
-        FieldName.EmbeddedField.isTypeOf(name)
-            ? Optional.of(FieldPath.parse(FieldName.getEmbeddedRootPathOrThrow(name)))
-            : Optional.empty();
+    if (usesDefaultAnalyzer(field, publicType.get())) {
+      throw unsupportedAnalysis(field, publicType.get());
+    }
     var path = FieldPath.parse(physicalType.get().stripPrefix(name));
-    @Var var observed = this.scopes.computeIfAbsent(embeddedRoot, ignored -> new ObservedField());
-    for (var component : path.getPathHierarchy()) {
-      // Embedded field names contain the absolute path. Their scope starts below the root.
-      if (embeddedRoot.isPresent() && !component.isChildOf(embeddedRoot.get())) {
+    if (FieldName.EmbeddedField.isTypeOf(name)) {
+      observeEmbedded(field, path, physicalType.get(), publicType.get(), source);
+      return;
+    }
+    // Static vector definitions already contain their dimensions. Two explicitly mapped BSON
+    // paths can share a dotted spelling while using different physical vector encodings.
+    if (publicType.get() == Type.VECTOR
+        && !(source.isPresent() && this.resolver.hasTypeSetVectorFields())
+        && this.resolver.getTypeSetVectorRule(path, Optional.empty()).isEmpty()) {
+      return;
+    }
+    var root = this.scopes.computeIfAbsent(List.of(), ignored -> new ObservedField());
+    if (source.isPresent()) {
+      observeType(root, source.get(), publicType.get(), physicalType.get(), field);
+      return;
+    }
+    if (publicType.get() == Type.VECTOR) {
+      var shapes = this.vectorSourcePaths.get(path.toString());
+      if (shapes == null || this.legacyPaths.contains(path.toString())) {
+        observeLegacyRoot(field, path, physicalType.get(), publicType.get());
+      }
+      if (shapes != null) {
+        for (var keys : shapes) {
+          observeType(root, keys, publicType.get(), physicalType.get(), field);
+        }
+      }
+
+    } else {
+      observeType(root, path.getSegments(), publicType.get(), physicalType.get(), field);
+    }
+  }
+
+  private void observeLegacyRoot(
+      FieldInfo field, FieldPath path, FieldName.TypeField physical, Type type) {
+    if (path.isAtRoot()) {
+      observeType(
+          this.scopes.computeIfAbsent(List.of(), unused -> new ObservedField()),
+          path.getSegments(),
+          type,
+          physical,
+          field);
+      return;
+    }
+    var matches = new LegacyMatches();
+    findShapes(
+        this.resolver.indexDefinition.getMappings(),
+        path.toString(),
+        type,
+        List.of(),
+        new ArrayList<>(),
+        matches);
+    observeLegacyMatch(matches, path, type, physical, field);
+  }
+
+  private void observeEmbedded(
+      FieldInfo field,
+      FieldPath path,
+      FieldName.TypeField physical,
+      Type type,
+      Optional<List<String>> source) {
+    if (type == Type.VECTOR) {
+      return;
+    }
+    String root = FieldName.getEmbeddedRootPathOrThrow(field.name);
+    var scopes = this.resolver.indexDefinition.embeddedScopes(root);
+    if (scopes.isEmpty()) {
+      return;
+    }
+    if (source.isPresent()) {
+      var keys = source.get();
+      for (var scope : scopes) {
+        int depth = scope.keys().size();
+        if (keys.size() > depth && keys.subList(0, depth).equals(scope.keys())) {
+          observeType(
+              this.scopes.computeIfAbsent(scope.keys(), unused -> new ObservedField()),
+              keys.subList(depth, keys.size()),
+              type,
+              physical,
+              field);
+          return;
+        }
+      }
+      return;
+    }
+    String relative = path.toString().substring(root.length() + 1);
+    if (scopes.size() == 1) {
+      observeType(
+          this.scopes.computeIfAbsent(scopes.getFirst().keys(), unused -> new ObservedField()),
+          List.of(relative.split("\\.", -1)),
+          type,
+          physical,
+          field);
+      return;
+    }
+    var matches = new LegacyMatches();
+    for (var scope : scopes) {
+      findShapes(scope.mapping(), relative, type, scope.keys(), new ArrayList<>(), matches);
+    }
+    observeLegacyMatch(matches, path, type, physical, field);
+  }
+
+  public static final class MappingExportException extends IllegalStateException {
+    private MappingExportException(String message) {
+      super(message);
+    }
+
+    private MappingExportException(FieldPath path, Type type) {
+      super(
+          "Cannot export the original BSON key segments of legacy "
+              + type.name().toLowerCase(java.util.Locale.ROOT)
+              + " field '"
+              + path
+              + "'. Reindex the source documents to record their field paths.");
+    }
+  }
+
+  private static ObservedField descend(ObservedField root, Iterable<String> keys) {
+    @Var var node = root;
+    for (String key : keys)
+      node = node.children.computeIfAbsent(key, unused -> new ObservedField());
+    return node;
+  }
+
+  private static void observeType(
+      ObservedField root,
+      Iterable<String> keys,
+      Type publicType,
+      FieldName.TypeField physicalType,
+      FieldInfo field) {
+    var observed = descend(root, keys);
+    observed.types.add(publicType);
+    if (publicType == Type.VECTOR) {
+      int dimensions = physicalType.logicalVectorDimensions(field.getVectorDimension());
+      if (observed.vectorDimensions.isPresent() && observed.vectorDimensions.get() != dimensions) {
+        throw new IllegalStateException("Conflicting vector dimensions for " + field.name);
+      }
+      observed.vectorDimensions = Optional.of(dimensions);
+    }
+  }
+
+  // Explicit matches are already in the exported definition. Ambiguity matters only if
+  // choosing between candidates would change which dynamic fields are emitted.
+  private static final class LegacyMatches {
+    private boolean explicit;
+    private boolean ambiguous;
+    private List<String> scope = List.of();
+    private Optional<List<String>> dynamicKeys = Optional.empty();
+
+    void add(List<String> scope, List<String> keys, boolean configured) {
+      if (configured) {
+        this.explicit = true;
+      } else {
+        this.ambiguous |= this.dynamicKeys.isPresent();
+        this.scope = scope;
+        this.dynamicKeys = Optional.of(List.copyOf(keys));
+      }
+      this.ambiguous |= this.explicit && this.dynamicKeys.isPresent();
+    }
+  }
+
+  private void observeLegacyMatch(
+      LegacyMatches matches,
+      FieldPath path,
+      Type type,
+      FieldName.TypeField physical,
+      FieldInfo field) {
+    if (matches.ambiguous || (!matches.explicit && matches.dynamicKeys.isEmpty())) {
+      throw new MappingExportException(path, type);
+    }
+    matches.dynamicKeys.ifPresent(
+        keys ->
+            observeType(
+                this.scopes.computeIfAbsent(matches.scope, unused -> new ObservedField()),
+                keys,
+                type,
+                physical,
+                field));
+  }
+
+  private void findShapes(
+      HierarchicalFieldDefinition parent,
+      String remaining,
+      Type type,
+      List<String> scope,
+      List<String> prefix,
+      LegacyMatches matches) {
+    // An implicit document inherits the same dynamic rule at every descendant.
+    var dynamic =
+        this.resolver
+            .getDynamicFieldDefinition(parent)
+            .filter(field -> field.hasAnyFieldDefinitionOf(Set.of(type)));
+    if (parent.fields().isEmpty() && dynamic.isEmpty()) {
+      return;
+    }
+    for (int end = remaining.length();
+        end >= 0 && !matches.ambiguous;
+        end = remaining.lastIndexOf('.', end - 1)) {
+      String key = remaining.substring(0, end);
+      var explicit = parent.getField(key);
+      var field = explicit.or(() -> dynamic);
+      if (field.isEmpty()) {
         continue;
       }
-      observed =
-          observed.children.computeIfAbsent(component.getLeaf(), ignored -> new ObservedField());
+      prefix.add(key);
+      if (end == remaining.length()) {
+        if (field.get().hasAnyFieldDefinitionOf(Set.of(type))) {
+          matches.add(scope, prefix, explicit.isPresent());
+        }
+      } else if (field.get().documentFieldDefinition().isPresent()) {
+        findShapes(
+            field.get().documentFieldDefinition().get(),
+            remaining.substring(end + 1),
+            type,
+            scope,
+            prefix,
+            matches);
+      }
+      prefix.removeLast();
     }
-    observed.types.add(publicType.get());
   }
 
   private BsonDocument exportDocument(
       HierarchicalFieldDefinition definition,
       BsonDocument result,
       ObservedField observed,
-      Optional<FieldPath> parent) {
+      Optional<FieldPath> parent,
+      Optional<FieldPath> embeddedRoot) {
     var fields = new BsonDocument();
     var names = new TreeSet<>(definition.fields().keySet());
     names.addAll(observed.children.keySet());
@@ -109,7 +735,7 @@ public final class LuceneIndexMappingExporter {
       }
       var path = parent.map(value -> value.newChild(name)).orElseGet(() -> FieldPath.newRoot(name));
       var child = observed.children.getOrDefault(name, new ObservedField());
-      var mapping = exportField(effective.get(), configured.isPresent(), child, path);
+      var mapping = exportField(effective.get(), configured.isPresent(), child, path, embeddedRoot);
       if (!mapping.isEmpty()) {
         fields.put(name, mapping.size() == 1 ? mapping.getFirst() : new BsonArray(mapping));
       }
@@ -120,24 +746,65 @@ public final class LuceneIndexMappingExporter {
   }
 
   private List<BsonValue> exportField(
-      FieldDefinition definition, boolean configured, ObservedField observed, FieldPath path) {
+      FieldDefinition definition,
+      boolean configured,
+      ObservedField observed,
+      FieldPath path,
+      Optional<FieldPath> embeddedRoot) {
     var result = new ArrayList<BsonValue>();
     for (var typeDefinition : definition.getAllDefinitions().flatMap(Optional::stream).toList()) {
       var type = typeDefinition.getType();
       if (!configured
           && !observed.types.contains(type)
-          && !(type == Type.DOCUMENT && !observed.children.isEmpty())) {
+          && !(type == Type.DOCUMENT
+              && (!observed.children.isEmpty()
+                  || (observed.present && observed.types.isEmpty())))) {
         continue;
       }
-      BsonDocument mapping = typeDefinition.toBson();
+      @Var BsonDocument mapping = typeDefinition.toBson();
       switch (typeDefinition) {
+        case StringFieldDefinition string -> {
+          fixStringAnalysis(
+              mapping, FieldName.TypeField.STRING.getLuceneFieldName(path, embeddedRoot));
+          for (String name : string.multi().keySet()) {
+            fixStringAnalysis(
+                mapping.getDocument("multi").getDocument(name),
+                FieldName.MultiField.getLuceneFieldName(path, name, embeddedRoot));
+          }
+        }
+        case TokenFieldDefinition token -> {
+          String physical = FieldName.TypeField.TOKEN.getLuceneFieldName(path, embeddedRoot);
+          mapping = this.analyzers.resolve(physical).orElse(token).toBson();
+        }
+        case AutocompleteFieldDefinition ac -> {
+          String physical = FieldName.TypeField.AUTOCOMPLETE.getLuceneFieldName(path, embeddedRoot);
+          mapping = this.analyzers.resolve(physical).orElse(ac).toBson();
+          fixSimilarity(mapping, physical);
+        }
+        case TypeSetVectorFieldDefinition vector -> {
+          // An explicit vector at an aliased path can supply the encoding for this spelling.
+          var dotted = FieldPath.parse(path.toString());
+          var spec =
+              this.resolver
+                  .getExplicitSearchVectorSpecification(dotted)
+                  .or(
+                      () ->
+                          this.resolver
+                              .getTypeSetVectorRule(dotted, Optional.empty())
+                              .orElse(vector)
+                              .resolve(() -> observed.vectorDimensions))
+                  .orElseThrow();
+          mapping = new SearchIndexVectorFieldDefinition(spec, true).toBson();
+        }
         case DocumentFieldDefinition document ->
-            exportDocument(document, mapping, observed, Optional.of(path));
+            exportDocument(document, mapping, observed, Optional.of(path), embeddedRoot);
         case EmbeddedDocumentsFieldDefinition embedded ->
             exportDocument(
                 embedded,
                 mapping,
-                this.scopes.getOrDefault(Optional.of(path), new ObservedField()),
+                this.scopes.getOrDefault(
+                    ImmutableList.copyOf(path.getSegments()), new ObservedField()),
+                Optional.of(path),
                 Optional.of(path));
         default -> {
           // All scalar options, including string multi fields, are already in toBson().
@@ -146,6 +813,40 @@ public final class LuceneIndexMappingExporter {
       result.add(mapping);
     }
     return result;
+  }
+
+  private boolean usesDefaultAnalyzer(FieldInfo field, Type type) {
+    return (type == Type.TOKEN || type == Type.AUTOCOMPLETE)
+        && this.analyzers.resolve(field.name).isEmpty();
+  }
+
+  private static MappingExportException unsupportedAnalysis(FieldInfo field, Type type) {
+    return new MappingExportException(
+        "Reindex before exporting '"
+            + FieldName.getFieldPath(field.name)
+            + "': this "
+            + type.name().toLowerCase(java.util.Locale.ROOT)
+            + " field used the index's default analyzer, which the static mapping cannot express.");
+  }
+
+  private void fixStringAnalysis(BsonDocument mapping, String physicalName) {
+    var selected = this.analyzers.resolve(physicalName).map(StringFieldDefinition.class::cast);
+    fixSimilarity(mapping, physicalName);
+    mapping.remove("analyzer");
+    mapping.remove("searchAnalyzer");
+    selected
+        .flatMap(StringFieldDefinition::analyzerName)
+        .ifPresent(name -> mapping.put("analyzer", new BsonString(name)));
+    selected
+        .flatMap(StringFieldDefinition::searchAnalyzerName)
+        .ifPresent(name -> mapping.put("searchAnalyzer", new BsonString(name)));
+  }
+
+  private void fixSimilarity(BsonDocument mapping, String physical) {
+    mapping.remove("similarity");
+    this.analyzers
+        .similarity(physical)
+        .ifPresent(model -> mapping.put("similarity", model.toBson()));
   }
 
   private static Optional<FieldTypeDefinition.Type> publicType(FieldName.TypeField type) {
@@ -165,6 +866,8 @@ public final class LuceneIndexMappingExporter {
       case STRING -> Optional.of(Type.STRING);
       case TOKEN -> Optional.of(Type.TOKEN);
       case UUID -> Optional.of(Type.UUID);
+      case KNN_VECTOR, KNN_BYTE, KNN_BIT, KNN_F32_Q7, KNN_F32_Q1, KNN_BYTE_Q1 ->
+          Optional.of(Type.VECTOR);
       // These types are only explicitly mapped (and are retained from the definition), or have
       // no public mapping type (null). Never infer an internal storage field as a new mapping.
       case DATE_FACET,
@@ -173,12 +876,6 @@ public final class LuceneIndexMappingExporter {
           SORTABLE_DATE_BETA_V1,
           SORTABLE_NUMBER_BETA_V1,
           SORTABLE_STRING_BETA_V1,
-          KNN_VECTOR,
-          KNN_BYTE,
-          KNN_BIT,
-          KNN_F32_Q7,
-          KNN_F32_Q1,
-          KNN_BYTE_Q1,
           NULL ->
           Optional.empty();
     };

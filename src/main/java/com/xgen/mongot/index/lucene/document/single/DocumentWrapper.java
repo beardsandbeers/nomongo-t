@@ -5,6 +5,7 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater.IndexingMetricsUpdater;
 import com.xgen.mongot.index.definition.NumericFieldOptions;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
+import com.xgen.mongot.index.lucene.field.MappingObservations;
 import com.xgen.mongot.index.query.sort.MongotSortField;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
@@ -39,6 +40,21 @@ public class DocumentWrapper extends AbstractDocumentWrapper {
   public final SearchFieldDefinitionResolver resolver;
 
   private final Optional<FieldPath> embeddedRoot;
+  private final Optional<MappingObservations> observations;
+
+  void observePresence(FieldPath path) {
+    this.observations.ifPresent(obs -> obs.recordPresence(path));
+  }
+
+  int firstFieldToObserve() {
+    return this.observations.isPresent() ? this.luceneDocument.getFields().size() : 0;
+  }
+
+  void observeFields(int start, FieldPath path) {
+    if (this.observations.isPresent()) {
+      this.observations.get().recordScalarFields(this.luceneDocument, start, path);
+    }
+  }
 
   private final ImmutableSet<FieldPath> indexSortNullnessFields;
 
@@ -51,6 +67,11 @@ public class DocumentWrapper extends AbstractDocumentWrapper {
       FeatureFlags featureFlags) {
     super(luceneDocument, resolver.indexCapabilities, indexingMetricsUpdater, featureFlags);
     this.embeddedRoot = embeddedRoot;
+    this.observations =
+        resolver.indexDefinition.requiresMappingObservations()
+            ? Optional.of(new MappingObservations(embeddedRoot))
+            : Optional.empty();
+    this.observations.ifPresent(luceneDocument::add);
     this.isNumberAndDateSortable =
         embeddedRoot.isEmpty() || resolver.indexCapabilities.supportsEmbeddedNumericAndDateV2();
     this.indexAnalyzer = indexAnalyzer;

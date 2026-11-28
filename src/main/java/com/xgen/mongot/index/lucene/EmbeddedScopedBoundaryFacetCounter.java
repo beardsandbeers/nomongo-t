@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.util.Optional;
 import org.apache.lucene.facet.FacetsCollector;
 import org.apache.lucene.facet.FacetsCollectorManager;
+import org.apache.lucene.facet.MultiLongValuesSource;
 import org.apache.lucene.facet.range.LongRange;
 import org.apache.lucene.search.Query;
 
@@ -42,7 +43,15 @@ final class EmbeddedScopedBoundaryFacetCounter {
     // The scoped facet reads the child-indexed numeric field under the embedded path, and buckets
     // against the same ranges (encoded consistently with the doc-values) the doc-indexed path uses.
     String lucenePath = facetContext.getBoundaryFacetPath(definition, embeddedPath);
-    LongRange[] ranges = facetContext.getRanges(definition, embeddedPath);
+    var mixed =
+        facetContext.numericBucketOrdinals(
+            definition,
+            embeddedPath,
+            facetContext.getBoundaryFacetFieldType(definition, embeddedPath));
+    LongRange[] ranges =
+        mixed.isPresent()
+            ? LuceneFacetContext.ordinalRanges(definition)
+            : facetContext.getRanges(definition, embeddedPath);
 
     Query childQuery =
         queryFactory.createEmbeddedChildQuery(
@@ -51,7 +60,9 @@ final class EmbeddedScopedBoundaryFacetCounter {
 
     ParentDedupedLongRangeFacetCounts counts =
         new ParentDedupedLongRangeFacetCounts(
-            lucenePath,
+            mixed
+                .<MultiLongValuesSource>map(source -> source)
+                .orElseGet(() -> MultiLongValuesSource.fromLongField(lucenePath)),
             ranges,
             childHits,
             queryFactory.rootParentBitSetProducer(),

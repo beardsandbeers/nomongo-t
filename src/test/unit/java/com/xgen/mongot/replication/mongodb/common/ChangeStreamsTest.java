@@ -64,6 +64,29 @@ public class ChangeStreamsTest {
     }
 
     @Test
+    public void updateDescription_literalVectorWithClosedAncestor_appliesToIndex()
+        throws Exception {
+      for (String ancestor : List.of("{type:'string'}", "{type:'document',dynamic:false}")) {
+        var raw = DYNAMIC_DEFINITION.toBson();
+        raw.put(
+            "mappings", BsonDocument.parse("{dynamic:{typeSet:'v'},fields:{a:" + ancestor + "}}"));
+        raw.put(
+            "typeSets",
+            BsonDocument.parse(
+                    "{sets:[{name:'v',types:[{type:'vector',"
+                        + "similarity:'euclidean',numDimensions:2}]}]}")
+                .getArray("sets"));
+        var definition = SearchIndexDefinition.fromBson(raw);
+        assertAppliesToDefinition(
+            new UpdateDescription(
+                List.of(), BsonDocument.parse("{'a.b':BinData(9,'JwAAAIA/AAAAAA==')}")),
+            definition);
+        assertAppliesToDefinition(
+            new UpdateDescription(List.of("a.b"), new BsonDocument()), definition);
+      }
+    }
+
+    @Test
     public void testDynamicMatchingRemovedField() {
       var description = new UpdateDescription(List.of("a.bb"), new BsonDocument());
       assertAppliesToDefinition(description, DYNAMIC_DEFINITION);

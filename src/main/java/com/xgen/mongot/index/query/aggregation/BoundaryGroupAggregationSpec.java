@@ -30,6 +30,7 @@ public final class BoundaryGroupAggregationSpec extends GroupAggregationSpec {
   // > Long.MAX_VALUE), so huge / +Inf values land in the top bucket.
   private final boolean lastEdgeInclusive;
   private final TypeField typeField;
+  private final Optional<NumericBucketOrdinals> bucketOrdinals;
 
   /** Constructs a boundary group spec with pre-encoded edges and metadata from {@code args}. */
   public BoundaryGroupAggregationSpec(
@@ -48,6 +49,7 @@ public final class BoundaryGroupAggregationSpec extends GroupAggregationSpec {
         rangeKeys,
         lastEdgeInclusive,
         args.defaultKey(),
+        args.bucketOrdinals(),
         args.typeField()
             .orElseThrow(
                 () ->
@@ -63,6 +65,7 @@ public final class BoundaryGroupAggregationSpec extends GroupAggregationSpec {
       List<BsonValue> rangeKeys,
       boolean lastEdgeInclusive,
       Optional<BsonValue> defaultBucketKey,
+      Optional<NumericBucketOrdinals> bucketOrdinals,
       TypeField typeField) {
     super(path, name, children);
     checkArg(
@@ -85,6 +88,7 @@ public final class BoundaryGroupAggregationSpec extends GroupAggregationSpec {
     this.defaultBucketKey = defaultBucketKey;
     this.lastEdgeInclusive = lastEdgeInclusive;
     this.typeField = typeField;
+    this.bucketOrdinals = bucketOrdinals;
   }
 
   /**
@@ -114,12 +118,17 @@ public final class BoundaryGroupAggregationSpec extends GroupAggregationSpec {
         rangeKeys,
         false,
         args.defaultKey(),
+        args.bucketOrdinals(),
         // Merge planning omits typeField; encoded edges are unused and a dummy keeps the
         // accumulator field populated for the constructor invariant.
         args.typeField().orElse(TypeField.NUMBER_INT64));
   }
 
   // Package-private accessors consumed once by BoundaryAccumulator's constructor.
+  Optional<NumericBucketOrdinals> bucketOrdinals() {
+    return this.bucketOrdinals;
+  }
+
   long[] boundaryEdges() {
     return this.boundaryEdges.clone();
   }

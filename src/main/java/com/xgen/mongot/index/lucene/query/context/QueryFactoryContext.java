@@ -5,6 +5,7 @@ import com.xgen.mongot.featureflag.FeatureFlags;
 import com.xgen.mongot.index.IndexMetricsUpdater;
 import com.xgen.mongot.index.definition.FieldDefinitionResolver;
 import com.xgen.mongot.index.definition.IndexDefinition;
+import com.xgen.mongot.index.definition.VectorDimensions;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.definition.quantization.VectorAutoEmbedQuantization;
 import com.xgen.mongot.index.definition.quantization.VectorQuantization;
@@ -61,6 +62,22 @@ public interface QueryFactoryContext {
    */
   VectorQuantization getIndexedQuantization(FieldPath fieldPath, Optional<FieldPath> embeddedRoot)
       throws InvalidQueryException;
+
+  record VectorField(
+      VectorSimilarity similarity,
+      VectorQuantization quantization,
+      Optional<VectorDimensions.Binding> binding,
+      boolean unbound) {}
+
+  default VectorField resolveVectorField(FieldPath path, Optional<FieldPath> root, int dimensions)
+      throws InvalidQueryException {
+    getQueryTimeMappingChecks().validateVectorField(path, root, dimensions);
+    return new VectorField(
+        getIndexedVectorSimilarityFunction(path, root),
+        getIndexedQuantization(path, root),
+        Optional.empty(),
+        false);
+  }
 
   /** Returns the metrics updater tied to the index that this query targets. */
   IndexMetricsUpdater.QueryingMetricsUpdater getMetrics();

@@ -4,6 +4,7 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
 import com.google.protobuf.ByteString;
+import com.xgen.mongot.index.definition.SearchIndexDefinition.MappingVersion;
 import com.xgen.mongot.standalone.grpc.CreateIndexRequest;
 import com.xgen.mongot.standalone.grpc.DropIndexRequest;
 import com.xgen.mongot.standalone.grpc.IndexType;
@@ -21,6 +22,104 @@ import org.junit.rules.TemporaryFolder;
 
 public class LocalIndexCatalogTest {
   @Rule public final TemporaryFolder folder = new TemporaryFolder();
+
+  @Test
+  public void createIndex_catalogVersion_matchesRequiredMappingFeatures() throws Exception {
+    var dir = this.folder.getRoot().toPath();
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      catalog.createIndex(
+          createRequest(
+              "plain",
+              "{mappings:{fields:{title:{type:'string'},'unambiguous.path':{type:'string'}}}}"));
+      var plain = BsonDocument.parse(Files.readString(dir.resolve("indexes.json")));
+      assertThat(plain.getInt32("catalogVersion").getValue()).isEqualTo(4);
+      assertThat(plain.toJson()).doesNotContain("typeSetSimilarity");
+      assertThat(plain.toJson()).doesNotContain("mappingVersion");
+
+      catalog.createIndex(
+          createRequest(
+              "vector",
+              """
+              {mappings:{dynamic:{typeSet:'v'}},
+               typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}
+              """));
+      var upgraded = BsonDocument.parse(Files.readString(dir.resolve("indexes.json")));
+      assertThat(upgraded.getInt32("catalogVersion").getValue()).isEqualTo(5);
+    }
+    try (var reopened = new LocalIndexCatalog(dir)) {
+      assertThat(reopened.definitions()).hasSize(2);
+    }
+  }
+
+  @Test
+  public void createIndex_staticBsonVectorOnly_usesVersionFiveCatalog() throws Exception {
+    var dir = this.folder.getRoot().toPath();
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      catalog.createIndex(
+          createRequest(
+              "bson-only",
+              """
+              {mappings:{dynamic:false,fields:{
+                v:{type:'vector',numDimensions:2,similarity:'euclidean',bsonVectorOnly:true}}}}
+              """));
+      var disk = BsonDocument.parse(Files.readString(dir.resolve("indexes.json")));
+      assertThat(disk.getInt32("catalogVersion").getValue()).isEqualTo(5);
+    }
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      assertThat(catalog.definitions()).hasSize(1);
+    }
+  }
+
+  private static CreateIndexRequest createRequest(String name, String json) {
+    return CreateIndexRequest.newBuilder()
+        .setType(IndexType.INDEX_TYPE_SEARCH)
+        .setName(name)
+        .setDefinitionBson(
+            ByteString.copyFrom(StandaloneDefinitionValidator.encode(BsonDocument.parse(json))))
+        .build();
+  }
+
+  @Test
+  public void planUpdate_olderScoringGeneration_preservedUntilRebuild() throws Exception {
+    var dir = this.folder.getRoot().toPath();
+    String schema =
+        """
+        {mappings:{dynamic:false,fields:{title:{type:'document',dynamic:{typeSet:'s'}}%s}},
+         typeSets:[{name:'s',types:[{type:'string',similarity:{type:'boolean'}}]}]}
+        """;
+    String id;
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      id = catalog.createIndex(createRequest("older", schema.formatted(""))).getIndexId();
+    }
+    var catalogFile = dir.resolve("indexes.json");
+    // Older catalogs predate schema and initialization records and the scoring generation flag.
+    var entries = BsonDocument.parse(Files.readString(catalogFile)).getArray("entries");
+    entries.get(0).asDocument().remove("mappingVersion");
+    Files.writeString(catalogFile, new BsonDocument("indexes", entries).toJson());
+    var update =
+        UpdateIndexRequest.newBuilder()
+            .setIndexId(id)
+            .setExpectedRevision(1)
+            .setDefinitionBson(
+                createRequest("older", schema.formatted(",extra:{type:'number'}"))
+                    .getDefinitionBson());
+    try (var catalog = new LocalIndexCatalog(dir)) {
+      var preserve = catalog.planUpdate(update.build());
+      var rebuild =
+          catalog.planUpdate(
+              update
+                  .setUpdateMode(
+                      com.xgen.mongot.standalone.grpc.IndexUpdateMode
+                          .INDEX_UPDATE_MODE_REBUILD_EMPTY)
+                  .build());
+      assertThat(preserve.compatibility().kind())
+          .isEqualTo(IndexUpdateCompatibility.Kind.PRESERVE_CONTENT);
+      assertThat(preserve.candidate().asSearchDefinition().getMappingVersion())
+          .isEqualTo(MappingVersion.LEGACY);
+      assertThat(rebuild.candidate().asSearchDefinition().getMappingVersion())
+          .isEqualTo(MappingVersion.SCOPED);
+    }
+  }
 
   @Test
   public void createIndex_moreThan64Indexes_persistsAcrossRestart() throws Exception {

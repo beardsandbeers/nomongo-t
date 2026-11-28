@@ -2,6 +2,7 @@ package com.xgen.mongot.index.lucene;
 
 import com.xgen.mongot.index.definition.FieldDefinition;
 import com.xgen.mongot.index.definition.NumberFieldDefinition;
+import com.xgen.mongot.index.definition.NumericFieldOptions.Representation;
 import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.aggregation.AggregationFieldResolver;
@@ -108,7 +109,17 @@ public final class LuceneAggregationContextFieldResolver implements AggregationF
     NumberFieldDefinition numberFieldDef = getNumberFieldDefinition(path, returnScope);
     FieldName.TypeField typeField = getNumericTypeField(numberFieldDef);
     return new ResolvedNumericMetricField(
-        typeField.getLuceneFieldName(path, returnScope), numberFieldDef.options().representation());
+        typeField.getLuceneFieldName(path, returnScope),
+        numberFieldDef.options().representation(),
+        this.facetContext
+                .getFieldDefinitionResolver()
+                .hasBothNumericRepresentations(path, returnScope)
+            ? Optional.of(
+                (typeField == FieldName.TypeField.NUMBER_INT64_V2
+                        ? FieldName.TypeField.NUMBER_DOUBLE_V2
+                        : FieldName.TypeField.NUMBER_INT64_V2)
+                    .getLuceneFieldName(path, returnScope))
+            : Optional.empty());
   }
 
   /**
@@ -175,12 +186,7 @@ public final class LuceneAggregationContextFieldResolver implements AggregationF
    */
   private Set<FieldName.TypeField> readableDocValuesTypes(
       FieldPath path, Optional<FieldPath> returnScope) throws InvalidQueryException {
-    Optional<FieldDefinition> fieldDefinition =
-        this.facetContext.getFieldDefinitionResolver().getFieldDefinition(path, returnScope);
-    if (fieldDefinition.isEmpty()) {
-      return Set.of();
-    }
-    FieldDefinition definition = fieldDefinition.get();
+    var resolver = this.facetContext.getFieldDefinitionResolver();
     boolean supportsObjectIdAndBooleanDocValues =
         this.facetContext
             .getFieldDefinitionResolver()
@@ -188,22 +194,43 @@ public final class LuceneAggregationContextFieldResolver implements AggregationF
             .supportsObjectIdAndBooleanDocValues();
 
     EnumSet<FieldName.TypeField> types = EnumSet.of(FieldName.TypeField.NULL);
-    if (definition.tokenFieldDefinition().isPresent()) {
+    if (resolver
+        .getQueryFieldDefinition(path, returnScope, FieldDefinition::tokenFieldDefinition)
+        .isPresent()) {
       types.add(FieldName.TypeField.TOKEN);
     }
-    if (definition.dateFieldDefinition().isPresent()) {
+    if (resolver
+        .getQueryFieldDefinition(path, returnScope, FieldDefinition::dateFieldDefinition)
+        .isPresent()) {
       types.add(FieldName.TypeField.DATE_V2);
     }
-    if (definition.uuidFieldDefinition().isPresent()) {
+    if (resolver
+        .getQueryFieldDefinition(path, returnScope, FieldDefinition::uuidFieldDefinition)
+        .isPresent()) {
       types.add(FieldName.TypeField.UUID);
     }
-    if (definition.numberFieldDefinition().isPresent()) {
-      types.add(getNumericTypeField(definition.numberFieldDefinition().get()));
+    for (var representation : Representation.values()) {
+      resolver
+          .getQueryFieldDefinition(
+              path,
+              returnScope,
+              field ->
+                  field
+                      .numberFieldDefinition()
+                      .filter(number -> number.options().representation() == representation))
+          .map(LuceneAggregationContextFieldResolver::getNumericTypeField)
+          .ifPresent(types::add);
     }
-    if (definition.booleanFieldDefinition().isPresent() && supportsObjectIdAndBooleanDocValues) {
+    if (resolver
+            .getQueryFieldDefinition(path, returnScope, FieldDefinition::booleanFieldDefinition)
+            .isPresent()
+        && supportsObjectIdAndBooleanDocValues) {
       types.add(FieldName.TypeField.BOOLEAN);
     }
-    if (definition.objectIdFieldDefinition().isPresent() && supportsObjectIdAndBooleanDocValues) {
+    if (resolver
+            .getQueryFieldDefinition(path, returnScope, FieldDefinition::objectIdFieldDefinition)
+            .isPresent()
+        && supportsObjectIdAndBooleanDocValues) {
       types.add(FieldName.TypeField.OBJECT_ID);
     }
 
@@ -232,11 +259,10 @@ public final class LuceneAggregationContextFieldResolver implements AggregationF
           "Numeric aggregation over embedded documents is not supported.");
     }
 
-    Optional<FieldDefinition> maybeFieldDef =
-        this.facetContext.getFieldDefinitionResolver().getFieldDefinition(path, returnScope);
-
-    Optional<NumberFieldDefinition> numberFieldDef =
-        maybeFieldDef.flatMap(FieldDefinition::numberFieldDefinition);
+    var numberFieldDef =
+        this.facetContext
+            .getFieldDefinitionResolver()
+            .getQueryFieldDefinition(path, returnScope, FieldDefinition::numberFieldDefinition);
 
     if (numberFieldDef.isEmpty()) {
       throwFieldNotIndexed(path.toString(), "number", returnScope);
@@ -251,7 +277,7 @@ public final class LuceneAggregationContextFieldResolver implements AggregationF
    * FieldName.TypeField#NUMBER_INT64_V2} / {@link FieldName.TypeField#NUMBER_DOUBLE_V2}), not
    * legacy number facet fields used by non-search-agg facet queries.
    */
-  private static FieldName.TypeField getNumericTypeField(NumberFieldDefinition numberFieldDef) {
+  static FieldName.TypeField getNumericTypeField(NumberFieldDefinition numberFieldDef) {
     return switch (numberFieldDef.options().representation()) {
       case DOUBLE -> FieldName.TypeField.NUMBER_DOUBLE_V2;
       case INT64 -> FieldName.TypeField.NUMBER_INT64_V2;

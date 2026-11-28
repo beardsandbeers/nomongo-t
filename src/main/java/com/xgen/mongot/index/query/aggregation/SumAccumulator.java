@@ -5,8 +5,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import org.apache.lucene.index.DocValues;
-import org.apache.lucene.index.SortedNumericDocValues;
 
 /** Lucene leaf accumulator for the {@code sum} aggregation operator. */
 final class SumAccumulator extends Accumulator {
@@ -22,9 +20,7 @@ final class SumAccumulator extends Accumulator {
 
   @Override
   public LeafBucketCollector getLeafCollector(AggregationContext context) throws IOException {
-    SortedNumericDocValues values =
-        DocValues.getSortedNumeric(
-            context.getLeafReaderContext().reader(), this.metricField.luceneFieldName());
+    var values = this.metricField.singleValues(context.getLeafReaderContext().reader());
     return new LeafBucketCollector() {
       @Override
       public void collect(int doc, long owningBucketOrd) throws IOException {
@@ -34,13 +30,11 @@ final class SumAccumulator extends Accumulator {
           return;
         }
         // Metric field is multi-valued or missing: only single-valued docs contribute.
-        if (!values.advanceExact(doc) || values.docValueCount() != 1) {
+        if (!values.advanceExact(doc)) {
           return;
         }
         int bucketOrd = Math.toIntExact(owningBucketOrd);
-        var representation = SumAccumulator.this.metricField.representation();
-        SumAccumulator.this.sums.increment(
-            bucketOrd, NumericMetricValues.decode(values.nextValue(), representation));
+        SumAccumulator.this.sums.increment(bucketOrd, values.doubleValue());
       }
     };
   }

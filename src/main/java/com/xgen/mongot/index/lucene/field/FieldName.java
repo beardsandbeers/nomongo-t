@@ -202,6 +202,9 @@ public class FieldName {
     UUID("uuid");
 
     private static final String PREFIX = "$type:";
+    // Lucene registers schemas before analysis finishes. Distinct physical names let the first
+    // successful document choose a different length from an earlier rejected document.
+    private static final String INFERRED_PREFIX = "$inferred:";
 
     private static final String DELIMITER = "/";
 
@@ -221,14 +224,33 @@ public class FieldName {
       this.fieldPrefix = PREFIX + fieldType;
     }
 
+    public String getInferredVectorFieldName(FieldPath path, int dimensions) {
+      return INFERRED_PREFIX + dimensions + ":" + getLuceneFieldName(path, Optional.empty());
+    }
+
+    public static boolean isInferredVectorField(String name) {
+      return name.startsWith(INFERRED_PREFIX);
+    }
+
+    private static String withoutScope(String fieldName) {
+      if (isInferredVectorField(fieldName)) {
+        int separator = fieldName.indexOf(':', INFERRED_PREFIX.length());
+        return separator < 0 ? fieldName : fieldName.substring(separator + 1);
+      }
+      return EmbeddedField.stripPrefix(fieldName);
+    }
+
+    /** Packed bit vectors occupy one Lucene byte dimension per eight BSON dimensions. */
+    public int logicalVectorDimensions(int luceneDimensions) {
+      return this == KNN_BIT ? Math.multiplyExact(Byte.SIZE, luceneDimensions) : luceneDimensions;
+    }
+
     public static Optional<TypeField> getTypeOf(String luceneField) {
-      // Strip embedded prefix from the luceneField
-      String strippedField = EmbeddedField.stripPrefix(luceneField);
+      String strippedField = withoutScope(luceneField);
 
       // Extract up to the first occurrence of DELIMITER for lookup
       int index = strippedField.indexOf(DELIMITER);
-      if (index == -1 || index + DELIMITER.length() >= strippedField.length()) {
-        // Return empty if no delimiter or if there's no content after the delimiter
+      if (index == -1) {
         return Optional.empty();
       }
 
@@ -242,7 +264,7 @@ public class FieldName {
     }
 
     public boolean isTypeOf(String luceneField) {
-      String luceneFieldNoEmbedded = EmbeddedField.stripPrefix(luceneField);
+      String luceneFieldNoEmbedded = withoutScope(luceneField);
       return luceneFieldNoEmbedded.startsWith(this.fieldPrefix + DELIMITER);
     }
 
@@ -256,8 +278,7 @@ public class FieldName {
             String.format("cannot strip %s field name prefix from %s field", this, luceneField));
       }
 
-      return EmbeddedField.stripPrefix(luceneField)
-          .substring(this.fieldPrefix.length() + DELIMITER.length());
+      return withoutScope(luceneField).substring(this.fieldPrefix.length() + DELIMITER.length());
     }
   }
 

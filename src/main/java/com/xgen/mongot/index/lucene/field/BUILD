@@ -5,6 +5,7 @@ java_library(
     srcs = [
         "FieldName.java",
         "FieldValue.java",
+        "MappingObservations.java",
     ],
     visibility = ["//visibility:public"],
     exports = [
@@ -14,6 +15,7 @@ java_library(
     deps = [
         "//src/main/java/com/xgen/mongot/index/path/string",
         "//src/main/java/com/xgen/mongot/util",
+        "@maven//:com_google_errorprone_error_prone_annotations",
         "@maven//:com_google_guava_guava",
         "@maven//:org_apache_lucene_lucene_core",
         "@maven//:org_apache_lucene_lucene_facet",

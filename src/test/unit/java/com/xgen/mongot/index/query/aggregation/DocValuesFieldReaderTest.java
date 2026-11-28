@@ -205,6 +205,24 @@ public class DocValuesFieldReaderTest {
         .containsExactly(new BsonString("dublin"));
   }
 
+  @Test
+  public void read_numericAliases_orderAcrossBothEncodingsWithoutRounding() throws IOException {
+    long integer = 9_007_199_254_740_993L;
+    double smaller = 9_007_199_254_740_992d;
+    openIndex(
+        document(int64Field(-2), doubleField(1.5), doubleField(smaller), int64Field(integer)));
+    var types = Set.of(TypeField.NUMBER_INT64_V2, TypeField.NUMBER_DOUBLE_V2);
+
+    assertThat(read(types, 0).orElseThrow().asArray().getValues())
+        .containsExactly(
+            new BsonInt64(-2), new BsonDouble(1.5), new BsonDouble(smaller), new BsonInt64(integer))
+        .inOrder();
+    assertThat(columns(types, Selection.MIN).getFirst().values(0))
+        .containsExactly(new BsonInt64(-2));
+    assertThat(columns(types, Selection.MAX).getFirst().values(0))
+        .containsExactly(new BsonInt64(integer));
+  }
+
   /**
    * The reader declares its column order rather than computing it, so this checks the declaration
    * against the real bracket table: reading the columns in order has to walk BSON brackets upwards,

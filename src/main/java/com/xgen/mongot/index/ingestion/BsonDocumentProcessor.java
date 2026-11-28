@@ -110,9 +110,15 @@ public class BsonDocumentProcessor {
         }
 
         if (binarySubtype == BsonVectorParser.VECTOR_SUB_TYPE) {
+          // Static mappings retain the legacy decoder. Both suppliers read only on demand.
           try (var supplier =
-              ResettingLazySupplier.create(bsonReader, BsonDocumentProcessor::readBsonVector)) {
+              ResettingLazySupplier.create(
+                  bsonReader, reader -> parseBsonVector(reader.readBinaryData()))) {
             fieldValueHandler.handleKnnVector(supplier);
+          }
+          try (var supplier =
+              ResettingLazySupplier.create(bsonReader, BsonDocumentProcessor::readTypeSetVector)) {
+            fieldValueHandler.handleBsonVector(supplier, bsonReader.peekBinarySize());
           }
         }
 
@@ -183,8 +189,12 @@ public class BsonDocumentProcessor {
     return new Binary(bsonBinary.getType(), bsonBinary.getData());
   }
 
-  private static Optional<Vector> readBsonVector(BsonReader bsonReader) {
-    BsonBinary bsonBinary = bsonReader.readBinaryData();
+  private static Optional<Vector> readTypeSetVector(BsonReader reader) {
+    BsonBinary binary = reader.readBinaryData();
+    return BsonVectorParser.hasIndexableHeader(binary) ? parseBsonVector(binary) : Optional.empty();
+  }
+
+  private static Optional<Vector> parseBsonVector(BsonBinary bsonBinary) {
     try {
       return Optional.of(BsonVectorParser.parse(bsonBinary));
     } catch (BSONException e) {

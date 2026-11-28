@@ -195,6 +195,8 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
     var definition = index.getDefinition();
     var searchIndexProperties = index.getSearchIndexProperties();
     var liveSchema = index.liveSchema();
+    var resolver =
+        definition.createFieldDefinitionResolver(searchIndexProperties.indexFormatVersion);
     var indexMetricsUpdaterBuilder =
         new IndexMetricsUpdater.Builder(
             index.getDefinition(),
@@ -235,8 +237,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
                     searchIndexProperties.fieldLimit,
                     searchIndexProperties.docsLimit,
                     liveSchema.map(LiveSearchSchema::writerAnalyzer).orElse(indexAnalyzer),
-                    definition.createFieldDefinitionResolver(
-                        searchIndexProperties.indexFormatVersion),
+                    resolver,
                     indexMetricsUpdaterBuilder.getIndexingMetricsUpdater(),
                     luceneIndexSnapshotter.map(
                         snapshotter -> snapshotter.getSnapshotDeletionPolicy(indexPartitionId)),
@@ -261,8 +262,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
       searchIndexReaders.add(
           LuceneSearchIndexReader.create(
               indexResources.luceneSearcherManagers.get(i),
-              definition,
-              searchIndexProperties.indexFormatVersion,
+              resolver,
               searchIndexProperties.analyzerRegistry,
               searchIndexProperties.synonymRegistry,
               indexAnalyzer,
@@ -336,7 +336,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
         schema ->
             initialized.schemaPreparer =
                 (nextDefinition, registry) -> {
-                  var next = schema.prepare(nextDefinition, registry);
+                  var next = schema.prepare(nextDefinition, registry, resolver.vectorDimensions());
                   var writeUpdate =
                       indexResources.luceneIndexWriter.prepareSchemaUpdate(
                           next.analyzer(), next.resolver());
@@ -350,8 +350,7 @@ class InitializedLuceneSearchIndex implements InitializedSearchIndex {
                     readers.add(
                         LuceneSearchIndexReader.create(
                             indexResources.luceneSearcherManagers.get(partition),
-                            next.definition(),
-                            searchIndexProperties.indexFormatVersion,
+                            next.resolver(),
                             next.registry(),
                             searchIndexProperties.synonymRegistry,
                             next.analyzer(),

@@ -239,10 +239,17 @@ public class AggregationValidator {
             "Multi-typed aggregation over embedded documents is not supported.");
       }
       FieldPath path = metric.path().orElseThrow();
-      Optional<FieldDefinition> fieldDef =
-          fieldDefinitionResolver.getFieldDefinition(path, returnScope);
-      if (fieldDef.isEmpty()
-          || !fieldDef.get().hasAnyFieldDefinitionOf(FieldDefinition.getIndexingSortableTypes())) {
+      if (fieldDefinitionResolver
+          .getQueryFieldDefinition(
+              path,
+              returnScope,
+              field ->
+                  Optional.of(field)
+                      .filter(
+                          f ->
+                              f.hasAnyFieldDefinitionOf(
+                                  FieldDefinition.getIndexingSortableTypes())))
+          .isEmpty()) {
         throw new AggregationValidationException(
             String.format(
                 "Cannot use a min/max aggregation on field \"%s\" because it was not indexed as any"
@@ -299,18 +306,26 @@ public class AggregationValidator {
       SearchFieldDefinitionResolver fieldDefinitionResolver,
       Optional<FieldPath> returnScope)
       throws AggregationValidationException {
-    Optional<FieldDefinition> fieldDefinition =
-        fieldDefinitionResolver.getFieldDefinition(path, returnScope);
     boolean legacyOnly =
         switch (boundary) {
           case FacetDefinition.NumericFacetDefinition ignored ->
-              fieldDefinition.flatMap(FieldDefinition::numberFieldDefinition).isEmpty()
-                  && fieldDefinition
-                      .flatMap(FieldDefinition::numberFacetFieldDefinition)
+              fieldDefinitionResolver
+                      .getQueryFieldDefinition(
+                          path, returnScope, FieldDefinition::numberFieldDefinition)
+                      .isEmpty()
+                  && fieldDefinitionResolver
+                      .getQueryFieldDefinition(
+                          path, returnScope, FieldDefinition::numberFacetFieldDefinition)
                       .isPresent();
           case FacetDefinition.DateFacetDefinition ignored ->
-              fieldDefinition.flatMap(FieldDefinition::dateFieldDefinition).isEmpty()
-                  && fieldDefinition.flatMap(FieldDefinition::dateFacetFieldDefinition).isPresent();
+              fieldDefinitionResolver
+                      .getQueryFieldDefinition(
+                          path, returnScope, FieldDefinition::dateFieldDefinition)
+                      .isEmpty()
+                  && fieldDefinitionResolver
+                      .getQueryFieldDefinition(
+                          path, returnScope, FieldDefinition::dateFacetFieldDefinition)
+                      .isPresent();
         };
     if (legacyOnly) {
       throw new AggregationValidationException(

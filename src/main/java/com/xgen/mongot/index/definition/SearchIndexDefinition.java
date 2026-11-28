@@ -2,6 +2,9 @@ package com.xgen.mongot.index.definition;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
+import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
@@ -11,6 +14,7 @@ import com.xgen.mongot.index.analyzer.definition.StockNormalizerName;
 import com.xgen.mongot.index.query.sort.Sort;
 import com.xgen.mongot.index.version.IndexEngine;
 import com.xgen.mongot.index.version.IndexFormatVersion;
+import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.CollectionUtils;
 import com.xgen.mongot.util.FieldPath;
@@ -32,6 +36,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.collections4.Trie;
@@ -55,6 +60,13 @@ public final class SearchIndexDefinition implements IndexDefinition {
       StockAnalyzerNames.LUCENE_STANDARD.getName();
 
   public static final StockNormalizerName DEFAULT_FALLBACK_NORMALIZER = StockNormalizerName.NONE;
+
+  /** Physical analysis and scoring rules persisted with the generation that wrote its postings. */
+  public enum MappingVersion {
+    LEGACY,
+    TYPE_SET_SIMILARITY,
+    SCOPED
+  }
 
   public static class Fields {
 
@@ -85,6 +97,17 @@ public final class SearchIndexDefinition implements IndexDefinition {
 
     public static final Field.WithDefault<Integer> INDEX_FEATURE_VERSION =
         Field.builder("indexFeatureVersion").intField().optional().withDefault(0);
+
+    static final Field.Optional<MappingVersion> MAPPING_VERSION =
+        Field.builder("mappingVersion")
+            .enumField(MappingVersion.class)
+            .asCamelCase()
+            .optional()
+            .noDefault();
+
+    // The first type-set scoring implementation persisted a boolean generation marker.
+    static final Field.WithDefault<Boolean> TYPE_SET_SIMILARITY =
+        Field.builder("typeSetSimilarity").booleanField().optional().withDefault(false);
 
     static final Field.Optional<List<SynonymMappingDefinition>> SYNONYMS =
         Field.builder("synonyms")
@@ -121,9 +144,33 @@ public final class SearchIndexDefinition implements IndexDefinition {
   private final Optional<String> analyzerName;
   private final Optional<String> searchAnalyzerName;
   private final DocumentFieldDefinition mappings;
+  private final ImmutableListMultimap<String, EmbeddedScope> embeddedScopes;
+  private final Supplier<Boolean> hasTypeSetVectorFields =
+      Suppliers.memoize(() -> dynamicVectorFields().findAny().isPresent());
+  private final Supplier<Boolean> usesEmbeddedVectorTypeSet =
+      Suppliers.memoize(this::usesEmbeddedVectorTypeSet);
+  private final Supplier<Boolean> hasStaticBsonVectorOnlyFields =
+      Suppliers.memoize(() -> hasStaticBsonVectorOnlyFields(getMappings()));
+  private final Supplier<Boolean> hasAliasedFields = Suppliers.memoize(this::hasAliasedFields);
+  private final Supplier<FieldHierarchyContext> legacyFields =
+      Suppliers.memoize(() -> FieldHierarchyContext.legacy(getMappings()));
+  private final Supplier<Boolean> declaresVectorTypeSet =
+      Suppliers.memoize(
+          () ->
+              getTypeSetsMap().values().stream()
+                  .flatMap(set -> set.types().stream())
+                  .anyMatch(TypeSetVectorFieldDefinition.class::isInstance));
+  private final Supplier<Map<String, FieldDefinition>> dynamicTypeSets =
+      Suppliers.memoize(
+          () ->
+              getTypeSetsMap().values().stream()
+                  .collect(
+                      ImmutableMap.toImmutableMap(
+                          TypeSetDefinition::name, TypeSetDefinition::getFieldDefinition)));
   private final AutoEmbedFieldSet autoEmbedFields;
   private final Optional<List<CustomAnalyzerDefinition>> analyzers;
   private final int indexFeatureVersion;
+  private final MappingVersion mappingVersion;
   private final Optional<List<SynonymMappingDefinition>> synonyms;
   private final Optional<StoredSourceDefinition> storedSource;
   private final Optional<List<TypeSetDefinition>> typeSets;
@@ -162,6 +209,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
       Set<String> nonStockAnalyzerNames,
       Optional<List<CustomAnalyzerDefinition>> analyzers,
       int parsedIndexFeatureVersion,
+      MappingVersion mappingVersion,
       Optional<List<SynonymMappingDefinition>> synonyms,
       Optional<StoredSourceDefinition> storedSource,
       Optional<List<TypeSetDefinition>> typeSets,
@@ -187,6 +235,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
     this.nonStockAnalyzerNames = nonStockAnalyzerNames;
     this.analyzers = analyzers;
     this.indexFeatureVersion = parsedIndexFeatureVersion;
+    this.mappingVersion = mappingVersion;
     this.synonyms = synonyms;
     this.storedSource = storedSource;
     this.typeSets = typeSets;
@@ -200,6 +249,11 @@ public final class SearchIndexDefinition implements IndexDefinition {
                             CollectionUtils.toMapUnsafe(
                                 TypeSetDefinition::name, Function.identity())))
             .orElse(Collections.emptyMap());
+    var scopes = ImmutableListMultimap.<String, EmbeddedScope>builder();
+    if (hasEmbeddedFields()) {
+      collectEmbeddedScopes(this.mappings, Optional.empty(), scopes);
+    }
+    this.embeddedScopes = scopes.build();
     this.definitionVersion = definitionVersion;
     this.definitionVersionCreatedAt = definitionVersionCreatedAt;
     this.definitionVersionId = definitionVersionId;
@@ -267,6 +321,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         nonStockAnalyzerNames,
         analyzers,
         indexFeatureVersionNumber,
+        MappingVersion.LEGACY,
         synonyms,
         storedSource,
         typeSets,
@@ -286,13 +341,111 @@ public final class SearchIndexDefinition implements IndexDefinition {
    * @return a new SearchIndexDefinition instance with the updated view definition
    */
   public SearchIndexDefinition withUpdatedViewDefinition(ViewDefinition updatedViewDefinition) {
+    return copy(Optional.of(updatedViewDefinition), this.mappingVersion);
+  }
+
+  public MappingVersion getMappingVersion() {
+    return this.mappingVersion;
+  }
+
+  public SearchIndexDefinition withMappingVersion(MappingVersion version) {
+    return this.mappingVersion == version ? this : copy(this.view, version);
+  }
+
+  /** Keep the original on-disk format when no mapping can select different physical analyzers. */
+  public SearchIndexDefinition forNewGeneration() {
+    return withMappingVersion(
+        this.hasAliasedFields.get() || usesNamedTypeSet() || declaresVectorTypeSet()
+            ? MappingVersion.SCOPED
+            : MappingVersion.LEGACY);
+  }
+
+  /** An unused vector type set still needs a reader that understands its BSON schema. */
+  public boolean declaresVectorTypeSet() {
+    return this.declaresVectorTypeSet.get();
+  }
+
+  public boolean hasStaticBsonVectorOnlyFields() {
+    return this.hasStaticBsonVectorOnlyFields.get();
+  }
+
+  private static boolean hasStaticBsonVectorOnlyFields(HierarchicalFieldDefinition scope) {
+    return scope.fields().values().stream()
+        .anyMatch(
+            field ->
+                field
+                        .searchIndexVectorFieldDefinition()
+                        .filter(SearchIndexVectorFieldDefinition::bsonVectorOnly)
+                        .isPresent()
+                    || field
+                        .documentFieldDefinition()
+                        .filter(SearchIndexDefinition::hasStaticBsonVectorOnlyFields)
+                        .isPresent()
+                    || field
+                        .embeddedDocumentsFieldDefinition()
+                        .filter(SearchIndexDefinition::hasStaticBsonVectorOnlyFields)
+                        .isPresent());
+  }
+
+  private boolean usesNamedTypeSet() {
+    if (this.typeSetsMap.isEmpty()) return false;
+    var hierarchy = getFieldHierarchyContext();
+    return getMappings().dynamic() instanceof DynamicDefinition.Document
+        || Stream.concat(
+                hierarchy.getRootFields().values().stream(),
+                hierarchy.getFieldsByEmbeddedRoot().values().stream()
+                    .flatMap(scope -> scope.values().stream()))
+            .anyMatch(
+                field ->
+                    field
+                            .documentFieldDefinition()
+                            .filter(doc -> doc.dynamic() instanceof DynamicDefinition.Document)
+                            .isPresent()
+                        || field
+                            .embeddedDocumentsFieldDefinition()
+                            .filter(doc -> doc.dynamic() instanceof DynamicDefinition.Document)
+                            .isPresent());
+  }
+
+  private boolean hasAliasedFields() {
+    // A collision collapses two declarations into one entry in the per-scope dotted lookup.
+    var hierarchy = getFieldHierarchyContext();
+    int physical =
+        hierarchy.getRootFields().size()
+            + hierarchy.getFieldsByEmbeddedRoot().values().stream().mapToInt(Map::size).sum();
+    return countDeclaredFields(getMappings()) != physical;
+  }
+
+  private static int countDeclaredFields(HierarchicalFieldDefinition scope) {
+    return scope.fields().size()
+        + scope.fields().values().stream()
+            .mapToInt(
+                field ->
+                    field
+                            .documentFieldDefinition()
+                            .map(SearchIndexDefinition::countDeclaredFields)
+                            .orElse(0)
+                        + field
+                            .embeddedDocumentsFieldDefinition()
+                            .map(SearchIndexDefinition::countDeclaredFields)
+                            .orElse(0))
+            .sum();
+  }
+
+  public FieldHierarchyContext getAnalyzerHierarchy() {
+    return this.mappingVersion == MappingVersion.LEGACY && this.hasAliasedFields.get()
+        ? this.legacyFields.get()
+        : getFieldHierarchyContext();
+  }
+
+  private SearchIndexDefinition copy(Optional<ViewDefinition> view, MappingVersion mappingVersion) {
     return new SearchIndexDefinition(
         this.indexId,
         this.name,
         this.database,
         this.lastObservedCollectionName,
         this.collectionUuid,
-        Optional.of(updatedViewDefinition),
+        view,
         this.numPartitions,
         this.mappings,
         this.autoEmbedFields,
@@ -302,6 +455,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         this.nonStockAnalyzerNames,
         this.analyzers,
         this.indexFeatureVersion,
+        mappingVersion,
         this.synonyms,
         this.storedSource,
         this.typeSets,
@@ -341,31 +495,39 @@ public final class SearchIndexDefinition implements IndexDefinition {
     IndexSortValidator.validateSort(sort, mappings);
     validateAutoEmbedPathsDoNotOverlapMappings(mappings);
 
+    var version = parser.getField(Fields.MAPPING_VERSION).unwrap();
+    boolean previousScoring = parser.getField(Fields.TYPE_SET_SIMILARITY).unwrap();
+    if (version.isPresent() && previousScoring) {
+      return parser.getContext().handleSemanticError("Conflicting mapping generation markers");
+    }
     return create(
-        indexId,
-        parser.getField(IndexDefinition.Fields.NAME).unwrap(),
-        parser.getField(IndexDefinition.Fields.DATABASE).unwrap(),
-        parser.getField(IndexDefinition.Fields.LAST_OBSERVED_COLLECTION_NAME).unwrap(),
-        parser.getField(IndexDefinition.Fields.COLLECTION_UUID).unwrap(),
-        parser.getField(IndexDefinition.Fields.VIEW).unwrap(),
-        parser.getField(IndexDefinition.Fields.NUM_PARTITIONS).unwrap(),
-        mappings,
-        parser.getField(Fields.ANALYZER).unwrap(),
-        parser.getField(Fields.SEARCH_ANALYZER).unwrap(),
-        parser.getField(Fields.ANALYZERS).unwrap(),
-        // Initialize with the minimum of the 2 IndexFeatureVersions
-        Integer.min(parsedIndexFeatureVersion, SearchIndexCapabilities.CURRENT_FEATURE_VERSION),
-        parser.getField(Fields.SYNONYMS).unwrap(),
-        parser.getField(IndexDefinition.Fields.STORED_SOURCE).unwrap(),
-        typeSets,
-        sort,
-        parser.getField(IndexDefinition.Fields.DEFINITION_VERSION).unwrap(),
-        DateUtil.parseInstantFromString(
-            parser, DATE_FORMAT, IndexDefinition.Fields.DEFINITION_VERSION_CREATED_AT),
-        parser.getField(IndexDefinition.Fields.DEFINITION_VERSION_ID).unwrap(),
-        parser.getField(IndexDefinition.Fields.INDEX_ID_AT_CREATION_TIME).unwrap(),
-        parser.getField(IndexDefinition.Fields.AUTO_EMBEDDING_DEFINITION_VERSION).unwrap(),
-        parser.getField(IndexDefinition.Fields.MATERIALIZED_VIEW_NAME_FORMAT_VERSION).unwrap());
+            indexId,
+            parser.getField(IndexDefinition.Fields.NAME).unwrap(),
+            parser.getField(IndexDefinition.Fields.DATABASE).unwrap(),
+            parser.getField(IndexDefinition.Fields.LAST_OBSERVED_COLLECTION_NAME).unwrap(),
+            parser.getField(IndexDefinition.Fields.COLLECTION_UUID).unwrap(),
+            parser.getField(IndexDefinition.Fields.VIEW).unwrap(),
+            parser.getField(IndexDefinition.Fields.NUM_PARTITIONS).unwrap(),
+            mappings,
+            parser.getField(Fields.ANALYZER).unwrap(),
+            parser.getField(Fields.SEARCH_ANALYZER).unwrap(),
+            parser.getField(Fields.ANALYZERS).unwrap(),
+            // Initialize with the minimum of the 2 IndexFeatureVersions
+            Integer.min(parsedIndexFeatureVersion, SearchIndexCapabilities.CURRENT_FEATURE_VERSION),
+            parser.getField(Fields.SYNONYMS).unwrap(),
+            parser.getField(IndexDefinition.Fields.STORED_SOURCE).unwrap(),
+            typeSets,
+            sort,
+            parser.getField(IndexDefinition.Fields.DEFINITION_VERSION).unwrap(),
+            DateUtil.parseInstantFromString(
+                parser, DATE_FORMAT, IndexDefinition.Fields.DEFINITION_VERSION_CREATED_AT),
+            parser.getField(IndexDefinition.Fields.DEFINITION_VERSION_ID).unwrap(),
+            parser.getField(IndexDefinition.Fields.INDEX_ID_AT_CREATION_TIME).unwrap(),
+            parser.getField(IndexDefinition.Fields.AUTO_EMBEDDING_DEFINITION_VERSION).unwrap(),
+            parser.getField(IndexDefinition.Fields.MATERIALIZED_VIEW_NAME_FORMAT_VERSION).unwrap())
+        .withMappingVersion(
+            version.orElse(
+                previousScoring ? MappingVersion.TYPE_SET_SIMILARITY : MappingVersion.LEGACY));
   }
 
   @Override
@@ -385,6 +547,13 @@ public final class SearchIndexDefinition implements IndexDefinition {
         .field(Fields.ANALYZERS, this.analyzers)
         .field(Fields.SYNONYMS, this.synonyms)
         .field(Fields.INDEX_FEATURE_VERSION, this.indexFeatureVersion)
+        .fieldOmitDefaultValue(
+            Fields.TYPE_SET_SIMILARITY, this.mappingVersion == MappingVersion.TYPE_SET_SIMILARITY)
+        .field(
+            Fields.MAPPING_VERSION,
+            this.mappingVersion == MappingVersion.SCOPED
+                ? Optional.of(this.mappingVersion)
+                : Optional.empty())
         .field(IndexDefinition.Fields.STORED_SOURCE, this.storedSource)
         .field(Fields.TYPE_SETS, this.typeSets)
         .field(Fields.SORT, this.sort)
@@ -527,6 +696,50 @@ public final class SearchIndexDefinition implements IndexDefinition {
     return new SearchIndexCapabilities(version, this.indexFeatureVersion);
   }
 
+  /**
+   * Vector rules reachable through ordinary document mappings, where Search indexes BSON vectors.
+   */
+  public Stream<TypeSetVectorFieldDefinition> dynamicVectorFields() {
+    return dynamicVectorFields(getMappings());
+  }
+
+  private Stream<TypeSetVectorFieldDefinition> dynamicVectorFields(
+      HierarchicalFieldDefinition scope) {
+    if (this.typeSetsMap.isEmpty()) {
+      return Stream.empty();
+    }
+    return ordinaryDocuments(scope)
+        .map(HierarchicalFieldDefinition::dynamic)
+        .filter(DynamicDefinition.Document.class::isInstance)
+        .map(DynamicDefinition.Document.class::cast)
+        .map(dynamic -> this.typeSetsMap.get(dynamic.typeSet()))
+        .distinct()
+        .flatMap(set -> set.types().stream())
+        .filter(TypeSetVectorFieldDefinition.class::isInstance)
+        .map(TypeSetVectorFieldDefinition.class::cast);
+  }
+
+  private static Stream<HierarchicalFieldDefinition> ordinaryDocuments(
+      HierarchicalFieldDefinition document) {
+    return Stream.concat(
+        Stream.of(document),
+        document.fields().values().stream()
+            .flatMap(field -> field.documentFieldDefinition().stream())
+            .flatMap(SearchIndexDefinition::ordinaryDocuments));
+  }
+
+  public Optional<FieldDefinition> getDynamicFieldDefinition(HierarchicalFieldDefinition scope) {
+    return switch (scope.dynamic()) {
+      case DynamicDefinition.Boolean bool ->
+          bool.value() ? Optional.of(FieldDefinition.DYNAMIC_FIELD_DEFINITION) : Optional.empty();
+      case DynamicDefinition.Document doc ->
+          Optional.of(
+              Check.isPresent(
+                  Optional.ofNullable(this.dynamicTypeSets.get().get(doc.typeSet())),
+                  "matchingTypeSet"));
+    };
+  }
+
   public boolean isStringFacetsFieldIndexed() {
     return !this.getStaticFieldDefinitionsOfType(FieldDefinition::stringFacetFieldDefinition)
         .isEmpty();
@@ -540,6 +753,55 @@ public final class SearchIndexDefinition implements IndexDefinition {
         .map(entry -> typeFilter.apply(entry.getValue()).map(val -> Map.entry(entry.getKey(), val)))
         .flatMap(Optional::stream)
         .collect(Collectors.toSet());
+  }
+
+  public record EmbeddedScope(
+      ImmutableList<String> keys, EmbeddedDocumentsFieldDefinition mapping) {}
+
+  public ImmutableList<EmbeddedScope> embeddedScopes(String dottedRoot) {
+    return this.embeddedScopes.get(dottedRoot);
+  }
+
+  public boolean hasTypeSetVectorFields() {
+    return this.hasTypeSetVectorFields.get();
+  }
+
+  private boolean usesEmbeddedVectorTypeSet() {
+    // Embedded documents can use the scalar entries in a vector type set. Their literal and
+    // nested keys still need exact export metadata, even though they do not index vectors.
+    return declaresVectorTypeSet()
+        && this.embeddedScopes.values().stream()
+            .anyMatch(scope -> dynamicVectorFields(scope.mapping()).findAny().isPresent());
+  }
+
+  public boolean requiresMappingObservations() {
+    return hasTypeSetVectorFields()
+        || this.usesEmbeddedVectorTypeSet.get()
+        || this.embeddedScopes.size() > this.embeddedScopes.keySet().size();
+  }
+
+  private static void collectEmbeddedScopes(
+      HierarchicalFieldDefinition parent,
+      Optional<FieldPath> prefix,
+      ImmutableListMultimap.Builder<String, EmbeddedScope> scopes) {
+    parent
+        .fields()
+        .forEach(
+            (name, field) -> {
+              var path = prefix.map(p -> p.newChild(name)).orElseGet(() -> FieldPath.newRoot(name));
+              field
+                  .documentFieldDefinition()
+                  .ifPresent(doc -> collectEmbeddedScopes(doc, Optional.of(path), scopes));
+              field
+                  .embeddedDocumentsFieldDefinition()
+                  .ifPresent(
+                      embedded -> {
+                        scopes.put(
+                            path.toString(),
+                            new EmbeddedScope(ImmutableList.copyOf(path.getSegments()), embedded));
+                        collectEmbeddedScopes(embedded, Optional.of(path), scopes);
+                      });
+            });
   }
 
   /** Returns the fields in the static configuration. */
@@ -688,6 +950,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
     SearchIndexDefinition that = (SearchIndexDefinition) o;
     return this.numPartitions == that.numPartitions
         && this.indexFeatureVersion == that.indexFeatureVersion
+        && this.mappingVersion == that.mappingVersion
         && Objects.equal(this.indexId, that.indexId)
         && Objects.equal(this.name, that.name)
         && Objects.equal(this.database, that.database)
@@ -735,6 +998,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
         this.mappings,
         this.analyzers,
         this.indexFeatureVersion,
+        this.mappingVersion,
         this.synonyms,
         this.storedSource,
         this.typeSets,
@@ -932,7 +1196,7 @@ public final class SearchIndexDefinition implements IndexDefinition {
           path.map(p -> p.newChild(entry.getKey()))
               .orElseGet(() -> FieldPath.parse(entry.getKey()));
 
-      fields.put(childPath.toString(), childDefinition);
+      fields.merge(childPath.toString(), childDefinition, FieldDefinition::mergeQueryAliases);
 
       if (childDefinition.documentFieldDefinition().isPresent()) {
         registerFields(

@@ -1,7 +1,6 @@
 package com.xgen.mongot.index.query;
 
 import com.xgen.mongot.index.definition.DocumentFieldDefinition;
-import com.xgen.mongot.index.definition.FieldDefinition;
 import com.xgen.mongot.index.definition.GeoFieldDefinition;
 import com.xgen.mongot.index.definition.KnnVectorFieldDefinition;
 import com.xgen.mongot.index.definition.SearchFieldDefinitionResolver;
@@ -122,31 +121,8 @@ public class SearchQueryTimeMappingChecksTest {
     var path = FieldPath.newRoot("foo");
     var embeddedRoot = FieldPath.newRoot("bar");
     var definition = new KnnVectorFieldDefinition(100, VectorSimilarity.EUCLIDEAN);
-    var fieldDefinition =
-        new FieldDefinition(
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.of(definition),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty());
-
-    Mockito.when(resolver.getFieldDefinition(path, Optional.of(embeddedRoot)))
-        .thenReturn(Optional.of(fieldDefinition));
+    Mockito.when(resolver.getVectorFieldSpecification(path, Optional.of(embeddedRoot)))
+        .thenReturn(Optional.of(definition.specification()));
 
     checks.validateVectorField(path, Optional.of(embeddedRoot), 100);
   }
@@ -158,31 +134,8 @@ public class SearchQueryTimeMappingChecksTest {
     var path = FieldPath.newRoot("foo");
     var embeddedRoot = FieldPath.newRoot("bar");
     var definition = new KnnVectorFieldDefinition(100, VectorSimilarity.EUCLIDEAN);
-    var fieldDefinition =
-        new FieldDefinition(
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.of(definition),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty());
-
-    Mockito.when(resolver.getFieldDefinition(path, Optional.of(embeddedRoot)))
-        .thenReturn(Optional.of(fieldDefinition));
+    Mockito.when(resolver.getVectorFieldSpecification(path, Optional.of(embeddedRoot)))
+        .thenReturn(Optional.of(definition.specification()));
 
     TestUtils.assertThrows(
         "vector field is indexed with 100 dimensions but queried with 999",
@@ -200,10 +153,7 @@ public class SearchQueryTimeMappingChecksTest {
     var path = FieldPath.newRoot("foo");
     var embeddedRoot = FieldPath.newRoot("bar");
 
-    Mockito.when(
-            resolver
-                .getFieldDefinition(path, Optional.of(embeddedRoot))
-                .flatMap(FieldDefinition::knnVectorFieldDefinition))
+    Mockito.when(resolver.getVectorFieldSpecification(path, Optional.of(embeddedRoot)))
         .thenReturn(Optional.empty());
 
     TestUtils.assertThrows(

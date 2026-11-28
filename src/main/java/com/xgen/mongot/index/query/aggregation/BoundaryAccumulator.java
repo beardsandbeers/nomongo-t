@@ -8,6 +8,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.IntFunction;
+import org.apache.lucene.facet.MultiLongValues;
+import org.apache.lucene.facet.MultiLongValuesSource;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
@@ -23,6 +25,7 @@ import org.bson.BsonValue;
 final class BoundaryAccumulator extends BucketsAccumulator {
   private final FieldPath path;
   private final String luceneField;
+  private final Optional<NumericBucketOrdinals> bucketOrdinals;
   private final long[] edges; // encoded boundary edges, length numRanges + 1
   private final int numRanges;
   private final boolean lastEdgeInclusive;
@@ -41,6 +44,7 @@ final class BoundaryAccumulator extends BucketsAccumulator {
     this.path = spec.getPath();
     this.luceneField = typeField.getLuceneFieldName(this.path, Optional.empty());
     this.edges = spec.boundaryEdges();
+    this.bucketOrdinals = spec.bucketOrdinals();
     this.numRanges = this.edges.length - 1;
     this.lastEdgeInclusive = spec.lastEdgeInclusive();
     this.rangeKeys = spec.rangeKeys();
@@ -88,6 +92,9 @@ final class BoundaryAccumulator extends BucketsAccumulator {
   protected LeafBucketCollector getLeafCollector(
       AggregationContext context, LeafBucketCollector children) throws IOException {
     LeafReaderContext leaf = context.getLeafReaderContext();
+    if (this.bucketOrdinals.isPresent()) {
+      return collectMultiple(context, children, this.bucketOrdinals.get().getValues(leaf));
+    }
     SortedNumericDocValues values = DocValues.getSortedNumeric(leaf.reader(), this.luceneField);
 
     // Single-valued fast path (V1 facet fields, or any single-valued V2 field).
@@ -111,6 +118,12 @@ final class BoundaryAccumulator extends BucketsAccumulator {
       };
     }
 
+    return collectMultiple(
+        context, children, MultiLongValuesSource.fromLongField(this.luceneField).getValues(leaf));
+  }
+
+  private LeafBucketCollector collectMultiple(
+      AggregationContext context, LeafBucketCollector children, MultiLongValues values) {
     // Multi-valued path (V2 SortedNumericDocValues). Values arrive sorted ascending, so the matched
     // range index is monotonic non-decreasing; the lastRange guard de-dupes a doc that has several
     // values in the same range.
@@ -121,13 +134,13 @@ final class BoundaryAccumulator extends BucketsAccumulator {
           collectDefault(children, doc, owningBucketOrd);
           return;
         }
-        int count = values.docValueCount();
+        long count = values.getValueCount();
         if (count > 1) {
           context.markMultiValued(doc);
         }
         @Var int lastRange = -1;
         @Var boolean matchedAny = false;
-        for (int i = 0; i < count; i++) {
+        for (long i = 0; i < count; i++) {
           int r = rangeIndexOf(values.nextValue());
           if (r >= 0 && r != lastRange) {
             collectBucket(children, doc, childBucketOrd(owningBucketOrd, r));

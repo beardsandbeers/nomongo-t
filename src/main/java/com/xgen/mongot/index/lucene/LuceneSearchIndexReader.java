@@ -67,7 +67,6 @@ import com.xgen.mongot.index.query.sort.SequenceToken;
 import com.xgen.mongot.index.query.sort.SortSpec;
 import com.xgen.mongot.index.query.sort.UserFieldSortOptions;
 import com.xgen.mongot.index.synonym.SynonymRegistry;
-import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.Check;
 import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.FieldPath;
@@ -239,8 +238,7 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
 
   static LuceneSearchIndexReader create(
       LuceneSearcherManager searcherManager,
-      SearchIndexDefinition indexDefinition,
-      IndexFormatVersion indexFormatVersion,
+      SearchFieldDefinitionResolver fieldDefinitionResolver,
       AnalyzerRegistry analyzerRegistry,
       SynonymRegistry synonymRegistry,
       Analyzer indexAnalyzer,
@@ -252,24 +250,21 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
       int indexPartitionId,
       FeatureFlags featureFlags,
       DynamicFeatureFlagRegistry dynamicFeatureFlagRegistry) {
+    var indexDefinition = fieldDefinitionResolver.indexDefinition;
     LuceneSearchQueryFactoryDistributor queryFactory =
         LuceneSearchQueryFactoryDistributor.create(
-            indexDefinition,
-            indexFormatVersion,
+            fieldDefinitionResolver,
             analyzerRegistry,
             synonymRegistry,
             queryingMetricsUpdater,
             enableTextOperatorNewSynonymsSyntax,
             featureFlags,
             dynamicFeatureFlagRegistry);
-    SearchFieldDefinitionResolver fieldDefinitionResolver =
-        indexDefinition.createFieldDefinitionResolver(indexFormatVersion);
 
     LuceneHighlighterContext highlighterContext =
         new LuceneHighlighterContext(fieldDefinitionResolver, indexAnalyzer);
     LuceneFacetContext facetContext =
-        new LuceneFacetContext(
-            fieldDefinitionResolver, indexDefinition.getIndexCapabilities(indexFormatVersion));
+        new LuceneFacetContext(fieldDefinitionResolver, fieldDefinitionResolver.indexCapabilities);
     return create(
         queryFactory,
         searcherManager,
@@ -924,8 +919,11 @@ public class LuceneSearchIndexReader implements SearchIndexReader {
         throw ReaderClosedException.create("getFieldInfos");
       }
       try (var searcherReference = createSearcherReference(false)) {
+        var fields =
+            FieldInfos.getMergedFieldInfos(searcherReference.getIndexSearcher().getIndexReader());
         return List.of(
-            FieldInfos.getMergedFieldInfos(searcherReference.getIndexSearcher().getIndexReader()));
+            LuceneIndexMappingExporter.publishedFields(
+                fields, this.facetContext.getFieldDefinitionResolver()));
       }
     }
   }

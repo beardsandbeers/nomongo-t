@@ -184,6 +184,7 @@ public class FieldDefinitionBuilder {
         this.stringFieldDefinition,
         this.stringFacetFieldDefinition,
         this.tokenFieldDefinition,
-        this.uuidFieldDefinition);
+        this.uuidFieldDefinition,
+        Optional.empty());
   }
 }

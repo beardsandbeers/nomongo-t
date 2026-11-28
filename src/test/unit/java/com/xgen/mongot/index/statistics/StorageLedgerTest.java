@@ -3,6 +3,7 @@ package com.xgen.mongot.index.statistics;
 import static com.google.common.truth.Truth.assertThat;
 
 import java.util.List;
+import java.util.Optional;
 import org.junit.Test;
 
 public class StorageLedgerTest {
@@ -16,7 +17,12 @@ public class StorageLedgerTest {
         10,
         30,
         new StorageLedger.Owner(
-            "title", "postings", List.of("title"), List.of("$type:string/title"), false, ""));
+            Optional.of("title"),
+            "postings",
+            List.of("title"),
+            List.of("$type:string/title"),
+            false,
+            ""));
     ledger.claim(file, 50, 20, StorageLedger.Owner.system("headers"));
 
     var entries = ledger.entries();
@@ -25,7 +31,7 @@ public class StorageLedgerTest {
     assertThat(entries.stream().mapToLong(StorageLedger.Entry::length).sum()).isEqualTo(100);
     assertThat(
             entries.stream()
-                .filter(entry -> entry.owner().path().equals("title"))
+                .filter(entry -> entry.owner().exclusivePath().equals(Optional.of("title")))
                 .mapToLong(StorageLedger.Entry::length)
                 .sum())
         .isEqualTo(30);

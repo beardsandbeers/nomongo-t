@@ -1,7 +1,7 @@
 package com.xgen.mongot.index.query.collectors;
 
+import com.xgen.mongot.index.lucene.query.pushdown.MqlComparator;
 import com.xgen.mongot.index.query.operators.EmbeddedDocumentScope;
-import com.xgen.mongot.util.bson.BsonNumberUtils;
 import com.xgen.mongot.util.bson.parser.BsonDocumentBuilder;
 import com.xgen.mongot.util.bson.parser.BsonParseException;
 import com.xgen.mongot.util.bson.parser.DocumentEncodable;
@@ -157,7 +157,7 @@ public sealed interface FacetDefinition extends DocumentEncodable
           numbers -> {
             var inOrder =
                 IntStream.range(0, numbers.size() - 1)
-                    .allMatch(i -> BsonNumberUtils.compare(numbers.get(i), numbers.get(i + 1)) < 0);
+                    .allMatch(i -> MqlComparator.compare(numbers.get(i), numbers.get(i + 1)) < 0);
             return inOrder
                 ? Optional.empty()
                 : Optional.of("must be distinct numbers in ascending order");
