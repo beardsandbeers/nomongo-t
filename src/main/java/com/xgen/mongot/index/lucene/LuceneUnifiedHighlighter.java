@@ -1,6 +1,7 @@
 package com.xgen.mongot.index.lucene;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableListMultimap;
 import com.xgen.mongot.index.SearchHighlight;
 import com.xgen.mongot.index.lucene.explain.explainers.HighlightFeatureExplainer;
 import com.xgen.mongot.index.lucene.explain.timing.ExplainTimings;
@@ -10,7 +11,6 @@ import com.xgen.mongot.index.path.string.StringFieldPath;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.highlights.Highlight;
-import com.xgen.mongot.util.CollectionUtils;
 import com.xgen.mongot.util.FieldPath;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -22,10 +22,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TopDocs;
@@ -83,7 +82,7 @@ class LuceneUnifiedHighlighter {
             // keep weightMatches off to preserve default behavior we had before upgrade to Lucene 9
             .withWeightMatches(false);
     PublicUnifiedHighlighter luceneHighlighter =
-        new PublicUnifiedHighlighter(highlighterBuilder, highlight.storedLuceneFieldNameMap());
+        new PublicUnifiedHighlighter(highlighterBuilder, highlight);
 
     return new LuceneUnifiedHighlighter(luceneHighlighter, highlight, searchQuery, explainer);
   }
@@ -280,11 +279,12 @@ class LuceneUnifiedHighlighter {
     // Maps resolved user-specified Lucene field names to their corresponding stored field names.
     // Used during {@link #loadFieldValues} to determine which fields to load from disk.
     private final Map<String, String> storedLuceneFieldNameMap;
+    private final Set<String> fieldsWithPartialStorage;
 
-    private PublicUnifiedHighlighter(
-        UnifiedHighlighter.Builder builder, Map<String, String> storedLuceneFieldNameMap) {
+    private PublicUnifiedHighlighter(UnifiedHighlighter.Builder builder, Highlight highlight) {
       super(builder);
-      this.storedLuceneFieldNameMap = storedLuceneFieldNameMap;
+      this.storedLuceneFieldNameMap = highlight.storedLuceneFieldNameMap();
+      this.fieldsWithPartialStorage = highlight.fieldsWithPartialStorage();
     }
 
     @Override
@@ -299,7 +299,14 @@ class LuceneUnifiedHighlighter {
 
     @Override
     protected OffsetSource getOptimizedOffsetSource(UHComponents components) {
-      OffsetSource result = super.getOptimizedOffsetSource(components);
+      // Postings offsets include every indexed value. When a BSON alias opted out of storage,
+      // those offsets cannot address the shorter stored text of a document containing both.
+      OffsetSource optimized = super.getOptimizedOffsetSource(components);
+      OffsetSource result =
+          optimized != OffsetSource.NONE_NEEDED
+                  && this.fieldsWithPartialStorage.contains(components.field())
+              ? OffsetSource.ANALYSIS
+              : optimized;
       Explain.getQueryInfo()
           .flatMap(e -> e.getFeatureExplainer(HighlightFeatureExplainer.class))
           .ifPresent(h -> h.addOffsetSource(components.field(), result));
@@ -307,59 +314,52 @@ class LuceneUnifiedHighlighter {
     }
 
     /**
-     * Overrides the default Lucene behavior to load stored fields, which are mapped from the
-     * provided fields using {@code storedLuceneFieldNameMap}.
+     * A stored value can back several requested multi-fields. Deliver it to each in document order,
+     * including when another BSON spelling stores its value directly on the multi-field.
      */
     @Override
-    protected List<CharSequence[]> loadFieldValues(
-        String[] fields, DocIdSetIterator docIter, int cacheCharsThreshold) throws IOException {
-      // Allocate output arrays
-      int[] remap = new int[fields.length];
-      String[] storedFields =
-          computeStoredFieldsAndRemap(fields, this.storedLuceneFieldNameMap, remap);
+    protected LimitedStoredFieldVisitor newLimitedStoredFieldsVisitor(String[] fields) {
+      if (Arrays.stream(fields)
+          .allMatch(field -> field.equals(this.storedLuceneFieldNameMap.get(field)))) {
+        return super.newLimitedStoredFieldsVisitor(fields);
+      }
+      var targets = storedFieldTargets(fields, this.storedLuceneFieldNameMap);
+      return new LimitedStoredFieldVisitor(fields, '\0', getMaxLength()) {
+        @Override
+        public Status needsField(FieldInfo info) {
+          for (int index : targets.get(info.name)) {
+            var value = this.values[index];
+            if (value == null || value.length() < this.maxLength) {
+              return Status.YES;
+            }
+          }
+          return Status.NO;
+        }
 
-      List<CharSequence[]> storedFieldValues =
-          super.loadFieldValues(storedFields, docIter, cacheCharsThreshold);
-
-      return storedFieldValues.stream()
-          .map(
-              storedRow -> {
-                CharSequence[] aligned = new CharSequence[remap.length];
-                for (int i = 0; i < remap.length; i++) {
-                  aligned[i] = storedRow[remap[i]];
-                }
-                return aligned;
-              })
-          .collect(Collectors.toList());
+        @Override
+        public void stringField(FieldInfo info, String value) throws IOException {
+          for (int index : targets.get(info.name)) {
+            if (this.values[index] == null || this.values[index].length() < this.maxLength) {
+              this.currentField = index;
+              super.stringField(info, value);
+            }
+          }
+        }
+      };
     }
 
-    /**
-     * Returns the sorted and deduplicated stored field names from a list of Lucene field names and
-     * fills remapOut[i] with the index into the storedFields array that corresponds to fields[i].
-     *
-     * @param fields the Lucene field names (may include multi-fields)
-     * @param remapOut an output array that will be filled with remap indices
-     * @return a sorted, deduplicated array of stored field names
-     */
-    @VisibleForTesting
-    static String[] computeStoredFieldsAndRemap(
-        String[] fields, Map<String, String> storedLuceneFieldNameMap, int[] remapOut) {
-      // Deduplicate and sort the base fields. This is needed because Lucene performs binary search
-      // on the field names to determine if the field values need to be fetched.
-      String[] storedFields =
-          storedLuceneFieldNameMap.values().stream().distinct().sorted().toArray(String[]::new);
-
-      // Map from stored field name to index in array.
-      Map<String, Integer> baseFieldIndex =
-          IntStream.range(0, storedFields.length)
-              .boxed()
-              .collect(CollectionUtils.toMapUnsafe(i -> storedFields[i], i -> i));
-
+    static ImmutableListMultimap<String, Integer> storedFieldTargets(
+        String[] fields, Map<String, String> storedNames) {
+      var targets = ImmutableListMultimap.<String, Integer>builder();
       for (int i = 0; i < fields.length; i++) {
-        remapOut[i] = baseFieldIndex.get(storedLuceneFieldNameMap.get(fields[i]));
+        String field = fields[i];
+        String stored = storedNames.get(field);
+        targets.put(stored, i);
+        if (!field.equals(stored)) {
+          targets.put(field, i);
+        }
       }
-
-      return storedFields;
+      return targets.build();
     }
   }
 }

@@ -76,6 +76,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 import org.apache.lucene.search.IndexSearcher;
+import org.bson.BsonArray;
 import org.bson.BsonDocument;
 import org.bson.RawBsonDocument;
 import org.junit.Rule;
@@ -3862,6 +3863,293 @@ public class StandaloneGrpcServerTest {
     assertThat(f.query(fixed, query).getArray("results")).isEqualTo(results);
   }
 
+  @Test
+  public void upsert_invalidExplicitVectorBeforeValidDynamicAlias_indexesBothDocuments()
+      throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id =
+          f.create(
+              "original",
+              "{mappings:{dynamic:{typeSet:'v'},fields:{'a.b':"
+                  + "{type:'vector',numDimensions:2,similarity:'euclidean'}}},"
+                  + "typeSets:[{name:'v',types:[{type:'vector',similarity:'euclidean'}]}]}");
+      String query = exactVectorQuery("a.b", "[1,0]");
+      f.upsert(
+          id, "{_id:1,a:{b:" + bsonFloatVector(1, 0) + "},'a.b':" + bsonFloatVector(1, 0, 0) + "}");
+      assertThat(f.query(id, query).getArray("results")).hasSize(1);
+      f.upsert(
+          id, "{_id:2,'a.b':" + bsonFloatVector(1, 0, 0) + ",a:{b:" + bsonFloatVector(1, 0) + "}}");
+      assertThat(f.query(id, query).getArray("results")).hasSize(2);
+    }
+  }
+
+  @Test
+  public void getIndexMappings_aliasedNumericRepresentations_preservesFacetBuckets()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      var id =
+          f.create(
+              "original",
+              ALIAS_TYPE_SETS
+                  .replace("{mappings:", "{numPartitions:2,mappings:")
+                  .formatted("{type:'number',representation:'int64'}", "{type:'number'}"));
+      var docs =
+          List.of(
+              "{_id:1,'a.b':1,g:1}",
+              "{_id:2,a:{b:8},g:1}",
+              "{_id:3,'a.b':2,a:{b:3},g:1}",
+              "{_id:4,'a.b':2,a:{b:8},g:1}",
+              "{_id:5,g:1}",
+              "{_id:6,'a.b':-10}",
+              "{_id:7,'a.b':1,a:{b:-8}}");
+      for (var doc : docs) {
+        f.upsert(id, doc);
+      }
+      var replay = f.create("replay", exportMappings(f, id).getDefinitionJson());
+      for (var doc : docs) {
+        f.upsert(replay, doc);
+      }
+
+      for (String name : List.of("original", "replay")) {
+        String facet = "{type:'number',path:'a.b',boundaries:[0,5,10],default:'other'}";
+        var buckets = facetBuckets(f, name, facet);
+        assertThat(buckets.stream().map(b -> b.asDocument().getNumber("count").intValue()).toList())
+            .containsExactly(4, 2, 2)
+            .inOrder();
+        var groups =
+            facetBuckets(
+                f,
+                name,
+                "{type:'number',path:'a.b',boundaries:[0,5,10],default:'other',"
+                    + "aggregations:{documents:{type:'count'},total:{type:'sum',path:'g'}}}");
+        assertThat(
+                groups.stream().map(b -> b.asDocument().getNumber("documents").intValue()).toList())
+            .containsExactly(4, 2, 2)
+            .inOrder();
+        var metrics =
+            facetBuckets(
+                    f,
+                    name,
+                    "{type:'number',path:'g',boundaries:[0,5],aggregations:{"
+                        + "total:{type:'sum',path:'a.b'},mean:{type:'avg',path:'a.b'}}}")
+                .getFirst()
+                .asDocument();
+        assertThat(metrics.getNumber("total").doubleValue()).isEqualTo(9);
+        assertThat(metrics.getNumber("mean").doubleValue()).isEqualTo(4.5);
+      }
+    }
+  }
+
+  private static final String HIGH_PRECISION_FACET =
+      "{type:'number',path:'a.b',boundaries:[9007199254740992.0,"
+          + "NumberLong('9007199254740993'),NumberLong('9007199254740994')]}";
+
+  @Test
+  public void searchMeta_mixedNumericBoundaries_keepAdjacentInt64ValuesDistinct() throws Exception {
+    try (var f = new Fixture(data())) {
+      String id =
+          f.create(
+              "precision",
+              ALIAS_TYPE_SETS.formatted(
+                  "{type:'number',representation:'int64'}", "{type:'number'}"));
+      f.upsert(id, "{_id:1,'a.b':NumberLong('9007199254740993')}");
+      f.upsert(id, "{_id:2,a:{b:9007199254740992.0}}");
+      var buckets = facetBuckets(f, "precision", HIGH_PRECISION_FACET);
+      assertThat(buckets.stream().map(b -> b.asDocument().getNumber("count").intValue()).toList())
+          .containsExactly(1, 1)
+          .inOrder();
+    }
+  }
+
+  @Test
+  public void getIndexMappings_singleObservedNumericRepresentation_preservesExactBoundaries()
+      throws Exception {
+    try (var f = new Fixture(data())) {
+      String mapping =
+          ALIAS_TYPE_SETS.formatted("{type:'number',representation:'int64'}", "{type:'number'}");
+      assertFacetReplay(
+          f,
+          "integers",
+          mapping,
+          List.of("{_id:1,'a.b':1}", "{_id:2,'a.b':2}", "{_id:3,'a.b':1}"),
+          "{type:'number',path:'a.b',boundaries:[1.5,2.5],default:'other'}",
+          List.of(1, 2));
+      assertFacetReplay(
+          f,
+          "doubles",
+          mapping,
+          List.of("{_id:1,a:{b:9007199254740992.0}}"),
+          HIGH_PRECISION_FACET,
+          List.of(1, 0));
+    }
+  }
+
+  @Test
+  public void getIndexMappings_embeddedNumericAliases_countEachParentOncePerBucket()
+      throws Exception {
+    var flags = DynamicFeatureFlagRegistry.communityDefault();
+    try (var f =
+        new Fixture(
+            StandaloneConfig.development(data(), 0),
+            new io.grpc.Metadata(),
+            FeatureFlags.communityDefaults(),
+            flags)) {
+      flags.updateDynamicFeatureFlags(
+          List.of(enabledFlag(DynamicFeatureFlags.ENABLE_EMBEDDED_SCOPED_FACET)));
+      String mapping =
+          """
+          {mappings:{fields:{items:{
+                type:'embeddedDocuments',dynamic:{typeSet:'literal'},fields:{
+            a:{type:'document',dynamic:{typeSet:'nested'}}}}}},typeSets:[
+            {name:'literal',types:[{type:'vector',similarity:'euclidean'},
+                  {type:'number',representation:'int64'}]},
+            {name:'nested',types:[{type:'number'}]}]}
+          """;
+      assertFacetReplay(
+          f,
+          "embedded",
+          mapping,
+          List.of("{_id:1,items:[{'a.b':1},{a:{b:3}},{a:{b:8}}]}", "{_id:2,items:[{'a.b':7}]}"),
+          "{type:'number',path:'items.a.b',boundaries:[0,5,10],"
+              + "embeddedDocument:{path:'items',operator:{exists:{path:'items.a.b'}}}}",
+          List.of(1, 2));
+    }
+  }
+
+  private static void assertFacetReplay(
+      Fixture fixture,
+      String name,
+      String definition,
+      List<String> docs,
+      String facet,
+      List<Integer> counts)
+      throws Exception {
+    String original = fixture.create(name, definition);
+    for (String doc : docs) {
+      fixture.upsert(original, doc);
+    }
+    String replayName = name + "-replay";
+    String replay =
+        fixture.create(replayName, exportMappings(fixture, original).getDefinitionJson());
+    for (String doc : docs) {
+      fixture.upsert(replay, doc);
+    }
+    for (String index : List.of(name, replayName)) {
+      assertWithMessage(index)
+          .that(
+              facetBuckets(fixture, index, facet).stream()
+                  .map(b -> b.asDocument().getNumber("count").intValue())
+                  .toList())
+          .containsExactlyElementsIn(counts)
+          .inOrder();
+    }
+  }
+
+  private static BsonArray facetBuckets(Fixture fixture, String index, String facet) {
+    String query = "{index:'%s',facet:{facets:{result:%s}}}".formatted(index, facet);
+    return metadata(fixture.queries.searchMeta(metaRequest(query)))
+        .getDocument("facet")
+        .getDocument("result")
+        .getArray("buckets");
+  }
+
+  @Test
+  public void getIndexMappings_aliasedStringStorage_preservesHighlighting() throws Exception {
+    try (var f = new Fixture(data())) {
+      String template =
+          "{type:'string',store:%s,multi:{exact:{"
+              + "type:'string',store:true,analyzer:'lucene.keyword'}}}";
+      var id =
+          f.create(
+              "original",
+              ALIAS_TYPE_SETS.formatted(template.formatted(false), template.formatted(true)));
+      var docs =
+          List.of(
+              "{_id:1,'a.b':'snow'}", "{_id:2,a:{b:'green'}}", "{_id:3,'a.b':'red',a:{b:'blue'}}");
+      for (var doc : docs) {
+        f.upsert(id, doc);
+      }
+      var replay = f.create("replay", exportMappings(f, id).getDefinitionJson());
+      for (var doc : docs) {
+        f.upsert(replay, doc);
+      }
+      String baseQuery = "{text:{path:'a.b',query:'green'},highlight:{path:'a.b'}}";
+      var before = f.query(id, baseQuery).getArray("results");
+      assertThat(before).hasSize(1);
+      assertThat(f.query(replay, baseQuery).getArray("results")).isEqualTo(before);
+      var mixedDocumentQuery = "{text:{path:'a.b',query:'blue'},highlight:{path:'a.b'}}";
+      for (String index : List.of(id, replay)) {
+        var mixedDoc =
+            f.query(index, mixedDocumentQuery).getArray("results").getFirst().asDocument();
+        assertThat(mixedDoc.getArray("$searchHighlights")).isNotEmpty();
+        assertThat(mixedDoc.getArray("$searchHighlights").toString()).contains("blue");
+      }
+      var multi = "{value:'a.b',multi:'exact'}";
+      for (String term : List.of("snow", "green", "blue")) {
+        String query =
+            "{text:{path:%s,query:'%s'},highlight:{path:%s}}".formatted(multi, term, multi);
+        var hits = f.query(id, query).getArray("results");
+        assertThat(hits).hasSize(1);
+        assertThat(hits.getFirst().asDocument().getArray("$searchHighlights")).isNotEmpty();
+        assertThat(f.query(replay, query).getArray("results")).isEqualTo(hits);
+      }
+    }
+  }
+
+  @Test
+  public void searchMeta_numericMetricOnLiteralAlias_matchesStaticReplay() throws Exception {
+    try (var f = new Fixture(data())) {
+      var id =
+          f.create("original", ALIAS_TYPE_SETS.formatted("{type:'number'}", "{type:'string'}"));
+      var docs = List.of("{_id:1,'a.b':2,bucket:1}", "{_id:2,a:{b:'snow'},bucket:1}");
+      for (var doc : docs) {
+        f.upsert(id, doc);
+      }
+      var replay = f.create("replay", exportMappings(f, id).getDefinitionJson());
+      for (var doc : docs) {
+        f.upsert(replay, doc);
+      }
+      String q =
+          "{index:'%s',facet:{facets:{groups:{type:'number',path:'bucket',boundaries:[0,5],"
+              + "aggregations:{total:{type:'sum',path:'a.b'}}}}}}";
+      for (var name : List.of("replay", "original")) {
+        var meta = metadata(f.queries.searchMeta(metaRequest(q.formatted(name))));
+        var bucket =
+            meta.getDocument("facet")
+                .getDocument("groups")
+                .getArray("buckets")
+                .getFirst()
+                .asDocument();
+        assertThat(bucket.getNumber("total").doubleValue()).isEqualTo(2);
+      }
+    }
+  }
+
+  @Test
+  public void getIndexFieldStats_observedEmptyVectorKey_reportsField() throws Exception {
+    Similarity.load();
+    try (var f = new Fixture(data())) {
+      var id = f.create("stats", MIXED_VECTOR_MAPPING);
+      f.upsert(id, "{_id:1,'':" + bsonFloatVector(1, 0) + "}");
+      assertThat(f.query(id, exactVectorQuery("", "[1,0]")).getArray("results")).hasSize(1);
+      f.upsert(id, "{_id:2,'':{child:'green'}}");
+      var fields = f.fieldStats(id, 100);
+      assertThat(fields.getFieldsList().stream().map(field -> field.getPath()).toList())
+          .contains("");
+      var selected = f.fieldStats(id, 100, "");
+      assertThat(selected.getFieldsCount()).isEqualTo(1);
+      var emptyKey = selected.getFields(0);
+      assertThat(emptyKey.getObserved()).isTrue();
+      assertThat(emptyKey.getRepresentationsList().stream().map(r -> r.getMappingType()).toList())
+          .contains("vector");
+      String replay = f.create("stats-replay", exportMappings(f, id).getDefinitionJson());
+      var child = f.fieldStats(replay, 100, ".child").getFieldsList();
+      assertThat(child).hasSize(1);
+      assertThat(child.getFirst().getConfigured()).isTrue();
+    }
+  }
+
   private static String exactVectorQuery(String path, String vector) {
     return "{vectorSearch:{path:'" + path + "',queryVector:" + vector + ",exact:true,limit:10}}";
   }
@@ -4832,12 +5120,17 @@ public class StandaloneGrpcServerTest {
       return this.runtime.cursors().hasOpenCursors(generation.getGenerationId());
     }
 
-    private IndexFieldStatsResponse fieldStats(String id, int size) throws Exception {
+    private IndexFieldStatsResponse fieldStats(String id, int size, String... paths)
+        throws Exception {
       long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
       while (System.nanoTime() < deadline) {
         var result =
             this.catalog.getIndexFieldStats(
-                GetIndexFieldStatsRequest.newBuilder().setIndexId(id).setPageSize(size).build());
+                GetIndexFieldStatsRequest.newBuilder()
+                    .setIndexId(id)
+                    .setPageSize(size)
+                    .addAllPaths(List.of(paths))
+                    .build());
         if (result.getState() == StatsCollectionState.STATS_COLLECTION_STATE_READY) {
           return result;
         }

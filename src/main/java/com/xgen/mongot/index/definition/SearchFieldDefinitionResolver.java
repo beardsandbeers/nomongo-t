@@ -2,12 +2,14 @@ package com.xgen.mongot.index.definition;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.Var;
+import com.xgen.mongot.index.path.string.StringMultiFieldPath;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.index.version.IndexCapabilities;
 import com.xgen.mongot.index.version.IndexFormatVersion;
 import com.xgen.mongot.util.FieldPath;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * FieldDefinitionResolver retrieves the correct FieldDefinition for a combination of path +
@@ -57,6 +59,13 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
 
   public Optional<StringFieldDefinition> getStringFieldDefinition(
       StringPath stringPath, Optional<FieldPath> embeddedRoot) {
+    return getStringFieldDefinition(stringPath, embeddedRoot, ignored -> true);
+  }
+
+  public Optional<StringFieldDefinition> getStringFieldDefinition(
+      StringPath stringPath,
+      Optional<FieldPath> embeddedRoot,
+      Predicate<StringFieldDefinition> matches) {
     return getQueryFieldDefinition(
         stringPath.getBaseFieldPath(),
         embeddedRoot,
@@ -67,7 +76,46 @@ public class SearchFieldDefinitionResolver implements FieldDefinitionResolver {
                     string ->
                         stringPath.isField()
                             ? Optional.of(string)
-                            : string.getMultiDefinition(stringPath.asMultiField().getMulti())));
+                            : string.getMultiDefinition(stringPath.asMultiField().getMulti()))
+                .filter(matches));
+  }
+
+  /**
+   * Check the base and multi on the same BSON declaration: unrelated aliases can each supply one.
+   */
+  public boolean storesMultiInBase(StringMultiFieldPath multi, Optional<FieldPath> root) {
+    var path = multi.getFieldPath();
+    Function<FieldDefinition, Optional<StringFieldDefinition>> stored =
+        field ->
+            field
+                .stringFieldDefinition()
+                .filter(StringFieldDefinition::storeFlag)
+                .flatMap(base -> base.getMultiDefinition(multi.getMulti()))
+                .filter(StringFieldDefinition::storeFlag);
+    if (root.isPresent() || path.isNested()) {
+      return findAlias(path, root, stored).isPresent();
+    }
+    return getFieldDefinition(path, root).flatMap(stored).isPresent();
+  }
+
+  /** Both physical number columns may be populated by different BSON spellings of a dotted path. */
+  public boolean hasBothNumericRepresentations(FieldPath path, Optional<FieldPath> root) {
+    if (!path.toString().contains(".")) {
+      return false;
+    }
+    for (var representation : NumericFieldOptions.Representation.values()) {
+      if (getQueryFieldDefinition(
+              path,
+              root,
+              field ->
+                  field
+                      .numberFieldDefinition()
+                      .filter(n -> n.options().representation() == representation))
+          .isEmpty()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** A query or change event carries a dotted name and can refer to multiple BSON spellings. */

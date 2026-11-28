@@ -191,8 +191,12 @@ public abstract class AbstractDocumentWrapper {
    * @param checkFieldName - field name of the corresponding vector field
    */
   boolean canIndexVectorField(String checkFieldName) {
-    return !this.vectorFieldsInvalidForIndexing.contains(checkFieldName)
-        && !this.vectorFieldsIndexed.contains(checkFieldName);
+    return canIndexVectorField(checkFieldName, checkFieldName);
+  }
+
+  boolean canIndexVectorField(String checkFieldName, String rejectionKey) {
+    return !this.vectorFieldsIndexed.contains(checkFieldName)
+        && !this.vectorFieldsInvalidForIndexing.contains(rejectionKey);
   }
 
   /**

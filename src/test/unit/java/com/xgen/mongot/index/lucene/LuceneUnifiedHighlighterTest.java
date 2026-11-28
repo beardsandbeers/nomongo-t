@@ -328,65 +328,21 @@ public class LuceneUnifiedHighlighterTest {
   public static class TestComputeStoredFieldsAndRemap {
 
     @Test
-    public void computeStoredFieldsAndRemap_deduplicatesStoredFields() {
-      String[] fields = {"$multi/title.french", "$multi/title.spanish", "$type:string/title"};
-      Map<String, String> map =
-          Map.of(
-              "$multi/title.french", "$type:string/title",
-              "$multi/title.spanish", "$type:string/title",
-              "$type:string/title", "$type:string/title");
-      int[] remapOut = new int[fields.length];
-
-      String[] storedFields =
-          LuceneUnifiedHighlighter.PublicUnifiedHighlighter.computeStoredFieldsAndRemap(
-              fields, map, remapOut);
-
-      Assert.assertArrayEquals(new String[] {"$type:string/title"}, storedFields);
-
-      Assert.assertArrayEquals(new int[] {0, 0, 0}, remapOut);
-    }
-
-    @Test
-    public void computeStoredFieldsAndRemap_sortsStoredFields() {
+    public void storedFieldTargets_mixedStorage_routesEachValueToRequestedFields() {
       String[] fields = {
-        "$multi/title.french", "$multi/author.french", "$multi/plot.french", "$type:string/title"
+        "$multi/title.french", "$multi/title.spanish", "$type:string/title", "$type:string/author"
       };
-      Map<String, String> map =
-          Map.of(
-              "$multi/title.french", "$type:string/title",
-              "$multi/author.french", "$type:string/author",
-              "$multi/plot.french", "$type:string/plot",
-              "$type:string/title", "$type:string/title");
-      int[] remapOut = new int[fields.length];
+      var targets =
+          LuceneUnifiedHighlighter.PublicUnifiedHighlighter.storedFieldTargets(
+              fields,
+              Map.of(
+                  fields[0], fields[2], fields[1], fields[2], fields[2], fields[2], fields[3],
+                  fields[3]));
 
-      String[] storedFields =
-          LuceneUnifiedHighlighter.PublicUnifiedHighlighter.computeStoredFieldsAndRemap(
-              fields, map, remapOut);
-
-      Assert.assertArrayEquals(
-          new String[] {"$type:string/author", "$type:string/plot", "$type:string/title"},
-          storedFields);
-
-      Assert.assertArrayEquals(new int[] {2, 0, 1, 2}, remapOut);
-    }
-
-    @Test
-    public void computeStoredFieldsAndRemap_storedFieldsOnly() {
-      String[] fields = {"$type:string/title", "$type:string/author"};
-      Map<String, String> map =
-          Map.of(
-              "$type:string/title", "$type:string/title",
-              "$type:string/author", "$type:string/author");
-      int[] remapOut = new int[fields.length];
-
-      String[] storedFields =
-          LuceneUnifiedHighlighter.PublicUnifiedHighlighter.computeStoredFieldsAndRemap(
-              fields, map, remapOut);
-
-      Assert.assertArrayEquals(
-          new String[] {"$type:string/author", "$type:string/title"}, storedFields);
-
-      Assert.assertArrayEquals(new int[] {1, 0}, remapOut);
+      Assert.assertEquals(List.of(0, 1, 2), targets.get(fields[2]));
+      Assert.assertEquals(List.of(0), targets.get(fields[0]));
+      Assert.assertEquals(List.of(1), targets.get(fields[1]));
+      Assert.assertEquals(List.of(3), targets.get(fields[3]));
     }
   }
 

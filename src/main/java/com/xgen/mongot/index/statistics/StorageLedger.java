@@ -6,6 +6,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 
 /** Disjoint physical ranges. Invalid claims invalidate the entire affected physical file. */
@@ -13,18 +14,41 @@ public final class StorageLedger {
   public record File(int partition, String name) {}
 
   public record Owner(
-      String path,
+      Optional<String> exclusivePath,
       String component,
       List<String> paths,
       List<String> physicalFields,
       boolean unattributed,
       String reason) {
+    /** Construct an owner using the original convention in which "" identified shared storage. */
+    public Owner(
+        String path,
+        String component,
+        List<String> paths,
+        List<String> physicalFields,
+        boolean unattributed,
+        String reason) {
+      this(
+          path.isEmpty() ? Optional.empty() : Optional.of(path),
+          component,
+          paths,
+          physicalFields,
+          unattributed,
+          reason);
+    }
+
+    /** Use exclusivePath() when the empty BSON key must be distinguished from shared storage. */
+    public String path() {
+      return this.exclusivePath.orElse("");
+    }
+
     public static Owner unknown(String reason) {
-      return new Owner("", "unsupported", List.of(), List.of(), true, reason);
+      return new Owner(Optional.empty(), "unsupported", List.of(), List.of(), true, reason);
     }
 
     public static Owner system(String component) {
-      return new Owner("", component, List.of(), List.of(), false, "index-owned metadata");
+      return new Owner(
+          Optional.empty(), component, List.of(), List.of(), false, "index-owned metadata");
     }
   }
 

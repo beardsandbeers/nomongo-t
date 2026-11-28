@@ -240,7 +240,7 @@ public final class StandaloneIndexStatistics implements AutoCloseable {
     }
     var paths = new TreeSet<String>();
     for (String path : request.getPathsList()) {
-      if (path.isEmpty() || path.length() > 4096 || path.indexOf('\0') >= 0) {
+      if (path.length() > 4096 || path.indexOf('\0') >= 0) {
         throw Status.INVALID_ARGUMENT
             .withDescription("Invalid canonical field path")
             .asRuntimeException();

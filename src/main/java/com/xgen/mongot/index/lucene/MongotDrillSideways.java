@@ -28,7 +28,6 @@ import org.apache.lucene.facet.Facets;
 import org.apache.lucene.facet.FacetsCollector;
 import org.apache.lucene.facet.FacetsConfig;
 import org.apache.lucene.facet.MultiFacets;
-import org.apache.lucene.facet.range.LongRangeFacetCounts;
 import org.apache.lucene.facet.sortedset.SortedSetDocValuesFacetCounts;
 import org.apache.lucene.facet.sortedset.SortedSetDocValuesReaderState;
 import org.apache.lucene.search.CollectorManager;
@@ -118,26 +117,12 @@ public class MongotDrillSideways extends DrillSideways {
             }
           }
 
-          case FacetDefinition.NumericFacetDefinition numericFacetDefinition -> {
-            String luceneDim =
-                this.facetContext.getBoundaryFacetPath(numericFacetDefinition, this.returnScope);
+          case FacetDefinition.BoundaryFacetDefinition<?> boundary -> {
+            String name = this.facetContext.getBoundaryFacetPath(boundary, this.returnScope);
             dimToDrillSidewaysFacets.put(
-                luceneDim,
-                new LongRangeFacetCounts(
-                    luceneDim,
-                    drillSideways[i],
-                    this.facetContext.getRanges(numericFacetDefinition, this.returnScope)));
-          }
-
-          case FacetDefinition.DateFacetDefinition dateFacetDefinition -> {
-            String luceneDim =
-                this.facetContext.getBoundaryFacetPath(dateFacetDefinition, this.returnScope);
-            dimToDrillSidewaysFacets.put(
-                luceneDim,
-                new LongRangeFacetCounts(
-                    luceneDim,
-                    drillSideways[i],
-                    this.facetContext.getRanges(dateFacetDefinition, this.returnScope)));
+                name,
+                LuceneFacetResultUtil.countRanges(
+                    this.facetContext, boundary, this.returnScope, drillSideways[i]));
           }
         }
       } catch (InvalidQueryException e) {

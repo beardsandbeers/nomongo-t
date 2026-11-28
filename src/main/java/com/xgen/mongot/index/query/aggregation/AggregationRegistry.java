@@ -43,8 +43,17 @@ public class AggregationRegistry {
         List<? extends BsonValue> boundaries,
         Optional<BsonValue> defaultKey,
         Optional<TypeField> typeField,
-        Optional<FieldDefinition> fieldDefinition)
-        implements GroupingArgs {}
+        Optional<FieldDefinition> fieldDefinition,
+        Optional<NumericBucketOrdinals> bucketOrdinals)
+        implements GroupingArgs {
+      public BoundaryArgs(
+          List<? extends BsonValue> boundaries,
+          Optional<BsonValue> defaultKey,
+          Optional<TypeField> typeField,
+          Optional<FieldDefinition> fieldDefinition) {
+        this(boundaries, defaultKey, typeField, fieldDefinition, Optional.empty());
+      }
+    }
   }
 
   /**

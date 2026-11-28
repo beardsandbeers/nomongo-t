@@ -552,11 +552,18 @@ public class IndexableFieldFactory {
                 field, specification.numDimensions())
             : FieldName.TypeField.KNN_VECTOR.getLuceneFieldName(field, Optional.empty());
 
-    // Skip vectors of invalid size to not fail indexing.
-    // Note: we need to do duplicate and validity check before the dimension check and similarity
-    // method check since we do not want to index any following vectors if any of the previous
-    // vectors were either already indexed or shown as invalid for indexing.
-    if (!document.canIndexVectorField(checkFieldName)) {
+    // Distinct BSON spellings can share one Lucene field. A successful vector claims that
+    // field, but an invalid value suppresses further candidates only from its own spelling.
+    String rejectionKey =
+        field.toString().contains(".")
+                && document instanceof DocumentWrapper search
+                && (search.resolver.hasTypeSetVectorFields()
+                    || search.resolver.indexDefinition.hasStaticBsonVectorOnlyFields())
+            ? checkFieldName
+                + "\0"
+                + sourcePath.orElseGet(() -> String.join("\0", field.getSegments()))
+            : checkFieldName;
+    if (!document.canIndexVectorField(checkFieldName, rejectionKey)) {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "nested embeddings are already indexed or invalid: "
               + "only first valid vector field with lucene field name %s is indexed. _id=%s",
@@ -572,7 +579,7 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "Vector dimension mismatch: expected %d, got %d. Skipping. _id=%s",
           dimensions, vector.numDimensions(), lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 
@@ -580,7 +587,7 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "Cosine similarity does not support zero vectors. Skipping. _id=%s",
           lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 
@@ -589,7 +596,7 @@ public class IndexableFieldFactory {
       FLOGGER.atWarning().atMostEvery(1, TimeUnit.HOURS).log(
           "float16 vectors are not supported by the Lucene engine, skipping. _id=%s",
           lazy(() -> getLoggingId(document)));
-      document.markVectorFieldInvalid(checkFieldName);
+      document.markVectorFieldInvalid(rejectionKey);
       return;
     }
 

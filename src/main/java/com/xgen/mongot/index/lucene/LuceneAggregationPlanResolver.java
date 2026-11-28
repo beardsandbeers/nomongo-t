@@ -44,7 +44,6 @@ public final class LuceneAggregationPlanResolver {
 
   static AggregationSpecBuilder.BoundaryFieldResolver boundaryFieldResolver(
       LuceneFacetContext facetContext) {
-    return new FacetContextBoundaryResolver(
-        new LuceneAggregationContextFieldResolver(facetContext));
+    return new FacetContextBoundaryResolver(facetContext);
   }
 }

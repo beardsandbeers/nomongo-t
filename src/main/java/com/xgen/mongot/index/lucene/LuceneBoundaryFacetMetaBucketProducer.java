@@ -2,7 +2,6 @@ package com.xgen.mongot.index.lucene;
 
 import static com.xgen.mongot.util.Check.checkState;
 
-import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.IntermediateFacetBucket;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.util.Check;
@@ -42,11 +41,9 @@ class LuceneBoundaryFacetMetaBucketProducer implements LuceneMetaBucketProducer 
       String facetName,
       FacetDefinition.BoundaryFacetDefinition<? extends BsonValue> facetDefinition,
       long totalCount) {
-    @Var long facetDocsCount = 0;
     List<IntermediateFacetBucket> buckets = new ArrayList<>();
     for (int i = 0; i < facetResult.labelValues.length; i++) {
       long bucketCount = facetResult.labelValues[i].value.longValue();
-      facetDocsCount += bucketCount;
       buckets.add(
           new IntermediateFacetBucket(
               IntermediateFacetBucket.Type.FACET,
@@ -62,7 +59,7 @@ class LuceneBoundaryFacetMetaBucketProducer implements LuceneMetaBucketProducer 
                     IntermediateFacetBucket.Type.FACET,
                     facetName,
                     new BsonString(facetDefinition.defaultBucketName().get()),
-                    totalCount - facetDocsCount))
+                    totalCount - facetResult.value.longValue()))
             : Optional.empty();
 
     return new LuceneBoundaryFacetMetaBucketProducer(buckets, defaultBucket);

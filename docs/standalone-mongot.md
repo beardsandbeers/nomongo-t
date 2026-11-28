@@ -192,9 +192,22 @@ once per segment. On segments with deletions, it checks matching IDs for a survi
 when the document frequency alone cannot establish that one survives. The literal key `"a.b"`
 and the nested path in `{"a":{"b":1}}` have separate entries. Each spelling can hold both a string
 and a vector. Replacing or deleting its last occurrence removes that spelling from the next
-refreshed export.
+refreshed export. Embedded document mappings that use a vector type set also record the BSON
+spellings of their scalar fields.
+
 Exported vector fields use `bsonVectorOnly: true`. Numeric arrays require an ordinary static
-vector mapping.
+vector mapping. A wrong-length vector at an explicitly mapped spelling leaves the other spelling
+eligible in the same document.
+
+Numeric facets on a shared dotted path read both `int64` and `double` representations. For example,
+if one document has `{"a.b":2,"a":{"b":3}}`, it counts once in the range `[0,5)`. Values in
+different ranges count once in each range. Bucket boundaries retain their BSON precision even when
+only one representation was observed before export. A `sum` or `avg` metric skips a document with multiple
+numeric values at the metric path. Highlighting reads the stored string values for the requested
+path or multi-field. These rules also apply after replaying an exported static mapping.
+
+An empty BSON key is a valid field path. `GetIndexFieldStats` includes observed fields at that key,
+and a request with `paths: [""]` selects it.
 
 An exact-path export also preserves fields that matched `exists` or contained null even
 when no typed value was indexed. For example, two valid vectors in one document can share a

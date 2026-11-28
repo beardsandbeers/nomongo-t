@@ -1,13 +1,18 @@
 package com.xgen.mongot.index.query.aggregation;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
 import com.xgen.mongot.index.lucene.field.FieldName.TypeField;
 import com.xgen.mongot.index.lucene.field.FieldValue;
+import com.xgen.mongot.index.lucene.query.pushdown.MqlComparator;
 import com.xgen.mongot.index.lucene.util.LuceneDoubleConversionUtils;
 import com.xgen.mongot.util.BsonUtils;
 import com.xgen.mongot.util.CheckedStream;
 import com.xgen.mongot.util.FieldPath;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -36,7 +41,8 @@ import org.bson.BsonValue;
  * <p>A path indexed as several BSON types has one column per type, so a value is assembled by
  * reading every column present in the segment. One value comes back as a scalar, several as a
  * {@link BsonArray}. Columns are opened in BSON bracket order and each is internally ascending, so
- * that array is in BSON order without being sorted.
+ * that array is in BSON order. When aliases populate both numeric encodings, their values are
+ * merged within the numeric bracket.
  *
  * <p>Built once per segment, and doc values are forward-only: callers must request documents in
  * increasing segment-local doc-id order.
@@ -120,11 +126,41 @@ final class DocValuesFieldReader implements FieldValueFetcher.ValueSource {
           "Token metric values cannot be read from doc values for TypeFields: "
               + types.stream().filter(type -> !TYPE_ORDER.contains(type)).toList());
     }
-    return new DocValuesFieldReader(
-        CheckedStream.from(TYPE_ORDER.stream().filter(types::contains))
-            .flatMapAndCollectChecked(
-                type ->
-                    CheckedStream.from(openColumn(path, type, leaf.reader(), selection).stream())));
+    var columns = new LinkedHashMap<TypeField, Column>();
+    for (var type : TYPE_ORDER) {
+      if (types.contains(type)) {
+        openColumn(path, type, leaf.reader(), selection)
+            .ifPresent(column -> columns.put(type, column));
+      }
+    }
+    var doubles = columns.get(TypeField.NUMBER_DOUBLE_V2);
+    var integers = columns.get(TypeField.NUMBER_INT64_V2);
+    if (doubles != null && integers != null) {
+      // min/max stop at the first nonempty BSON bracket. Both encodings are the same bracket.
+      columns.put(TypeField.NUMBER_DOUBLE_V2, numericBracket(doubles, integers, selection));
+      columns.remove(TypeField.NUMBER_INT64_V2);
+    }
+    return new DocValuesFieldReader(List.copyOf(columns.values()));
+  }
+
+  private static Column numericBracket(Column doubles, Column integers, Selection selection) {
+    Comparator<BsonValue> numericOrder =
+        (a, b) -> MqlComparator.compare(a.asNumber(), b.asNumber());
+    return doc -> {
+      var a = doubles.values(doc);
+      var b = integers.values(doc);
+      if (a.isEmpty()) {
+        return b;
+      }
+      if (b.isEmpty()) {
+        return a;
+      }
+      return switch (selection) {
+        case MIN -> numericOrder.compare(a.getFirst(), b.getFirst()) <= 0 ? a : b;
+        case MAX -> numericOrder.compare(a.getFirst(), b.getFirst()) >= 0 ? a : b;
+        case ALL -> ImmutableList.copyOf(Iterables.mergeSorted(List.of(a, b), numericOrder));
+      };
+    };
   }
 
   /**

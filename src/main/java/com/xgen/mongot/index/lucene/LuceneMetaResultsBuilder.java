@@ -3,7 +3,6 @@ package com.xgen.mongot.index.lucene;
 import static com.xgen.mongot.util.Check.checkState;
 import static java.lang.String.format;
 
-import com.google.errorprone.annotations.Var;
 import com.xgen.mongot.index.FacetBucket;
 import com.xgen.mongot.index.FacetInfo;
 import com.xgen.mongot.index.MetaResults;
@@ -294,23 +293,19 @@ class LuceneMetaResultsBuilder {
     String path = facetContext.getBoundaryFacetPath(boundaryDefinition, returnScope);
     FacetResult facetResult = drillSidewaysResult.facets.getAllChildren(path);
     List<FacetBucket> results = new ArrayList<>();
-    @Var long facetDocsCount = 0;
     for (int i = 0; i < facetResult.labelValues.length; i++) {
       long bucketCount = facetResult.labelValues[i].value.longValue();
       if (bucketCount > 0) {
-        facetDocsCount += bucketCount;
         results.add(new FacetBucket(boundaryDefinition.boundaries().get(i), bucketCount));
       }
     }
 
     if (boundaryDefinition.defaultBucketName().isPresent()) {
-      // Default bucket can be computed by subtracting the total docs in the buckets from the
-      // total docs returned by the query, which is accurate when provided by the FacetsCollector.
-      // This also relies on the fact that we do not index numbers or dates in arrays.
+      // A document can contribute to several buckets. Lucene counts it once in facetResult.value.
       results.add(
           new FacetBucket(
               new BsonString(boundaryDefinition.defaultBucketName().get()),
-              totalCount - facetDocsCount));
+              totalCount - facetResult.value.longValue()));
     }
 
     return new FacetInfo(results);
@@ -328,21 +323,17 @@ class LuceneMetaResultsBuilder {
         LuceneFacetResultUtil.getBoundaryFacetResult(
             boundaryDefinition, facetContext, facetsCollector, returnScope);
     List<FacetBucket> results = new ArrayList<>();
-    @Var long facetDocsCount = 0;
     for (int i = 0; i < facetResult.labelValues.length; i++) {
       long bucketCount = facetResult.labelValues[i].value.longValue();
-      facetDocsCount += bucketCount;
       results.add(new FacetBucket(boundaryDefinition.boundaries().get(i), bucketCount));
     }
 
     if (boundaryDefinition.defaultBucketName().isPresent()) {
-      // Default bucket can be computed by subtracting the total docs in the buckets from the
-      // total docs returned by the query, which is accurate when provided by the FacetsCollector.
-      // This also relies on the fact that we do not index numbers or dates in arrays.
+      // A document can contribute to several buckets. Lucene counts it once in facetResult.value.
       results.add(
           new FacetBucket(
               new BsonString(boundaryDefinition.defaultBucketName().get()),
-              totalCount - facetDocsCount));
+              totalCount - facetResult.value.longValue()));
     }
 
     return new FacetInfo(results);

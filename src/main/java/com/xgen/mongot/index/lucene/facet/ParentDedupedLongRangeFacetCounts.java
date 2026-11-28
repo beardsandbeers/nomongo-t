@@ -7,12 +7,11 @@ import java.util.HashMap;
 import java.util.Map;
 import org.apache.lucene.facet.FacetsCollector;
 import org.apache.lucene.facet.FacetsCollector.MatchingDocs;
+import org.apache.lucene.facet.MultiLongValuesSource;
 import org.apache.lucene.facet.range.LongRange;
-import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.ReaderUtil;
-import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.join.BitSetProducer;
 import org.apache.lucene.util.BitSet;
@@ -42,7 +41,7 @@ import org.apache.lucene.util.FixedBitSet;
 public class ParentDedupedLongRangeFacetCounts {
 
   private final LongRange[] ranges;
-  private final String field;
+  private final MultiLongValuesSource source;
   private final BitSetProducer parentFilter;
   private final IndexReader reader;
 
@@ -74,8 +73,25 @@ public class ParentDedupedLongRangeFacetCounts {
       FacetsCollector resultParentHits,
       IndexReader reader)
       throws IOException {
+    this(
+        MultiLongValuesSource.fromLongField(field),
+        ranges,
+        childHits,
+        parentFilter,
+        resultParentHits,
+        reader);
+  }
+
+  public ParentDedupedLongRangeFacetCounts(
+      MultiLongValuesSource source,
+      LongRange[] ranges,
+      FacetsCollector childHits,
+      BitSetProducer parentFilter,
+      FacetsCollector resultParentHits,
+      IndexReader reader)
+      throws IOException {
     this.ranges = ranges;
-    this.field = field;
+    this.source = source;
     this.parentFilter = parentFilter;
     this.reader = reader;
     this.counts = new int[ranges.length];
@@ -143,10 +159,7 @@ public class ParentDedupedLongRangeFacetCounts {
 
   private void countOneSegment(MatchingDocs hits) throws IOException {
     LeafReaderContext context = hits.context();
-    SortedNumericDocValues values = DocValues.getSortedNumeric(context.reader(), this.field);
-    if (values == null) {
-      return;
-    }
+    var values = this.source.getValues(context);
     BitSet parents = this.parentFilter.getBitSet(context);
     if (parents == null) {
       return;
@@ -189,7 +202,7 @@ public class ParentDedupedLongRangeFacetCounts {
         parentHasDefault = true;
         continue;
       }
-      for (int i = 0; i < values.docValueCount(); i++) {
+      for (long i = 0; i < values.getValueCount(); i++) {
         int bucket = rangeIndexOf(values.nextValue());
         if (bucket >= 0) {
           parentBuckets[bucket] = true;

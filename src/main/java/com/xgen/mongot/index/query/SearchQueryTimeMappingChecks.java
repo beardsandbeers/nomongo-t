@@ -7,6 +7,7 @@ import com.xgen.mongot.index.definition.StringFieldDefinition;
 import com.xgen.mongot.index.definition.VectorFieldSpecification;
 import com.xgen.mongot.index.definition.VectorSimilarity;
 import com.xgen.mongot.index.path.string.StringFieldPath;
+import com.xgen.mongot.index.path.string.StringMultiFieldPath;
 import com.xgen.mongot.index.path.string.StringPath;
 import com.xgen.mongot.util.FieldPath;
 import com.xgen.mongot.util.bson.FloatVector;
@@ -154,9 +155,19 @@ public class SearchQueryTimeMappingChecks implements QueryTimeMappingChecks {
   @Override
   public boolean isHighlightableStringField(StringPath path, Optional<FieldPath> embeddedRoot) {
     return this.fieldDefinitionResolver
-        .getStringFieldDefinition(path, embeddedRoot)
-        .map(StringFieldDefinition::storeFlag)
-        .orElse(false);
+        .getStringFieldDefinition(path, embeddedRoot, StringFieldDefinition::storeFlag)
+        .isPresent();
+  }
+
+  public boolean hasUnstoredStringAlias(StringPath path, Optional<FieldPath> embeddedRoot) {
+    return path.getBaseFieldPath().isNested()
+        && this.fieldDefinitionResolver
+            .getStringFieldDefinition(path, embeddedRoot, field -> !field.storeFlag())
+            .isPresent();
+  }
+
+  public boolean storesMultiInBase(StringMultiFieldPath multi, Optional<FieldPath> embeddedRoot) {
+    return this.fieldDefinitionResolver.storesMultiInBase(multi, embeddedRoot);
   }
 
   @Override

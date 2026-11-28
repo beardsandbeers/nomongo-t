@@ -32,6 +32,15 @@ public final class AggregationSpecBuilder {
     FieldDefinition getFieldDefinition(FieldPath path);
 
     TypeField getBoundaryFacetFieldType(BoundaryFacetDefinition<?> facetDefinition);
+
+    default AggregationRegistry.GroupingArgs.BoundaryArgs resolve(
+        BoundaryFacetDefinition<?> facet) {
+      return new AggregationRegistry.GroupingArgs.BoundaryArgs(
+          facet.boundaries(),
+          facet.defaultBucketName().map(BsonString::new),
+          Optional.of(getBoundaryFacetFieldType(facet)),
+          Optional.of(getFieldDefinition(FieldPath.parse(facet.path()))));
+    }
   }
 
   private AggregationSpecBuilder() {}
@@ -111,7 +120,7 @@ public final class AggregationSpecBuilder {
                   name,
                   path,
                   childrenSpecs,
-                  toBoundaryArgs(dateFacetDefinition, path, boundaryResolver),
+                  toBoundaryArgs(dateFacetDefinition, boundaryResolver),
                   registry);
       case FacetDefinition.NumericFacetDefinition numericFacetDefinition ->
           registry
@@ -120,7 +129,7 @@ public final class AggregationSpecBuilder {
                   name,
                   path,
                   childrenSpecs,
-                  toBoundaryArgs(numericFacetDefinition, path, boundaryResolver),
+                  toBoundaryArgs(numericFacetDefinition, boundaryResolver),
                   registry);
     };
   }
@@ -132,13 +141,15 @@ public final class AggregationSpecBuilder {
    */
   private static AggregationRegistry.GroupingArgs.BoundaryArgs toBoundaryArgs(
       BoundaryFacetDefinition<?> facetDefinition,
-      FieldPath path,
       Optional<BoundaryFieldResolver> boundaryResolver) {
-    return new AggregationRegistry.GroupingArgs.BoundaryArgs(
-        facetDefinition.boundaries(),
-        facetDefinition.defaultBucketName().map(BsonString::new),
-        boundaryResolver.map(resolver -> resolver.getBoundaryFacetFieldType(facetDefinition)),
-        boundaryResolver.map(resolver -> resolver.getFieldDefinition(path)));
+    return boundaryResolver
+        .map(resolver -> resolver.resolve(facetDefinition))
+        .orElseGet(
+            () ->
+                new AggregationRegistry.GroupingArgs.BoundaryArgs(
+                    facetDefinition.boundaries(),
+                        facetDefinition.defaultBucketName().map(BsonString::new),
+                    Optional.empty(), Optional.empty()));
   }
 
   private static AggregationSpec operatorSpec(

@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 import org.apache.lucene.codecs.CodecUtil;
@@ -22,14 +23,14 @@ final class LuceneStorageAttribution {
   private record CompoundEntry(String name, long offset, long length) {}
 
   private final SegmentReader reader;
-  private final Function<String, String> path;
+  private final Function<String, Optional<String>> path;
   private final Map<String, List<FieldInfo>> formats = new HashMap<>();
   private final Map<String, String> components = new HashMap<>();
   private final Runnable checkCancelled;
   private Map<String, List<StorageLedger.Entry>> fieldRanges = Map.of();
 
   LuceneStorageAttribution(
-      SegmentReader reader, Function<String, String> path, Runnable checkCancelled) {
+      SegmentReader reader, Function<String, Optional<String>> path, Runnable checkCancelled) {
     this.reader = reader;
     this.path = path;
     this.checkCancelled = checkCancelled;
@@ -220,13 +221,12 @@ final class LuceneStorageAttribution {
     if (fields.isEmpty()) {
       return StorageLedger.Owner.unknown("file has no matching field metadata");
     }
-    var allPaths =
-        fields.stream().map(field -> this.path.apply(field.name)).distinct().sorted().toList();
-    String exclusive = allPaths.size() == 1 ? allPaths.getFirst() : "";
+    var allPaths = fields.stream().map(field -> this.path.apply(field.name)).distinct().toList();
+    var exclusive = allPaths.size() == 1 ? allPaths.getFirst() : Optional.<String>empty();
     return new StorageLedger.Owner(
         exclusive,
         component,
-        allPaths.stream().filter(path -> !path.isEmpty()).toList(),
+        allPaths.stream().flatMap(Optional::stream).sorted().toList(),
         fields.stream().map(field -> field.name).distinct().sorted().toList(),
         false,
         exclusive.isEmpty()

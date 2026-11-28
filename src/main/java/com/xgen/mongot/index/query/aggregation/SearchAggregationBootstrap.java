@@ -142,13 +142,17 @@ public class SearchAggregationBootstrap {
     // Since boundaries is right exclusive, so minus one for number of ranges.
     List<BsonValue> rangeKeys = new ArrayList<>(n - 1);
     for (int i = 0; i < n; i++) {
-      edges[i] = BoundaryEncoder.encode(boundaries.get(i), fieldTypeDefinition, typeField);
+      edges[i] =
+          boundaryArgs.bucketOrdinals().isPresent()
+              ? i
+              : BoundaryEncoder.encode(boundaries.get(i), fieldTypeDefinition, typeField);
       if (i < n - 1) {
         rangeKeys.add(boundaries.get(i));
       }
     }
     boolean lastEdgeInclusive =
-        BoundaryEncoder.lastEdgeInclusive(boundaries.get(n - 1), fieldTypeDefinition);
+        boundaryArgs.bucketOrdinals().isEmpty()
+            && BoundaryEncoder.lastEdgeInclusive(boundaries.get(n - 1), fieldTypeDefinition);
     return new BoundaryGroupAggregationSpec(
         name, path, children, edges, rangeKeys, lastEdgeInclusive, boundaryArgs);
   }

@@ -147,6 +147,8 @@ public final class SearchIndexDefinition implements IndexDefinition {
   private final ImmutableListMultimap<String, EmbeddedScope> embeddedScopes;
   private final Supplier<Boolean> hasTypeSetVectorFields =
       Suppliers.memoize(() -> dynamicVectorFields().findAny().isPresent());
+  private final Supplier<Boolean> usesEmbeddedVectorTypeSet =
+      Suppliers.memoize(this::usesEmbeddedVectorTypeSet);
   private final Supplier<Boolean> hasStaticBsonVectorOnlyFields =
       Suppliers.memoize(() -> hasStaticBsonVectorOnlyFields(getMappings()));
   private final Supplier<Boolean> hasAliasedFields = Suppliers.memoize(this::hasAliasedFields);
@@ -698,11 +700,16 @@ public final class SearchIndexDefinition implements IndexDefinition {
    * Vector rules reachable through ordinary document mappings, where Search indexes BSON vectors.
    */
   public Stream<TypeSetVectorFieldDefinition> dynamicVectorFields() {
+    return dynamicVectorFields(getMappings());
+  }
+
+  private Stream<TypeSetVectorFieldDefinition> dynamicVectorFields(
+      HierarchicalFieldDefinition scope) {
     if (this.typeSetsMap.isEmpty()) {
       return Stream.empty();
     }
-    return ordinaryDocuments(getMappings())
-        .map(DocumentFieldDefinition::dynamic)
+    return ordinaryDocuments(scope)
+        .map(HierarchicalFieldDefinition::dynamic)
         .filter(DynamicDefinition.Document.class::isInstance)
         .map(DynamicDefinition.Document.class::cast)
         .map(dynamic -> this.typeSetsMap.get(dynamic.typeSet()))
@@ -712,8 +719,8 @@ public final class SearchIndexDefinition implements IndexDefinition {
         .map(TypeSetVectorFieldDefinition.class::cast);
   }
 
-  private static Stream<DocumentFieldDefinition> ordinaryDocuments(
-      DocumentFieldDefinition document) {
+  private static Stream<HierarchicalFieldDefinition> ordinaryDocuments(
+      HierarchicalFieldDefinition document) {
     return Stream.concat(
         Stream.of(document),
         document.fields().values().stream()
@@ -759,8 +766,17 @@ public final class SearchIndexDefinition implements IndexDefinition {
     return this.hasTypeSetVectorFields.get();
   }
 
+  private boolean usesEmbeddedVectorTypeSet() {
+    // Embedded documents can use the scalar entries in a vector type set. Their literal and
+    // nested keys still need exact export metadata, even though they do not index vectors.
+    return declaresVectorTypeSet()
+        && this.embeddedScopes.values().stream()
+            .anyMatch(scope -> dynamicVectorFields(scope.mapping()).findAny().isPresent());
+  }
+
   public boolean requiresMappingObservations() {
     return hasTypeSetVectorFields()
+        || this.usesEmbeddedVectorTypeSet.get()
         || this.embeddedScopes.size() > this.embeddedScopes.keySet().size();
   }
 

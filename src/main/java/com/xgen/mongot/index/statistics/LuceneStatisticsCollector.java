@@ -96,6 +96,7 @@ public final class LuceneStatisticsCollector {
   private static final class HeapResource {
     private final Accountable accountable;
     private final Set<String> paths = new TreeSet<>();
+    private boolean hasSystemOwner;
     private final Set<String> physicalNames = new TreeSet<>();
     private final Set<String> components = new TreeSet<>();
 
@@ -273,8 +274,8 @@ public final class LuceneStatisticsCollector {
       for (var entry : ledger.entries()) {
         checkCancelled();
         var owner = entry.owner();
-        if (!owner.path().isEmpty()) {
-          var field = this.fields.get(owner.path());
+        if (owner.exclusivePath().isPresent()) {
+          var field = this.fields.get(owner.exclusivePath().get());
           field.disk = Math.addExact(field.disk, entry.length());
           attributed = Math.addExact(attributed, entry.length());
           if (owner.physicalFields().size() == 1) {
@@ -334,11 +335,11 @@ public final class LuceneStatisticsCollector {
   }
 
   private void observe(FieldInfo info) {
-    String path = path(info.name);
+    var path = path(info.name);
     if (path.isEmpty()) {
       return;
     }
-    var field = field(path);
+    var field = field(path.get());
     field.observed = true;
     this.physical.computeIfAbsent(
         info.name,
@@ -363,7 +364,7 @@ public final class LuceneStatisticsCollector {
                     .createFieldDefinitionResolver(
                         com.xgen.mongot.index.version.IndexFormatVersion.CURRENT)
                     .getFieldDefinition(
-                        com.xgen.mongot.util.FieldPath.parse(path),
+                        com.xgen.mongot.util.FieldPath.parse(path.get()),
                         root.isEmpty()
                             ? Optional.empty()
                             : Optional.of(com.xgen.mongot.util.FieldPath.parse(root)));
@@ -379,17 +380,17 @@ public final class LuceneStatisticsCollector {
         });
   }
 
-  private String path(String name) {
-    String physicalPath =
+  private Optional<String> path(String name) {
+    var physicalPath =
         FieldName.MultiField.isTypeOf(name)
-            ? FieldName.MultiField.getFieldPath(name).getFieldPath().toString()
-            : FieldName.TypeField.getTypeOf(name).map(type -> type.stripPrefix(name)).orElse("");
-    return this.logicalPaths.getOrDefault(physicalPath, physicalPath);
+            ? Optional.of(FieldName.MultiField.getFieldPath(name).getFieldPath().toString())
+            : FieldName.TypeField.getTypeOf(name).map(type -> type.stripPrefix(name));
+    return physicalPath.map(path -> this.logicalPaths.getOrDefault(path, path));
   }
 
   private void configuredFields() {
     if (this.definition instanceof SearchIndexDefinition search) {
-      configuredDocument(search.getMappings(), "", "");
+      configuredDocument(search.getMappings(), Optional.empty(), "");
     } else {
       for (var definition : this.definition.asVectorDefinition().getFields()) {
         var field = field(definition.getPath().toString());
@@ -411,10 +412,10 @@ public final class LuceneStatisticsCollector {
   }
 
   private void configuredDocument(
-      HierarchicalFieldDefinition document, String parent, String root) {
+      HierarchicalFieldDefinition document, Optional<String> parent, String root) {
     for (var entry : document.fields().entrySet()) {
       checkCancelled();
-      String path = parent.isEmpty() ? entry.getKey() : parent + "." + entry.getKey();
+      String path = parent.map(prefix -> prefix + "." + entry.getKey()).orElse(entry.getKey());
       var field = field(path);
       field.configured = true;
       for (var definition :
@@ -423,10 +424,10 @@ public final class LuceneStatisticsCollector {
         var representation = new MutableRepresentation("", type, "", root);
         field.representations.put("configured:" + representation.signature(), representation);
         if (definition instanceof DocumentFieldDefinition child) {
-          configuredDocument(child, path, root);
+          configuredDocument(child, Optional.of(path), root);
         }
         if (definition instanceof EmbeddedDocumentsFieldDefinition child) {
-          configuredDocument(child, path, path);
+          configuredDocument(child, Optional.of(path), path);
         }
         if (definition instanceof com.xgen.mongot.index.definition.StringFieldDefinition string) {
           for (var multi : string.multi().keySet()) {
@@ -450,7 +451,7 @@ public final class LuceneStatisticsCollector {
       }
       checkCancelled();
       var representation = this.physical.get(info.name);
-      var field = this.fields.get(path(info.name));
+      var field = path(info.name).map(this.fields::get).orElse(null);
       if (representation == null || field == null) {
         this.heapOmitted.add("unrecognized_vector_field");
         this.unrecognizedVector = true;
@@ -492,10 +493,10 @@ public final class LuceneStatisticsCollector {
           this.resources.computeIfAbsent(object, ignored -> new HeapResource(accountable));
       resource.components.add(component);
       if (physicalFields.isEmpty()) {
-        resource.paths.add("");
+        resource.hasSystemOwner = true;
       }
       for (String name : physicalFields) {
-        resource.paths.add(path(name));
+        path(name).ifPresentOrElse(resource.paths::add, () -> resource.hasSystemOwner = true);
         resource.physicalNames.add(name);
       }
     } else {
@@ -513,7 +514,7 @@ public final class LuceneStatisticsCollector {
         continue;
       }
       total = Math.addExact(total, bytes);
-      if (resource.paths.size() == 1 && !resource.paths.contains("")) {
+      if (resource.paths.size() == 1 && !resource.hasSystemOwner) {
         var field = this.fields.get(resource.paths.iterator().next());
         field.heap = Math.addExact(field.heap, bytes);
         field.heapKnown = true;
@@ -526,7 +527,7 @@ public final class LuceneStatisticsCollector {
         buckets.add(
             new IndexStatistics.MemoryBucket(
                 String.join("+", resource.components),
-                resource.paths.stream().filter(path -> !path.isEmpty()).toList(),
+                List.copyOf(resource.paths),
                 Bytes.measured(
                     bytes,
                     Method.RESOURCE_ACCOUNTING,

@@ -19,6 +19,7 @@ import com.xgen.mongot.index.lucene.field.FieldName;
 import com.xgen.mongot.index.lucene.util.LuceneDoubleConversionUtils;
 import com.xgen.mongot.index.query.InvalidQueryException;
 import com.xgen.mongot.index.query.ReturnScope;
+import com.xgen.mongot.index.query.aggregation.NumericBucketOrdinals;
 import com.xgen.mongot.index.query.collectors.FacetCollector;
 import com.xgen.mongot.index.query.collectors.FacetDefinition;
 import com.xgen.mongot.index.query.operators.EmbeddedDocumentScope;
@@ -169,6 +170,39 @@ public class LuceneFacetContext {
 
   SearchFieldDefinitionResolver getFieldDefinitionResolver() {
     return this.fieldDefinitionResolver;
+  }
+
+  Optional<NumericBucketOrdinals> numericBucketOrdinals(
+      FacetDefinition.BoundaryFacetDefinition<?> facet,
+      Optional<FieldPath> root,
+      FieldName.TypeField type) {
+    if (facet instanceof FacetDefinition.NumericFacetDefinition numeric
+        && usesNumericBucketOrdinals(numeric, root, type)) {
+      return Optional.of(
+          new NumericBucketOrdinals(FieldPath.parse(numeric.path()), root, numeric.boundaries()));
+    }
+    return Optional.empty();
+  }
+
+  private boolean usesNumericBucketOrdinals(
+      FacetDefinition.NumericFacetDefinition facet,
+      Optional<FieldPath> root,
+      FieldName.TypeField type) {
+    var path = FieldPath.parse(facet.path());
+    // An export may contain only the observed spelling. Compare against the same BSON
+    // boundaries even if the other representation is absent from the static mapping.
+    return path.isNested()
+        && v2Types.contains(type)
+        && (this.fieldDefinitionResolver.hasBothNumericRepresentations(path, root)
+            || NumericBucketOrdinals.hasInexactBoundary(type, facet.boundaries()));
+  }
+
+  static LongRange[] ordinalRanges(FacetDefinition.BoundaryFacetDefinition<?> facet) {
+    var ranges = new LongRange[facet.boundaries().size() - 1];
+    for (int i = 0; i < ranges.length; i++) {
+      ranges[i] = new LongRange(facet.boundaries().get(i).toString(), i, true, i, true);
+    }
+    return ranges;
   }
 
   LongRange[] getRanges(
@@ -322,15 +356,19 @@ public class LuceneFacetContext {
   private void assertNoDuplicateResolvedBoundaries(
       FacetDefinition.NumericFacetDefinition facetDefinition, Optional<FieldPath> returnScope)
       throws InvalidQueryException {
-    NumericFieldOptions.Representation numericRepresentation =
-        getNumberFacetFieldDefinition(facetDefinition, returnScope).options().representation();
     FieldName.TypeField typeField = getBoundaryFacetFieldType(facetDefinition, returnScope);
-    List<Long> resolvedBoundaries =
-        facetDefinition.boundaries().stream()
-            .map((val) -> getNumericRangeValue(val, numericRepresentation, typeField))
+    if (usesNumericBucketOrdinals(facetDefinition, returnScope, typeField)) {
+      // BSON validation checks ordering across both types. One column can have an empty
+      // range between two adjacent edges that the other column can distinguish.
+      return;
+    }
+    var representation =
+        getNumberFacetFieldDefinition(facetDefinition, returnScope).options().representation();
+    if (facetDefinition.boundaries().stream()
+            .map(value -> getNumericRangeValue(value, representation, typeField))
             .distinct()
-            .toList();
-    if (resolvedBoundaries.size() < facetDefinition.boundaries().size()) {
+            .count()
+        < facetDefinition.boundaries().size()) {
       throw new InvalidQueryException(
           "Cannot use multiple consecutive boundaries that resolve to the same number.  This can "
               + "happen when resolving very large or very small numbers, depending on the chosen "
